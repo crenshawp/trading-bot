@@ -459,7 +459,10 @@ def detect_crypto_signals(ticker, df):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def send_notification(signal):
-    log_signal(signal)
+    try:
+        log_signal(signal)
+    except Exception as e:
+        print(f"  Log error: {e}")
 
     msg = (
         f"🚨 TRADE ALERT — {signal['ticker']}\n"
@@ -476,39 +479,41 @@ def send_notification(signal):
         f"Time:        {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
     )
 
-    if NOTIFY_METHOD == "print":
-        print("\n" + "="*50)
-        print(msg)
-        print("="*50)
-
-    elif NOTIFY_METHOD == "discord":
+    try:
         requests.post(DISCORD_WEBHOOK, json={
-    "content": "@everyone 🚨 TRADE ALERT",
-    "embeds": [{
-        "title": f"🚨 TRADE ALERT — {signal['ticker']}",
-        "color": 3066993,
-        "fields": [
-            {"name": "Asset",       "value": signal['asset_type'].upper(), "inline": True},
-            {"name": "Type",        "value": signal['trade_type'],         "inline": True},
-            {"name": "Direction",   "value": signal['direction'],          "inline": True},
-            {"name": "Setup",       "value": signal['setup'],              "inline": False},
-            {"name": "Detail",      "value": signal['detail'],             "inline": False},
-            {"name": "Price",       "value": f"${signal['price']:.2f}",    "inline": True},
-            {"name": "Take Profit", "value": f"${signal['take_profit']:.2f}", "inline": True},
-            {"name": "Stop Loss",   "value": f"${signal['stop_loss']:.2f}",   "inline": True},
-            {"name": "Hold Time",   "value": signal['hold_days'],          "inline": True},
-            {"name": "Confidence",  "value": signal['confidence'],         "inline": True},
-            {"name": "Time",        "value": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "inline": True},
-        ]
-    }]
-})
-    elif NOTIFY_METHOD == "pushover":
+            "content": "@everyone 🚨 TRADE ALERT",
+            "embeds": [{
+                "title": f"🚨 TRADE ALERT — {signal['ticker']}",
+                "color": 3066993,
+                "fields": [
+                    {"name": "Asset",       "value": signal['asset_type'].upper(), "inline": True},
+                    {"name": "Type",        "value": signal['trade_type'],         "inline": True},
+                    {"name": "Direction",   "value": signal['direction'],          "inline": True},
+                    {"name": "Setup",       "value": signal['setup'],              "inline": False},
+                    {"name": "Detail",      "value": signal['detail'],             "inline": False},
+                    {"name": "Price",       "value": f"${signal['price']:.2f}",    "inline": True},
+                    {"name": "Take Profit", "value": f"${signal['take_profit']:.2f}", "inline": True},
+                    {"name": "Stop Loss",   "value": f"${signal['stop_loss']:.2f}",   "inline": True},
+                    {"name": "Hold Time",   "value": signal['hold_days'],          "inline": True},
+                    {"name": "Confidence",  "value": signal['confidence'],         "inline": True},
+                    {"name": "Time",        "value": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "inline": True},
+                ]
+            }]
+        })
+        print(f"  Discord notification sent")
+    except Exception as e:
+        print(f"  Discord error: {e}")
+
+    try:
         requests.post("https://api.pushover.net/1/messages.json", data={
             "token":   PUSHOVER_TOKEN,
             "user":    PUSHOVER_USER,
             "title":   f"Alert: {signal['ticker']} {signal['direction']}",
             "message": msg,
         })
+        print(f"  Pushover notification sent")
+    except Exception as e:
+        print(f"  Pushover error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
