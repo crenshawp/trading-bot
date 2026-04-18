@@ -1,5 +1,6 @@
 # backtest.py
 # Rebuilt around EMA21 Pullback — the only consistently profitable signal
+print("RUNNING LATEST VERSON.")
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -41,10 +42,6 @@ def calculate_roc_acceleration(series, period=10):
 
 
 def calculate_regression_slope(series, period=20):
-    """
-    Fits a straight line to recent price data using least squares regression.
-    Positive = uptrend, Negative = downtrend. Steeper = stronger trend.
-    """
     slopes = []
     for i in range(len(series)):
         if i < period:
@@ -58,13 +55,15 @@ def calculate_regression_slope(series, period=20):
 
 
 def add_indicators(df):
-    df["RSI"]       = calculate_rsi(df["Close"])
-    df["EMA21"]     = calculate_ema(df["Close"], 21)
-    df["EMA50"]     = calculate_ema(df["Close"], 50)
-    df["ATR"]       = calculate_atr(df)
-    df["ROC_Accel"] = calculate_roc_acceleration(df["Close"])
-    df["Slope"]     = calculate_regression_slope(df["Close"])
-    df["Vol_MA20"]  = df["Volume"].rolling(20).mean()
+    df["RSI"]         = calculate_rsi(df["Close"])
+    df["EMA21"]       = calculate_ema(df["Close"], 21)
+    df["EMA50"]       = calculate_ema(df["Close"], 50)
+    df["ATR"]         = calculate_atr(df)
+    df["ROC_Accel"]   = calculate_roc_acceleration(df["Close"])
+    df["Slope"]       = calculate_regression_slope(df["Close"])
+    df["Slope_Accel"] = df["Slope"].diff()
+    df["High_20"]     = df["High"].rolling(20).max().shift(1)
+    df["Vol_MA20"]    = df["Volume"].rolling(20).mean()
     df.dropna(inplace=True)
     return df
 
@@ -85,8 +84,6 @@ def get_historical_data(ticker):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # OUTCOME CHECKER
-# Looks forward 10 candles after signal fires
-# Checks if take profit or stop loss was hit first
 # ══════════════════════════════════════════════════════════════════════════════
 
 def check_outcome(df, signal_index, take_profit, stop_loss, direction):
@@ -105,8 +102,6 @@ def check_outcome(df, signal_index, take_profit, stop_loss, direction):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BACKTEST
-# asset_type="stock" uses normal ATR multipliers
-# asset_type="crypto" uses wider ATR multipliers for higher volatility
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_backtest(ticker, asset_type="stock"):
@@ -124,19 +119,20 @@ def run_backtest(ticker, asset_type="stock"):
         current  = df.iloc[i]
         previous = df.iloc[i - 1]
 
-        price   = float(current["Close"])
-        rsi     = float(current["RSI"])
-        atr     = float(current["ATR"])
-        volume  = float(current["Volume"])
-        vol_ma  = float(current["Vol_MA20"])
-        ema21   = float(current["EMA21"])
-        ema50   = float(current["EMA50"])
-        slope   = float(current["Slope"])
-        roc_a   = float(current["ROC_Accel"])
+        price       = float(current["Close"])
+        rsi         = float(current["RSI"])
+        atr         = float(current["ATR"])
+        volume      = float(current["Volume"])
+        vol_ma      = float(current["Vol_MA20"])
+        ema21       = float(current["EMA21"])
+        ema50       = float(current["EMA50"])
+        slope       = float(current["Slope"])
+        slope_accel = float(current["Slope_Accel"])
+        roc_a       = float(current["ROC_Accel"])
+        high_20     = float(current["High_20"])
 
         near_ema21 = abs(price - ema21) / ema21 < 0.015
 
-        # ATR multipliers — wider for crypto, tighter for stocks
         if asset_type == "crypto":
             tp_call = round(price + (atr * 5),   2)
             sl_call = round(price - (atr * 2.5), 2)
@@ -150,7 +146,7 @@ def run_backtest(ticker, asset_type="stock"):
 
         date = df.index[i].strftime("%Y-%m-%d")
 
-        # ── CALL — EMA21 Pullback in uptrend ─────────────────────────────────
+        # ── CALL — EMA21 Pullback ────────────────────────────────────────────
         if (price > ema50
                 and slope > -0.5
                 and near_ema21
@@ -170,7 +166,7 @@ def run_backtest(ticker, asset_type="stock"):
                 "outcome":     outcome,
             })
 
-        # ── PUT — EMA21 Pullback in downtrend ────────────────────────────────
+        # ── PUT — EMA21 Pullback ─────────────────────────────────────────────
         if (price < ema50
                 and slope < 0.5
                 and near_ema21
@@ -187,6 +183,43 @@ def run_backtest(ticker, asset_type="stock"):
                 "price":       price,
                 "take_profit": tp_put,
                 "stop_loss":   sl_put,
+                "outcome":     outcome,
+            })
+
+        # ── CALL — Trend Acceleration ────────────────────────────────────────
+        if (price > ema50
+                and slope > 2.0
+                and slope_accel > 0
+                and roc_a > 0
+                and volume > vol_ma * 1.3):
+            outcome = check_outcome(df, i, tp_call, sl_call, "CALL")
+            results.append({
+                "date":        date,
+                "ticker":      ticker,
+                "asset_type":  asset_type,
+                "setup":       "Trend Acceleration",
+                "direction":   "CALL",
+                "price":       price,
+                "take_profit": tp_call,
+                "stop_loss":   sl_call,
+                "outcome":     outcome,
+            })
+
+        # ── CALL — Higher High Breakout ──────────────────────────────────────
+        if (price >= high_20
+                and rsi >=50
+                and slope > 0.5
+                and volume > vol_ma * 1.5):
+            outcome = check_outcome(df, i, tp_call, sl_call, "CALL")
+            results.append({
+                "date":        date,
+                "ticker":      ticker,
+                "asset_type":  asset_type,
+                "setup":       "Higher High Breakout",
+                "direction":   "CALL",
+                "price":       price,
+                "take_profit": tp_call,
+                "stop_loss":   sl_call,
                 "outcome":     outcome,
             })
 

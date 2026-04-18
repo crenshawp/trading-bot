@@ -16,7 +16,7 @@ import os
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Stock watchlist — backtested, Tier 1 only
-STOCK_WATCHLIST = ["BLK", "GOOGL", "META", "GS", "NOW", "AMZN"]
+STOCK_WATCHLIST = ["BLK", "GOOGL", "META", "GS", "NOW", "AMZN", "LLY", "TSLA"]
 
 # Crypto watchlist — backtested on hourly candles
 CRYPTO_WATCHLIST = ["BTC-USD", "BNB-USD", "ETH-USD"]
@@ -90,6 +90,9 @@ def add_stock_indicators(df):
     df["ROC_Accel"] = calculate_roc_acceleration(df["Close"])
     df["Slope"]     = calculate_regression_slope(df["Close"])
     df["Vol_MA20"]  = df["Volume"].rolling(20).mean()
+    df["Slope"]       = calculate_regression_slope(df["Close"])
+    df["Slope_Accel"] = df["Slope"].diff()
+    df["High_20"]     = df["High"].rolling(20).max().shift(1)
     df.dropna(inplace=True)
     return df
 
@@ -262,15 +265,17 @@ def detect_stock_signals(ticker, df):
     latest = df.iloc[-1]
     prev   = df.iloc[-2]
 
-    price   = float(latest["Close"])
-    rsi     = float(latest["RSI"])
-    atr     = float(latest["ATR"])
-    volume  = float(latest["Volume"])
-    vol_ma  = float(latest["Vol_MA20"])
-    ema21   = float(latest["EMA21"])
-    ema50   = float(latest["EMA50"])
-    slope   = float(latest["Slope"])
-    roc_a   = float(latest["ROC_Accel"])
+    price       = float(latest["Close"])
+    rsi         = float(latest["RSI"])
+    atr         = float(latest["ATR"])
+    volume      = float(latest["Volume"])
+    vol_ma      = float(latest["Vol_MA20"])
+    ema21       = float(latest["EMA21"])
+    ema50       = float(latest["EMA50"])
+    slope       = float(latest["Slope"])
+    roc_a       = float(latest["ROC_Accel"])
+    slope_accel = float(latest["Slope_Accel"])
+    high_20     = float(latest["High_20"])
 
     hold_days  = estimate_hold_days(price, atr)
     near_ema21 = abs(price - ema21) / ema21 < 0.015
@@ -358,8 +363,46 @@ def detect_stock_signals(ticker, df):
             "hold_days":  hold_days,
         })
 
-    return signals
+    # ── Trend Acceleration ────────────────────────────────────────────────────
+    if (price > ema50
+            and slope > 2.0
+            and slope_accel > 0
+            and roc_a > 0
+            and volume > vol_ma * 1.3):
+        signals.append({
+            "ticker":     ticker,
+            "asset_type": "stock",
+            "trade_type": "📆 SWING TRADE",
+            "direction":  "CALL 📈",
+            "setup":      "Trend Acceleration",
+            "detail":     f"Strong upward momentum detected. Slope accelerating with {volume/vol_ma:.1f}x volume.",
+            "price":      price,
+            "confidence": "High",
+            "take_profit": tp_call,
+            "stop_loss":   sl_call,
+            "hold_days":  hold_days,
+        })
 
+    # ── Higher High Breakout ──────────────────────────────────────────────────
+    if (price >= high_20
+            and rsi >= 50
+            and slope > 1.0
+            and volume > vol_ma * 1.5):
+        signals.append({
+            "ticker":     ticker,
+            "asset_type": "stock",
+            "trade_type": "📆 SWING TRADE",
+            "direction":  "CALL 📈",
+            "setup":      "Higher High Breakout",
+            "detail":     f"Price breaking 20 day high at ${high_20:.2f} with strong volume.",
+            "price":      price,
+            "confidence": "High",
+            "take_profit": tp_call,
+            "stop_loss":   sl_call,
+            "hold_days":  hold_days,
+        })
+
+    return signals
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CRYPTO SIGNALS — Oversold Reversal + Momentum Breakout + Overbought Reversal
