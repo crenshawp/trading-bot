@@ -17,6 +17,7 @@ import os
 
 # Stock watchlist — backtested, Tier 1 only
 STOCK_WATCHLIST = ["BLK", "GOOGL", "META", "GS", "NOW", "AMZN", "LLY", "TSLA"]
+TREND_CONT_TICKERS = ["JPM", "GS", "GOOGL", "NOW", "SPY", "BLK", "AMZN"]
 
 # Crypto watchlist — backtested on hourly candles
 CRYPTO_WATCHLIST = ["BTC-USD", "BNB-USD", "ETH-USD"]
@@ -401,6 +402,32 @@ def detect_stock_signals(ticker, df):
             "stop_loss":   sl_call,
             "hold_days":  hold_days,
         })
+    # ── Trend Continuation ─────────────────────────────────────────────────────
+# Price above EMA21 (short term trend intact)
+# Price above EMA50 (long term trend intact)  
+# Slope positive (trend confirmed)
+# RSI 50-65 (strong but not overextended)
+# Volume average or above (real participation)
+    if ticker in TREND_CONT_TICKERS:
+        if (price > ema21
+                and price > ema50
+                and slope > 0
+                and 50 <= rsi <= 65
+                and volume > vol_ma
+                and roc_a > 0):
+            signals.append({
+             "ticker":     ticker,
+             "asset_type": "stock",
+             "trade_type": "📆 SWING TRADE",
+             "direction":  "CALL 📈",
+             "setup":      "Trend Continuation",
+             "detail":     f"Established uptrend with healthy momentum. RSI at {rsi:.1f}.",
+             "price":      price,
+             "confidence": "Medium",
+             "take_profit": tp_call,
+             "stop_loss":   sl_call,
+             "hold_days":  hold_days,
+    })
 
     return signals
 

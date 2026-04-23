@@ -207,7 +207,7 @@ def run_backtest(ticker, asset_type="stock"):
 
         # ── CALL — Higher High Breakout ──────────────────────────────────────
         if (price >= high_20
-                and rsi >=50
+                and rsi >= 50
                 and slope > 0.5
                 and volume > vol_ma * 1.5):
             outcome = check_outcome(df, i, tp_call, sl_call, "CALL")
@@ -223,9 +223,27 @@ def run_backtest(ticker, asset_type="stock"):
                 "outcome":     outcome,
             })
 
+        # ── CALL — Trend Continuation ────────────────────────────────────────
+        if (price > ema21
+                and price > ema50
+                and slope > 0
+                and 50 <= rsi <= 65
+                and volume > vol_ma
+                and roc_a > 0):
+            outcome = check_outcome(df, i, tp_call, sl_call, "CALL")
+            results.append({
+                "date":        date,
+                "ticker":      ticker,
+                "asset_type":  asset_type,
+                "setup":       "Trend Continuation",
+                "direction":   "CALL",
+                "price":       price,
+                "take_profit": tp_call,
+                "stop_loss":   sl_call,
+                "outcome":     outcome,
+            })
+
     return pd.DataFrame(results)
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # SUMMARY
 # ══════════════════════════════════════════════════════════════════════════════
