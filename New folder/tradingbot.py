@@ -18,6 +18,7 @@ import os
 # Stock watchlist — backtested, Tier 1 only
 STOCK_WATCHLIST = ["BLK", "GOOGL", "META", "GS", "NOW", "AMZN", "LLY", "TSLA"]
 TREND_CONT_TICKERS = ["JPM", "GS", "GOOGL", "NOW", "SPY", "BLK", "AMZN"]
+NEWS_WATCHLIST = ["BLK", "GOOGL", "META", "GS", "NOW", "AMZN", "LLY", "TSLA", "PLTR", "NVDA", "AAPL"]
 
 # Crypto watchlist — backtested on hourly candles
 CRYPTO_WATCHLIST = ["BTC-USD", "BNB-USD", "ETH-USD"]
@@ -134,6 +135,82 @@ def get_crypto_data(ticker):
         return None
     df.dropna(inplace=True)
     return df
+
+def get_yahoo_news(ticker, max_articles=5):
+    """Pull recent news headlines from Yahoo Finance for a ticker"""
+    try:
+        stock    = yf.Ticker(ticker)
+        news     = stock.news
+        articles = []
+        
+        for item in news[:max_articles]:
+            content = item.get("content", {})
+            title   = content.get("title", "No title")
+            summary = content.get("summary", "")
+            link    = content.get("canonicalUrl", {}).get("url", "")
+            articles.append({
+                "title":   title,
+                "summary": summary,
+                "link":    link,
+            })
+        
+        return articles
+    except Exception as e:
+        return []
+
+
+def send_morning_report():
+    """Send a morning news digest for the watchlist"""
+    if not is_market_open():
+        # Still send report on market days even before open
+        now = datetime.now(ZoneInfo("America/New_York"))
+        if now.weekday() >= 5:
+            return
+
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Generating morning news report...")
+    
+    report = "📰 **MORNING MARKET REPORT** — " + datetime.now().strftime("%Y-%m-%d") + "\n\n"
+    
+    for ticker in NEWS_WATCHLIST:
+        articles = get_yahoo_news(ticker)
+        report  += f"\n**{ticker}**\n"
+        
+        if not articles:
+            report += "  No recent news\n"
+            continue
+        
+        for article in articles[:3]:
+            title = article["title"][:100]
+            report += f"  • {title}\n"
+    
+    # Send to Discord
+    try:
+        # Discord has a 2000 character limit per message
+        # Split if needed
+        if len(report) > 1900:
+            chunks = [report[i:i+1900] for i in range(0, len(report), 1900)]
+            for chunk in chunks:
+                requests.post(DISCORD_WEBHOOK, json={"content": chunk})
+        else:
+            requests.post(DISCORD_WEBHOOK, json={"content": report})
+        print(f"  Morning report sent")
+    except Exception as e:
+        print(f"  Morning report error: {e}")
+    # Send to Pushover — split into chunks since limit is 1024 chars
+    try:
+        chunk_size = 1000
+        chunks     = [report[i:i+chunk_size] for i in range(0, len(report), chunk_size)]
+        
+        for idx, chunk in enumerate(chunks, 1):
+            requests.post("https://api.pushover.net/1/messages.json", data={
+                "token":   PUSHOVER_TOKEN,
+                "user":    PUSHOVER_USER,
+                "title":   f"📰 Morning Report ({idx}/{len(chunks)})",
+                "message": chunk,
+            })
+        print(f"  Pushover report sent ({len(chunks)} parts)")
+    except Exception as e:
+        print(f"  Pushover report error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -646,12 +723,17 @@ if __name__ == "__main__":
     # Run both immediately on start
     scan_stocks()
     scan_crypto()
+    send_morning_report()
 
     # Stock scan — once per day at 9:31am EST
     schedule.every().day.at("09:31").do(scan_stocks)
 
     # Crypto scan — every hour
     schedule.every(1).hours.do(scan_crypto)
+
+    #News updates — every weekday at 8:00am EST
+    schedule.every().day.at("08:00").do(send_morning_report)
+
 
     while True:
         schedule.run_pending()
