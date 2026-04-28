@@ -139,8 +139,9 @@ def get_crypto_data(ticker):
 def get_yahoo_news(ticker, max_articles=5):
     """Pull recent news headlines from Yahoo Finance for a ticker"""
     try:
+        print(f"  Fetching news for {ticker} from Yahoo Finance...") # Debug log to confirm function is called
         stock    = yf.Ticker(ticker)
-        news     = stock.news
+        news     = stock.news or []
         articles = []
         
         for item in news[:max_articles]:
@@ -161,9 +162,10 @@ def get_yahoo_news(ticker, max_articles=5):
 
 def send_morning_report():
     """Send a morning news digest for the watchlist"""
+    print("=== MORNING REPORT FUNCTION CALLED ===") # Debug log to confirm function is called
     if not is_market_open():
         # Still send report on market days even before open
-        now = datetime.now(ZoneInfo("America/New_York"))
+        now = datetime.now(ZoneInfo("America/New_York"))    
         if now.weekday() >= 5:
             return
 
