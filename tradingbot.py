@@ -16,7 +16,9 @@ import os
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Stock watchlist — backtested, Tier 1 only
-STOCK_WATCHLIST = ["BLK", "GOOGL", "META", "GS", "NOW", "AMZN"]
+STOCK_WATCHLIST = ["BLK", "GOOGL", "META", "GS", "NOW", "AMZN", "LLY", "TSLA"]
+TREND_CONT_TICKERS = ["JPM", "GS", "GOOGL", "NOW", "SPY", "BLK", "AMZN"]
+NEWS_WATCHLIST = ["BLK", "GOOGL", "META", "GS", "NOW", "AMZN", "LLY", "TSLA", "PLTR", "NVDA", "AAPL"]
 
 # Crypto watchlist — backtested on hourly candles
 CRYPTO_WATCHLIST = ["BTC-USD", "BNB-USD", "ETH-USD"]
@@ -90,6 +92,9 @@ def add_stock_indicators(df):
     df["ROC_Accel"] = calculate_roc_acceleration(df["Close"])
     df["Slope"]     = calculate_regression_slope(df["Close"])
     df["Vol_MA20"]  = df["Volume"].rolling(20).mean()
+    df["Slope"]       = calculate_regression_slope(df["Close"])
+    df["Slope_Accel"] = df["Slope"].diff()
+    df["High_20"]     = df["High"].rolling(20).max().shift(1)
     df.dropna(inplace=True)
     return df
 
@@ -130,6 +135,84 @@ def get_crypto_data(ticker):
         return None
     df.dropna(inplace=True)
     return df
+
+def get_yahoo_news(ticker, max_articles=5):
+    """Pull recent news headlines from Yahoo Finance for a ticker"""
+    try:
+        print(f"  Fetching news for {ticker} from Yahoo Finance...") # Debug log to confirm function is called
+        stock    = yf.Ticker(ticker)
+        news     = stock.news or []
+        articles = []
+        
+        for item in news[:max_articles]:
+            content = item.get("content", {})
+            title   = content.get("title", "No title")
+            summary = content.get("summary", "")
+            link    = content.get("canonicalUrl", {}).get("url", "")
+            articles.append({
+                "title":   title,
+                "summary": summary,
+                "link":    link,
+            })
+        
+        return articles
+    except Exception as e:
+        return []
+
+
+def send_morning_report():
+    """Send a morning news digest for the watchlist"""
+    print("=== MORNING REPORT FUNCTION CALLED ===") # Debug log to confirm function is called
+    if not is_market_open():
+        # Still send report on market days even before open
+        now = datetime.now(ZoneInfo("America/New_York"))    
+        if now.weekday() >= 5:
+            return
+
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Generating morning news report...")
+    
+    report = "📰 **MORNING MARKET REPORT** — " + datetime.now().strftime("%Y-%m-%d") + "\n\n"
+    
+    for ticker in NEWS_WATCHLIST:
+        articles = get_yahoo_news(ticker)
+        report  += f"\n**{ticker}**\n"
+        
+        if not articles:
+            report += "  No recent news\n"
+            continue
+        
+        for article in articles[:3]:
+            title = article["title"][:100]
+            report += f"  • {title}\n"
+    
+    # Send to Discord
+    try:
+        # Discord has a 2000 character limit per message
+        # Split if needed
+        if len(report) > 1900:
+            chunks = [report[i:i+1900] for i in range(0, len(report), 1900)]
+            for chunk in chunks:
+                requests.post(DISCORD_WEBHOOK, json={"content": chunk})
+        else:
+            requests.post(DISCORD_WEBHOOK, json={"content": report})
+        print(f"  Morning report sent")
+    except Exception as e:
+        print(f"  Morning report error: {e}")
+    # Send to Pushover — split into chunks since limit is 1024 chars
+    try:
+        chunk_size = 1000
+        chunks     = [report[i:i+chunk_size] for i in range(0, len(report), chunk_size)]
+        
+        for idx, chunk in enumerate(chunks, 1):
+            requests.post("https://api.pushover.net/1/messages.json", data={
+                "token":   PUSHOVER_TOKEN,
+                "user":    PUSHOVER_USER,
+                "title":   f"📰 Morning Report ({idx}/{len(chunks)})",
+                "message": chunk,
+            })
+        print(f"  Pushover report sent ({len(chunks)} parts)")
+    except Exception as e:
+        print(f"  Pushover report error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -262,15 +345,17 @@ def detect_stock_signals(ticker, df):
     latest = df.iloc[-1]
     prev   = df.iloc[-2]
 
-    price   = float(latest["Close"])
-    rsi     = float(latest["RSI"])
-    atr     = float(latest["ATR"])
-    volume  = float(latest["Volume"])
-    vol_ma  = float(latest["Vol_MA20"])
-    ema21   = float(latest["EMA21"])
-    ema50   = float(latest["EMA50"])
-    slope   = float(latest["Slope"])
-    roc_a   = float(latest["ROC_Accel"])
+    price       = float(latest["Close"])
+    rsi         = float(latest["RSI"])
+    atr         = float(latest["ATR"])
+    volume      = float(latest["Volume"])
+    vol_ma      = float(latest["Vol_MA20"])
+    ema21       = float(latest["EMA21"])
+    ema50       = float(latest["EMA50"])
+    slope       = float(latest["Slope"])
+    roc_a       = float(latest["ROC_Accel"])
+    slope_accel = float(latest["Slope_Accel"])
+    high_20     = float(latest["High_20"])
 
     hold_days  = estimate_hold_days(price, atr)
     near_ema21 = abs(price - ema21) / ema21 < 0.015
@@ -358,8 +443,72 @@ def detect_stock_signals(ticker, df):
             "hold_days":  hold_days,
         })
 
-    return signals
+    # ── Trend Acceleration ────────────────────────────────────────────────────
+    if (price > ema50
+            and slope > 2.0
+            and slope_accel > 0
+            and roc_a > 0
+            and volume > vol_ma * 1.3):
+        signals.append({
+            "ticker":     ticker,
+            "asset_type": "stock",
+            "trade_type": "📆 SWING TRADE",
+            "direction":  "CALL 📈",
+            "setup":      "Trend Acceleration",
+            "detail":     f"Strong upward momentum detected. Slope accelerating with {volume/vol_ma:.1f}x volume.",
+            "price":      price,
+            "confidence": "High",
+            "take_profit": tp_call,
+            "stop_loss":   sl_call,
+            "hold_days":  hold_days,
+        })
 
+    # ── Higher High Breakout ──────────────────────────────────────────────────
+    if (price >= high_20
+            and rsi >= 50
+            and slope > 1.0
+            and volume > vol_ma * 1.5):
+        signals.append({
+            "ticker":     ticker,
+            "asset_type": "stock",
+            "trade_type": "📆 SWING TRADE",
+            "direction":  "CALL 📈",
+            "setup":      "Higher High Breakout",
+            "detail":     f"Price breaking 20 day high at ${high_20:.2f} with strong volume.",
+            "price":      price,
+            "confidence": "High",
+            "take_profit": tp_call,
+            "stop_loss":   sl_call,
+            "hold_days":  hold_days,
+        })
+    # ── Trend Continuation ─────────────────────────────────────────────────────
+# Price above EMA21 (short term trend intact)
+# Price above EMA50 (long term trend intact)  
+# Slope positive (trend confirmed)
+# RSI 50-65 (strong but not overextended)
+# Volume average or above (real participation)
+    if ticker in TREND_CONT_TICKERS:
+        if (price > ema21
+                and price > ema50
+                and slope > 0
+                and 50 <= rsi <= 65
+                and volume > vol_ma
+                and roc_a > 0):
+            signals.append({
+             "ticker":     ticker,
+             "asset_type": "stock",
+             "trade_type": "📆 SWING TRADE",
+             "direction":  "CALL 📈",
+             "setup":      "Trend Continuation",
+             "detail":     f"Established uptrend with healthy momentum. RSI at {rsi:.1f}.",
+             "price":      price,
+             "confidence": "Medium",
+             "take_profit": tp_call,
+             "stop_loss":   sl_call,
+             "hold_days":  hold_days,
+    })
+
+    return signals
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CRYPTO SIGNALS — Oversold Reversal + Momentum Breakout + Overbought Reversal
@@ -459,7 +608,10 @@ def detect_crypto_signals(ticker, df):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def send_notification(signal):
-    log_signal(signal)
+    try:
+        log_signal(signal)
+    except Exception as e:
+        print(f"  Log error: {e}")
 
     msg = (
         f"🚨 TRADE ALERT — {signal['ticker']}\n"
@@ -476,39 +628,41 @@ def send_notification(signal):
         f"Time:        {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
     )
 
-    if NOTIFY_METHOD == "print":
-        print("\n" + "="*50)
-        print(msg)
-        print("="*50)
-
-    elif NOTIFY_METHOD == "discord":
+    try:
         requests.post(DISCORD_WEBHOOK, json={
-    "content": "@everyone 🚨 TRADE ALERT",
-    "embeds": [{
-        "title": f"🚨 TRADE ALERT — {signal['ticker']}",
-        "color": 3066993,
-        "fields": [
-            {"name": "Asset",       "value": signal['asset_type'].upper(), "inline": True},
-            {"name": "Type",        "value": signal['trade_type'],         "inline": True},
-            {"name": "Direction",   "value": signal['direction'],          "inline": True},
-            {"name": "Setup",       "value": signal['setup'],              "inline": False},
-            {"name": "Detail",      "value": signal['detail'],             "inline": False},
-            {"name": "Price",       "value": f"${signal['price']:.2f}",    "inline": True},
-            {"name": "Take Profit", "value": f"${signal['take_profit']:.2f}", "inline": True},
-            {"name": "Stop Loss",   "value": f"${signal['stop_loss']:.2f}",   "inline": True},
-            {"name": "Hold Time",   "value": signal['hold_days'],          "inline": True},
-            {"name": "Confidence",  "value": signal['confidence'],         "inline": True},
-            {"name": "Time",        "value": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "inline": True},
-        ]
-    }]
-})
-    elif NOTIFY_METHOD == "pushover":
+            "content": "@everyone 🚨 TRADE ALERT",
+            "embeds": [{
+                "title": f"🚨 TRADE ALERT — {signal['ticker']}",
+                "color": 3066993,
+                "fields": [
+                    {"name": "Asset",       "value": signal['asset_type'].upper(), "inline": True},
+                    {"name": "Type",        "value": signal['trade_type'],         "inline": True},
+                    {"name": "Direction",   "value": signal['direction'],          "inline": True},
+                    {"name": "Setup",       "value": signal['setup'],              "inline": False},
+                    {"name": "Detail",      "value": signal['detail'],             "inline": False},
+                    {"name": "Price",       "value": f"${signal['price']:.2f}",    "inline": True},
+                    {"name": "Take Profit", "value": f"${signal['take_profit']:.2f}", "inline": True},
+                    {"name": "Stop Loss",   "value": f"${signal['stop_loss']:.2f}",   "inline": True},
+                    {"name": "Hold Time",   "value": signal['hold_days'],          "inline": True},
+                    {"name": "Confidence",  "value": signal['confidence'],         "inline": True},
+                    {"name": "Time",        "value": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "inline": True},
+                ]
+            }]
+        })
+        print(f"  Discord notification sent")
+    except Exception as e:
+        print(f"  Discord error: {e}")
+
+    try:
         requests.post("https://api.pushover.net/1/messages.json", data={
             "token":   PUSHOVER_TOKEN,
             "user":    PUSHOVER_USER,
             "title":   f"Alert: {signal['ticker']} {signal['direction']}",
             "message": msg,
         })
+        print(f"  Pushover notification sent")
+    except Exception as e:
+        print(f"  Pushover error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -571,12 +725,18 @@ if __name__ == "__main__":
     # Run both immediately on start
     scan_stocks()
     scan_crypto()
+    send_morning_report()
 
     # Stock scan — once per day at 9:31am EST
     schedule.every().day.at("09:31").do(scan_stocks)
 
     # Crypto scan — every hour
     schedule.every(1).hours.do(scan_crypto)
+
+    #News updates — every weekday at 8:00am EST
+    schedule.every().day.at("08:00").do(send_morning_report)
+    print(f"Schedules registered: {schedule.jobs}")
+
 
     while True:
         schedule.run_pending()
