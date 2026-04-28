@@ -733,6 +733,7 @@ if __name__ == "__main__":
 
     #News updates — every weekday at 8:00am EST
     schedule.every().day.at("08:00").do(send_morning_report)
+    print(f"Schedules registered: {schedule.jobs}")
 
 
     while True:
