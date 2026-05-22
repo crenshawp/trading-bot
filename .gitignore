@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# uv
+.venv/
+
+# Claude Code harness (per-worktree scaffolding — never commit)
+.claude/
+
+# Databases (for future phases)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Local secrets (for future phases)
+.env
+.env.local

@@ -1,0 +1,71 @@
+[project]
+name = "trading-bot"
+version = "0.1.0"
+description = "Python algorithmic trading alert bot — scans stock/crypto watchlists and sends Discord/Pushover signals."
+authors = [
+    { name = "unkownuccr", email = "drigsstore1@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "yfinance",
+    "pandas",
+    "numpy",
+    "requests",
+    "schedule",
+    "python-dotenv",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.8,<0.12.0"]
+build-backend = "uv_build"
+
+# Flat package layout: trading_bot/ lives at the project root, not under src/.
+[tool.uv.build-backend]
+module-root = ""
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-include = ["*.py"]
+# Legacy files excluded pending Phase 1.2 migration.
+# Do not add new files here — fix lint at the source instead.
+#   tradingbot.py  — live bot (run by Procfile); 37-error legacy file
+#   backtest.py    — legacy backtester; unused imports, E701, missing newline
+#   backtest2.py   — legacy crypto backtester; same class of legacy issues
+extend-exclude = [".venv", "build", "dist", "tradingbot.py", "backtest.py", "backtest2.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+
+# Legacy root-level files are not held to strict typing yet (Phase 1.2).
+[[tool.mypy.overrides]]
+module = "*"
+ignore_errors = true
+
+# New code in trading_bot/ IS held to strict typing.
+[[tool.mypy.overrides]]
+module = "trading_bot.*"
+ignore_errors = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --cov=trading_bot --cov-report=term-missing --cov-fail-under=0"
