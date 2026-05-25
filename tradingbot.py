@@ -24,10 +24,6 @@ NEWS_WATCHLIST = ["BLK", "GOOGL", "META", "GS", "NOW", "AMZN", "LLY", "TSLA", "P
 CRYPTO_WATCHLIST = ["BTC-USD", "BNB-USD", "ETH-USD"]
 
 NOTIFY_METHOD    = "pushover"
-DISCORD_WEBHOOK  = "https://discordapp.com/api/webhooks/1489655770734657718/LBrV6158qOKFCacoppOqkrRZroOBeyJOaIbR09DDXJZkyHUjHPQW0it_-kWdTCWWtiDL"
-NEWSAPI_KEY      = "uokzEBhMdwXBGl68kurGxZUi1cunwftDIYdZmd8h"
-PUSHOVER_TOKEN   = "aay3zwof4v2ubykk5gbusm52e7pmme"
-PUSHOVER_USER    = "u7oonukvyknw5131jix4wgip9gb9dw"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INDICATORS
