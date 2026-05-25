@@ -2,6 +2,7 @@
 
 import os
 from collections.abc import Iterator
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -42,3 +43,17 @@ def mock_keyring() -> Iterator[dict[str, str]]:
         patch("keyring.delete_password", side_effect=fake_delete),
     ):
         yield store
+
+
+@pytest.fixture
+def tmp_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """Fresh, initialized database in a per-test temp directory.
+
+    db.py references ``config.DB_PATH`` (not a cached import), so patching
+    the source in config is sufficient.
+    """
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr("trading_bot.config.DB_PATH", db_path)
+    from trading_bot import db
+    db.init_db()
+    yield db_path

@@ -69,4 +69,4 @@ ignore_errors = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-v --cov=trading_bot --cov-report=term-missing --cov-fail-under=0"
+addopts = "-v --cov=trading_bot --cov-report=term-missing --cov-fail-under=85"
