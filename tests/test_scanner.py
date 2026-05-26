@@ -106,6 +106,65 @@ def test_log_signal_normalizes_signal_type(tmp_db: Path) -> None:
     assert row.signal_type == "higher_high_breakout"
 
 
+def test_log_signal_opens_a_trade(tmp_db: Path) -> None:
+    """Phase 1.3: every tradable signal opens a corresponding Trade row."""
+    sid = scanner.log_signal({
+        "ticker":      "GOOGL",
+        "asset_type":  "stock",
+        "direction":   "CALL 📈",
+        "setup":       "EMA21 Pullback",
+        "price":       180.0,
+        "take_profit": 185.0,
+        "stop_loss":   178.0,
+    })
+    assert sid is not None
+    trade = db.get_trade_by_signal_id(sid)
+    assert trade is not None
+    assert trade.outcome == "open"
+    assert trade.closed_at is None
+
+
+def test_log_signal_trade_references_signal_id(tmp_db: Path) -> None:
+    sid = scanner.log_signal({
+        "ticker":      "BTC-USD",
+        "asset_type":  "crypto",
+        "direction":   "LONG 📈",
+        "setup":       "Oversold Reversal",
+        "price":       50000.0,
+        "take_profit": 51000.0,
+        "stop_loss":   49500.0,
+    })
+    assert sid is not None
+    trade = db.get_trade_by_signal_id(sid)
+    assert trade is not None
+    assert trade.signal_id == sid
+
+
+def test_log_signal_does_not_double_open_trade_on_dedupe(tmp_db: Path) -> None:
+    """Calling log_signal twice with the same signal must not create two trades."""
+    payload = {
+        "ticker":      "META",
+        "asset_type":  "stock",
+        "direction":   "CALL 📈",
+        "setup":       "Higher High Breakout",
+        "price":       500.0,
+        "take_profit": 510.0,
+        "stop_loss":   495.0,
+    }
+    sid1 = scanner.log_signal(payload)
+    sid2 = scanner.log_signal(payload)
+    # Timestamps differ (each call uses datetime.now), so dedupe may or may
+    # not fire — but if both produce trades we'd be double-opening, which is
+    # the actual hazard. Check that count of trades == count of distinct sids.
+    distinct_sids = {sid1, sid2} - {None}
+    conn = db.get_connection()
+    try:
+        trade_count = conn.execute("SELECT COUNT(*) c FROM trades").fetchone()["c"]
+    finally:
+        conn.close()
+    assert trade_count == len(distinct_sids)
+
+
 def test_log_signal_skips_warning_entries(tmp_db: Path) -> None:
     """Legacy "⚠️ WARNING" earnings/news risk alerts don't fit the schema."""
     sid = scanner.log_signal({

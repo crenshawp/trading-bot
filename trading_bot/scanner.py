@@ -24,8 +24,8 @@ import requests
 import schedule
 import yfinance as yf
 
-from trading_bot import db
-from trading_bot.models import Signal
+from trading_bot import db, outcomes
+from trading_bot.models import Signal, Trade
 from trading_bot.secrets import get_required
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -390,12 +390,16 @@ def _normalize_signal_type(raw: str) -> str:
 
 
 def log_signal(signal: dict) -> int | None:
-    """Translate a legacy-shape ``signal`` dict into a ``Signal`` row.
+    """Translate a legacy-shape ``signal`` dict into a ``Signal`` row and open
+    a corresponding ``Trade`` record (Phase 1.3).
 
-    Returns the inserted (or deduped) row id, or ``None`` if the entry is a
+    Returns the inserted (or deduped) signal id, or ``None`` if the entry is a
     risk-warning alert (``direction = "⚠️ WARNING"``) that the legacy code
     uses for earnings/news risk. Those don't fit the trade-signal schema and
     are silently skipped — the Discord/Pushover alert still fires.
+
+    Trade-opening is idempotent: if a trade already exists for this signal_id
+    (e.g. dedupe collision or backfill ran first), no second trade is created.
     """
     direction   = _normalize_direction(str(signal.get("direction", "")))
     asset_class = str(signal.get("asset_type", ""))
@@ -420,7 +424,35 @@ def log_signal(signal: dict) -> int | None:
         stop_loss=float(stop_loss_raw) if stop_loss_raw is not None else None,
         take_profit=float(take_profit_raw) if take_profit_raw is not None else None,
     )
-    return db.insert_signal(rec)
+    signal_id = db.insert_signal(rec)
+
+    # Open a Trade if one doesn't already exist for this signal.
+    if db.get_trade_by_signal_id(signal_id) is None:
+        # Use the persisted signal's timestamp so backfill and live writes
+        # converge on the same opened_at after a dedupe collision.
+        persisted = db.get_signal_by_id(signal_id)
+        opened_at = persisted.timestamp if persisted is not None else rec.timestamp
+        db.insert_trade(Trade(signal_id=signal_id, opened_at=opened_at, outcome="open"))
+
+    return signal_id
+
+
+def _run_outcome_resolver() -> None:
+    """Thin wrapper called by the scheduler — never lets an exception escape.
+
+    Yfinance hiccups, rate limits, or schema surprises should NOT kill the
+    scheduling loop. They get logged to stderr and the next run tries again.
+    """
+    try:
+        result = outcomes.resolve_all_open_trades()
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] outcome resolver: "
+            f"wins={result['wins']} losses={result['losses']} "
+            f"expired={result['expired']} still_open={result['still_open']}"
+        )
+    except Exception as exc:
+        import sys
+        print(f"  outcome resolver error: {exc}", file=sys.stderr)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -856,6 +888,10 @@ def main() -> None:
 
     # News updates — every weekday at 8:00am EST
     schedule.every().day.at("08:00").do(send_morning_report)
+
+    # Resolve open trades every hour (Phase 1.3) — lightweight, only touches
+    # trades with outcome IS NULL or 'open' and skips already-closed ones.
+    schedule.every(1).hours.do(_run_outcome_resolver)
     print(f"Schedules registered: {schedule.jobs}")
 
     while True:

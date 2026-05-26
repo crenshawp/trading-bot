@@ -36,8 +36,27 @@ comment on the suppression.
 - [x] Phase 1.1b — Secrets layer
 - [x] Phase 1.1c — SQLite foundation
 - [x] Phase 1.2 — Migrate live scanner to SQLite
-- [ ] Phase 1.3 — Trade outcome tracking
+- [x] Phase 1.3 — Trade outcome tracking
 - [ ] Phase 1.4 — Performance attribution
+
+## Outcome resolution
+
+Phase 1.3 added automated win/loss/expired tracking for every fired signal.
+
+- Every call to `log_signal` opens a `Trade` row with `outcome='open'`.
+- The resolver (`trading_bot.outcomes.resolve_all_open_trades`) runs **hourly**
+  via the scanner's `schedule` loop. It pulls historical candles from yfinance
+  for each open trade and decides whether `take_profit` or `stop_loss` was hit
+  first within the hold window (default 30 days for stocks, 14 days for crypto).
+- **Same-candle TP+SL is conservatively marked as `loss`.** OHLC can't reveal
+  intra-candle ordering; we assume SL hits first to keep the win rate honest.
+- **PnL is percentage-only** for now. `pnl_dollars` stays `None` until Phase 7
+  (Risk Management) introduces position sizing.
+- `python -m trading_bot outcomes backfill` is a **one-shot** to seed Trades
+  for the 20 CSV-imported historical signals. It IS idempotent (re-running
+  creates zero new trades), but pointless to re-run.
+- `python -m trading_bot outcomes status` prints per-signal-type win rates
+  and average PnL.
 
 ## Railway deployment notes
 

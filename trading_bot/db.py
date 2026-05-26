@@ -235,6 +235,36 @@ def _row_to_signal(row: sqlite3.Row) -> Signal:
     )
 
 
+def get_signal_by_id(signal_id: int) -> Signal | None:
+    """Fetch a single signal by id, or None if absent."""
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM signals WHERE id = ?", (signal_id,)).fetchone()
+    finally:
+        conn.close()
+    return _row_to_signal(row) if row is not None else None
+
+
+def get_signals_without_trades() -> list[Signal]:
+    """Return every signal that has no corresponding Trade row.
+
+    Used by the Phase 1.3 backfill to seed Trade records for the historical
+    CSV-imported signals (and any future stragglers).
+    """
+    sql = (
+        "SELECT signals.* FROM signals "
+        "LEFT JOIN trades ON trades.signal_id = signals.id "
+        "WHERE trades.id IS NULL "
+        "ORDER BY signals.timestamp ASC"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_signal(r) for r in rows]
+
+
 def get_signals(
     ticker: str | None = None,
     since: datetime | None = None,
@@ -366,6 +396,21 @@ def get_open_trades() -> list[Trade]:
     finally:
         conn.close()
     return [_row_to_trade(r) for r in rows]
+
+
+def get_trade_by_signal_id(signal_id: int) -> Trade | None:
+    """Return the Trade for a given signal_id, or None if no trade exists yet.
+
+    Schema doesn't enforce 1:1 (no UNIQUE constraint on trades.signal_id)
+    so callers that rely on 1:1 should treat any result as "trade exists".
+    """
+    sql = "SELECT * FROM trades WHERE signal_id = ? ORDER BY id ASC LIMIT 1"
+    conn = get_connection()
+    try:
+        row = conn.execute(sql, (signal_id,)).fetchone()
+    finally:
+        conn.close()
+    return _row_to_trade(row) if row is not None else None
 
 
 # ---- daily performance ----

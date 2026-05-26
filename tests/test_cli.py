@@ -56,3 +56,81 @@ def test_cli_secrets_list(
     out = capsys.readouterr().out
     assert "DISCORD_WEBHOOK_URL" in out
     assert "NOT SET" in out
+
+
+# ───────────────────── Phase 1.3 outcomes subcommands ─────────────────────
+
+
+def test_outcomes_resolve_subcommand(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[bool] = []
+
+    def fake_resolve(**_kwargs: object) -> dict[str, int]:
+        calls.append(True)
+        return {"wins": 2, "losses": 1, "expired": 0, "still_open": 4}
+
+    monkeypatch.setattr("trading_bot.outcomes.resolve_all_open_trades", fake_resolve)
+    _run(["outcomes", "resolve"])
+    out = capsys.readouterr().out
+    assert calls, "outcomes resolve should call resolve_all_open_trades"
+    assert "wins=2" in out
+    assert "losses=1" in out
+    assert "still_open=4" in out
+
+
+def test_outcomes_backfill_subcommand(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "trading_bot.outcomes.backfill_signals_without_trades", lambda: 17
+    )
+    _run(["outcomes", "backfill"])
+    assert "Backfilled 17 signals" in capsys.readouterr().out
+
+
+def test_outcomes_status_subcommand(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "trading_bot.outcomes.summary",
+        lambda: {
+            "by_signal_type": [
+                {
+                    "signal_type": "ema21_pullback",
+                    "wins": 8, "losses": 4,
+                    "win_rate": 66.7, "avg_pnl": 2.31,
+                },
+                {
+                    "signal_type": "oversold_reversal",
+                    "wins": 3, "losses": 2,
+                    "win_rate": 60.0, "avg_pnl": -1.5,
+                },
+            ],
+            "open": 5,
+            "expired": 2,
+        },
+    )
+    _run(["outcomes", "status"])
+    out = capsys.readouterr().out
+    assert "ema21_pullback" in out
+    assert "66.7%" in out
+    assert "+2.31%" in out
+    assert "-1.50%" in out
+    assert "Open trades:    5" in out
+    assert "Expired trades: 2" in out
+
+
+def test_outcomes_status_empty_database(
+    tmp_db: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _run(["outcomes", "status"])
+    out = capsys.readouterr().out
+    assert "no closed trades yet" in out

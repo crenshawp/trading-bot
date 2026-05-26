@@ -4,7 +4,7 @@ import argparse
 import getpass
 import sys
 
-from trading_bot import db, secrets
+from trading_bot import db, outcomes, secrets
 from trading_bot.migrate_csv import migrate_csv
 
 # ---- secrets ----
@@ -65,6 +65,41 @@ def cmd_migrate_csv() -> None:
     print(f"Imported {imported} signals, skipped {skipped} malformed rows")
 
 
+# ---- outcomes ----
+
+
+def cmd_outcomes_resolve() -> None:
+    result = outcomes.resolve_all_open_trades()
+    print(
+        f"Resolved: wins={result['wins']} losses={result['losses']} "
+        f"expired={result['expired']} still_open={result['still_open']}"
+    )
+
+
+def cmd_outcomes_backfill() -> None:
+    created = outcomes.backfill_signals_without_trades()
+    print(f"Backfilled {created} signals")
+
+
+def cmd_outcomes_status() -> None:
+    report = outcomes.summary()
+    print("Outcomes by signal type (closed trades only):")
+    if not report["by_signal_type"]:
+        print("  (no closed trades yet)")
+    for entry in report["by_signal_type"]:
+        sign = "+" if entry["avg_pnl"] >= 0 else ""
+        print(
+            f"  {entry['signal_type']:<22}"
+            f" wins: {entry['wins']:>2}"
+            f"  losses: {entry['losses']:>2}"
+            f"  win_rate: {entry['win_rate']:>5.1f}%"
+            f"  avg_pnl: {sign}{entry['avg_pnl']:.2f}%"
+        )
+    print()
+    print(f"Open trades:    {report['open']}")
+    print(f"Expired trades: {report['expired']}")
+
+
 # ---- dispatcher ----
 
 
@@ -94,6 +129,13 @@ def main() -> None:
     migrate_sub = migrate_parser.add_subparsers(dest="migrate_cmd", required=True)
     migrate_sub.add_parser("csv")
 
+    # outcomes
+    outcomes_parser = sub.add_parser("outcomes")
+    outcomes_sub = outcomes_parser.add_subparsers(dest="outcomes_cmd", required=True)
+    outcomes_sub.add_parser("resolve")
+    outcomes_sub.add_parser("backfill")
+    outcomes_sub.add_parser("status")
+
     args = parser.parse_args()
 
     if args.command == "secrets":
@@ -112,6 +154,13 @@ def main() -> None:
             cmd_db_status()
     elif args.command == "migrate" and args.migrate_cmd == "csv":
         cmd_migrate_csv()
+    elif args.command == "outcomes":
+        if args.outcomes_cmd == "resolve":
+            cmd_outcomes_resolve()
+        elif args.outcomes_cmd == "backfill":
+            cmd_outcomes_backfill()
+        elif args.outcomes_cmd == "status":
+            cmd_outcomes_status()
 
 
 if __name__ == "__main__":
