@@ -24,7 +24,7 @@ import requests
 import schedule
 import yfinance as yf
 
-from trading_bot import db, outcomes
+from trading_bot import db, outcomes, performance
 from trading_bot.models import Signal, Trade
 from trading_bot.secrets import get_required
 
@@ -453,6 +453,21 @@ def _run_outcome_resolver() -> None:
     except Exception as exc:
         import sys
         print(f"  outcome resolver error: {exc}", file=sys.stderr)
+
+
+def _run_daily_perf_update() -> None:
+    """Materialize yesterday's daily_performance row. Swallow-all on failure
+    so a transient DB error doesn't kill the scheduling loop."""
+    try:
+        perf = performance.update_daily_performance()
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] daily perf: {perf.date} "
+            f"signals={perf.signals_fired} opened={perf.trades_opened} "
+            f"closed={perf.trades_closed} wins={perf.wins} losses={perf.losses}"
+        )
+    except Exception as exc:
+        import sys
+        print(f"  daily perf update error: {exc}", file=sys.stderr)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -892,6 +907,10 @@ def main() -> None:
     # Resolve open trades every hour (Phase 1.3) — lightweight, only touches
     # trades with outcome IS NULL or 'open' and skips already-closed ones.
     schedule.every(1).hours.do(_run_outcome_resolver)
+
+    # Materialize yesterday's daily_performance row daily at 00:30 UTC
+    # (~20:30 ET, well after market close and the hourly resolver). Phase 1.4.
+    schedule.every().day.at("00:30", "UTC").do(_run_daily_perf_update)
     print(f"Schedules registered: {schedule.jobs}")
 
     while True:

@@ -37,7 +37,13 @@ comment on the suppression.
 - [x] Phase 1.1c — SQLite foundation
 - [x] Phase 1.2 — Migrate live scanner to SQLite
 - [x] Phase 1.3 — Trade outcome tracking
-- [ ] Phase 1.4 — Performance attribution
+- [x] Phase 1.4 — Performance attribution
+
+### Phase 1 complete. Phase 2 sub-phases queued:
+
+- [ ] Phase 2.1 — Market context (regime detection, breadth, VIX)
+- [ ] Phase 2.2 — News-aware signal weighting
+- [ ] Phase 2.3 — Watchlist auto-discovery
 
 ## Outcome resolution
 
@@ -57,6 +63,44 @@ Phase 1.3 added automated win/loss/expired tracking for every fired signal.
   creates zero new trades), but pointless to re-run.
 - `python -m trading_bot outcomes status` prints per-signal-type win rates
   and average PnL.
+
+## Reporting
+
+Phase 1.4 added a `report` CLI that answers performance questions without
+hand-rolling SQL. Every command queries the existing signals+trades tables
+and never hits the network.
+
+```
+python -m trading_bot report overall              # single-block summary
+python -m trading_bot report recent --days 30     # last N days
+python -m trading_bot report by-signal            # per signal_type
+python -m trading_bot report by-ticker [--stocks | --crypto]
+python -m trading_bot report by-asset             # stock vs crypto
+python -m trading_bot report cross                # signal_type × ticker (≥3 trades)
+python -m trading_bot report daily-backfill       # one-shot daily_performance seed
+python -m trading_bot report daily [--date YYYY-MM-DD]
+```
+
+### Aggregation rules (the only ones that matter)
+
+- **"Closed" means** `outcome IN ('win', 'loss', 'expired')`. Trades with
+  `outcome IS NULL` or `outcome = 'open'` are excluded from every stat.
+- **Win rate = wins / (wins + losses).** Expired trades do **not** count
+  toward the denominator. All-expired slices report `win_rate = None`
+  (the CLI prints `-`), not `0%`.
+- **Avg / best / worst PnL include expired trades.** An expired trade with
+  no available exit (`pnl_pct IS NULL`) is silently ignored by AVG/MAX/MIN
+  but still counts toward `total` and the `expired` bucket.
+- **Empty slices return numeric `None`**, never 0 — so the CLI can render
+  `-` instead of misleading "0% win rate".
+
+### Daily performance
+
+`daily_performance` rows are populated by the scheduler at **00:30 UTC**
+each day (covers yesterday's trades). The hourly outcome resolver runs
+first, so most decisions are settled by the time daily perf updates. Use
+`python -m trading_bot report daily-backfill` once after a long downtime
+to fill in any gaps; afterward the scheduler keeps it fresh.
 
 ## Railway deployment notes
 
