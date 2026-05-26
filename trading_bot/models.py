@@ -39,6 +39,8 @@ class Trade:
     pnl_dollars: float | None = None
     notes: str | None = None
     market_regime: str | None = None  # "bull" | "bear" | "sideways" | "unknown" (Phase 2.1)
+    vix_level: float | None = None    # close-of-day VIX at fire time (Phase 2.2)
+    vix_band: str | None = None       # "low" | "elevated" | "high" | "extreme" | "unknown"
     id: int | None = None
 
 
@@ -64,4 +66,9 @@ VALID_OUTCOMES: frozenset[str] = frozenset(
 # unfetchable at signal fire time — we still log the trade rather than skip it.
 VALID_MARKET_REGIMES: frozenset[str] = frozenset(
     {"bull", "bear", "sideways", "unknown"}
+)
+# Phase 2.2 VIX bands. "unknown" is the fallback when VIX is unfetchable
+# at fire time — we still log the trade rather than skipping it.
+VALID_VIX_BANDS: frozenset[str] = frozenset(
+    {"low", "elevated", "high", "extreme", "unknown"}
 )

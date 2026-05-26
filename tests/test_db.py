@@ -30,11 +30,11 @@ def _make_signal(**overrides: Any) -> Signal:
 def test_init_db_is_idempotent(tmp_db: Path) -> None:
     db.init_db()  # tmp_db already called init_db once; second call must not error
     db.init_db()
-    assert db.schema_version() == 2
+    assert db.schema_version() == 3
 
 
 def test_schema_version_is_1_after_init(tmp_db: Path) -> None:
-    assert db.schema_version() == 2
+    assert db.schema_version() == 3
 
 
 # ---- signals ----
@@ -192,7 +192,8 @@ def test_get_daily_performance_returns_none_when_absent(tmp_db: Path) -> None:
 def test_get_table_counts_zero_on_fresh_db(tmp_db: Path) -> None:
     counts = db.get_table_counts()
     assert counts == {
-        "signals": 0, "trades": 0, "daily_performance": 0, "regime_snapshots": 0,
+        "signals": 0, "trades": 0, "daily_performance": 0,
+        "regime_snapshots": 0, "vix_snapshots": 0,
     }
 
 

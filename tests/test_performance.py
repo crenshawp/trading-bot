@@ -524,3 +524,148 @@ def test_stats_by_regime_empty_database(tmp_db: Path) -> None:
 
 def test_stats_by_signal_type_with_regime_empty(tmp_db: Path) -> None:
     assert performance.stats_by_signal_type_with_regime() == []
+
+
+# ────────────────────── VIX-aware slices (Phase 2.2) ──────────────────────
+
+
+def _seed_with_axes(
+    *,
+    market_regime: str | None = None,
+    vix_band: str | None = None,
+    vix_level: float | None = None,
+    ticker: str = "GOOGL",
+    signal_type: str = "ema21_pullback",
+    asset_class: str = "stock",
+    direction: str = "call",
+    outcome: str = "win",
+    pnl_pct: float = 5.0,
+    timestamp: datetime | None = None,
+) -> int:
+    """Seed a signal+trade with both regime and VIX tags."""
+    ts = timestamp if timestamp is not None else datetime(2026, 4, 1, tzinfo=UTC)
+    sid = db.insert_signal(Signal(
+        timestamp=ts, ticker=ticker, asset_class=asset_class,
+        signal_type=signal_type, direction=direction,
+        entry_price=100.0, take_profit=110.0, stop_loss=95.0,
+    ))
+    return db.insert_trade(Trade(
+        signal_id=sid, opened_at=ts,
+        closed_at=ts + timedelta(days=2),
+        outcome=outcome, exit_price=105.0, pnl_pct=pnl_pct,
+        market_regime=market_regime,
+        vix_level=vix_level, vix_band=vix_band,
+    ))
+
+
+def test_stats_by_vix_band_orders_low_elevated_high_extreme_unknown(
+    tmp_db: Path,
+) -> None:
+    base = datetime(2026, 4, 1, tzinfo=UTC)
+    _seed_with_axes(vix_band="extreme", timestamp=base + timedelta(seconds=1),
+                    outcome="loss", pnl_pct=-3.0)
+    _seed_with_axes(vix_band="unknown", timestamp=base + timedelta(seconds=2))
+    _seed_with_axes(vix_band="low",     timestamp=base + timedelta(seconds=3))
+    _seed_with_axes(vix_band="high",    timestamp=base + timedelta(seconds=4))
+    _seed_with_axes(vix_band="elevated", timestamp=base + timedelta(seconds=5))
+    result = performance.stats_by_vix_band()
+    assert [s.label for s in result] == [
+        "low", "elevated", "high", "extreme", "unknown",
+    ]
+
+
+def test_stats_by_vix_band_folds_null_into_unknown(tmp_db: Path) -> None:
+    _seed_with_axes(vix_band=None)
+    result = performance.stats_by_vix_band()
+    assert len(result) == 1
+    assert result[0].label == "unknown"
+
+
+def test_stats_by_signal_type_with_vix_builds_matrix(tmp_db: Path) -> None:
+    base = datetime(2026, 4, 1, tzinfo=UTC)
+    _seed_with_axes(vix_band="low", signal_type="ema21_pullback",
+                    timestamp=base, outcome="win", pnl_pct=5.0)
+    _seed_with_axes(vix_band="low", signal_type="ema21_pullback",
+                    timestamp=base + timedelta(seconds=1),
+                    outcome="win", pnl_pct=3.0)
+    _seed_with_axes(vix_band="elevated", signal_type="ema21_pullback",
+                    timestamp=base + timedelta(seconds=2),
+                    outcome="loss", pnl_pct=-2.0)
+    _seed_with_axes(vix_band="low", signal_type="oversold_reversal",
+                    ticker="BTC-USD", asset_class="crypto", direction="long",
+                    timestamp=base + timedelta(seconds=3),
+                    outcome="win", pnl_pct=7.0)
+
+    rows = performance.stats_by_signal_type_with_vix()
+    by_label = {r.label: r for r in rows}
+
+    ep = by_label["ema21_pullback"]
+    assert ep.overall.total == 3
+    assert ep.by_vix["low"].wins == 2
+    assert ep.by_vix["elevated"].losses == 1
+    assert "high" not in ep.by_vix
+
+
+def test_stats_by_ticker_with_vix_filters_by_asset_class(tmp_db: Path) -> None:
+    base = datetime(2026, 4, 1, tzinfo=UTC)
+    _seed_with_axes(vix_band="low", ticker="GOOGL", timestamp=base)
+    _seed_with_axes(vix_band="elevated", ticker="BTC-USD",
+                    asset_class="crypto", direction="long",
+                    signal_type="oversold_reversal",
+                    timestamp=base + timedelta(seconds=1),
+                    outcome="win", pnl_pct=7.0)
+
+    stocks = performance.stats_by_ticker_with_vix(asset_class="stock")
+    assert {r.label for r in stocks} == {"GOOGL"}
+    crypto = performance.stats_by_ticker_with_vix(asset_class="crypto")
+    assert {r.label for r in crypto} == {"BTC-USD"}
+
+
+def test_stats_by_ticker_with_vix_rejects_bad_asset_class(tmp_db: Path) -> None:
+    with pytest.raises(ValueError, match="asset_class"):
+        performance.stats_by_ticker_with_vix(asset_class="forex")
+
+
+def test_stats_by_regime_x_vix_sorts_by_trade_count_desc(tmp_db: Path) -> None:
+    base = datetime(2026, 4, 1, tzinfo=UTC)
+    # bull/low: 3 trades, bull/elevated: 2, sideways/low: 1
+    for i in range(3):
+        _seed_with_axes(
+            market_regime="bull", vix_band="low",
+            timestamp=base + timedelta(seconds=i),
+        )
+    for i in range(2):
+        _seed_with_axes(
+            market_regime="bull", vix_band="elevated",
+            timestamp=base + timedelta(seconds=10 + i),
+        )
+    _seed_with_axes(
+        market_regime="sideways", vix_band="low",
+        timestamp=base + timedelta(seconds=20),
+    )
+
+    rows = performance.stats_by_regime_x_vix()
+    assert [r.label for r in rows] == [
+        "bull / low", "bull / elevated", "sideways / low",
+    ]
+    assert [r.total for r in rows] == [3, 2, 1]
+
+
+def test_stats_by_regime_x_vix_omits_empty_buckets(tmp_db: Path) -> None:
+    """Only non-empty (regime, vix) buckets show up."""
+    _seed_with_axes(market_regime="bull", vix_band="low")
+    rows = performance.stats_by_regime_x_vix()
+    assert len(rows) == 1
+    assert rows[0].label == "bull / low"
+
+
+def test_stats_by_vix_band_empty(tmp_db: Path) -> None:
+    assert performance.stats_by_vix_band() == []
+
+
+def test_stats_by_regime_x_vix_empty(tmp_db: Path) -> None:
+    assert performance.stats_by_regime_x_vix() == []
+
+
+def test_stats_by_signal_type_with_vix_empty(tmp_db: Path) -> None:
+    assert performance.stats_by_signal_type_with_vix() == []

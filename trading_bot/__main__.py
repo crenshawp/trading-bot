@@ -5,9 +5,9 @@ import getpass
 import sys
 from datetime import date
 
-from trading_bot import db, outcomes, performance, regime, secrets
+from trading_bot import db, outcomes, performance, regime, secrets, vix
 from trading_bot.migrate_csv import migrate_csv
-from trading_bot.performance import PerfStats, RegimeBreakdown
+from trading_bot.performance import PerfStats, RegimeBreakdown, VixBreakdown
 
 # ---- secrets ----
 
@@ -212,7 +212,7 @@ def cmd_report_daily_backfill() -> None:
     print(f"Backfilled daily_performance for {count} dates")
 
 
-def _format_regime_age(cached_at: object) -> str:
+def _format_cache_age(cached_at: object) -> str:
     """Return a human-readable age string like '4 hours' or '23 minutes'.
 
     Accepts a datetime or None. The CLI prints 'unknown' for missing cache
@@ -245,7 +245,7 @@ def cmd_regime_current() -> None:
     except regime.RegimeFetchError as exc:
         print(f"Regime fetch error: {exc}", file=sys.stderr)
         sys.exit(1)
-    age = _format_regime_age(regime.last_cached_at())
+    age = _format_cache_age(regime.last_cached_at())
     ema50_marker = "above 200 EMA" if snap.ema50 > snap.ema200 else (
         "below 200 EMA" if snap.ema50 < snap.ema200 else "equal to 200 EMA"
     )
@@ -312,31 +312,65 @@ def _fmt_cell(stats: PerfStats | None) -> str:
     return f"{stats.wins}/{decided} {stats.win_rate:.0f}%"
 
 
+def _format_axis_matrix(
+    rows: list[object],
+    title: str,
+    label_header: str,
+    axis_keys: tuple[str, ...],
+    axis_headers: tuple[str, ...],
+    cell_getter: object,
+) -> str:
+    """Render a label × axis cross-tab. ``cell_getter`` extracts the per-axis
+    dict from a breakdown row (e.g. ``lambda r: r.by_regime`` or
+    ``lambda r: r.by_vix``). ``axis_keys`` is the lookup order on that dict,
+    ``axis_headers`` the display labels. Both are positionally aligned."""
+    if not rows:
+        return f"{title}\n  (no closed trades)"
+
+    # rows are RegimeBreakdown | VixBreakdown — both expose .label and .overall.
+    label_w = max(18, max(len(getattr(r, "label")) for r in rows))  # noqa: B009
+    cell_w = 12
+    header_cells = "".join(h.ljust(cell_w) for h in axis_headers)
+    header = f"  {label_header:<{label_w}}  {header_cells}{'Overall':<{cell_w}}"
+    lines = [title, header]
+
+    # Local typed cast — cell_getter is callable but kept loosely typed at the
+    # signature boundary so it can accept either RegimeBreakdown or VixBreakdown.
+    getter = cell_getter
+    for r in rows:
+        bucket = getter(r)  # type: ignore[operator]
+        cells = "".join(_fmt_cell(bucket.get(k)).ljust(cell_w) for k in axis_keys)
+        overall_cell = _fmt_cell(getattr(r, "overall"))  # noqa: B009
+        lines.append(
+            f"  {getattr(r, 'label'):<{label_w}}  {cells}{overall_cell:<{cell_w}}"  # noqa: B009
+        )
+    return "\n".join(lines)
+
+
 def _format_regime_matrix(
     rows: list[RegimeBreakdown], title: str, label_header: str
 ) -> str:
-    if not rows:
-        return f"{title}\n  (no closed trades)"
-    label_w = max(18, max(len(r.label) for r in rows))
-    cell_w = 12
-    header = (
-        f"  {label_header:<{label_w}}"
-        f"  {'Bull':<{cell_w}}{'Sideways':<{cell_w}}{'Bear':<{cell_w}}"
-        f"{'Unknown':<{cell_w}}{'Overall':<{cell_w}}"
+    return _format_axis_matrix(
+        rows=list(rows),
+        title=title,
+        label_header=label_header,
+        axis_keys=("bull", "sideways", "bear", "unknown"),
+        axis_headers=("Bull", "Sideways", "Bear", "Unknown"),
+        cell_getter=lambda r: r.by_regime,
     )
-    lines = [title, header]
-    for r in rows:
-        bull   = _fmt_cell(r.by_regime.get("bull"))
-        side   = _fmt_cell(r.by_regime.get("sideways"))
-        bear   = _fmt_cell(r.by_regime.get("bear"))
-        unkn   = _fmt_cell(r.by_regime.get("unknown"))
-        ovr    = _fmt_cell(r.overall)
-        lines.append(
-            f"  {r.label:<{label_w}}"
-            f"  {bull:<{cell_w}}{side:<{cell_w}}{bear:<{cell_w}}"
-            f"{unkn:<{cell_w}}{ovr:<{cell_w}}"
-        )
-    return "\n".join(lines)
+
+
+def _format_vix_matrix(
+    rows: list[VixBreakdown], title: str, label_header: str
+) -> str:
+    return _format_axis_matrix(
+        rows=list(rows),
+        title=title,
+        label_header=label_header,
+        axis_keys=("low", "elevated", "high", "extreme", "unknown"),
+        axis_headers=("Low", "Elevated", "High", "Extreme", "Unknown"),
+        cell_getter=lambda r: r.by_vix,
+    )
 
 
 def cmd_report_by_regime() -> None:
@@ -376,6 +410,126 @@ def cmd_report_by_ticker_regime(asset_class: str | None) -> None:
     if asset_class is not None:
         title = f"BY TICKER x REGIME ({asset_class})"
     print(_format_regime_matrix(rows, title=title, label_header="Ticker"))
+
+
+# ---- VIX CLI (Phase 2.2) ----
+
+
+def cmd_vix_current() -> None:
+    try:
+        snap = vix.get_current_vix()
+    except vix.VixFetchError as exc:
+        print(f"VIX fetch error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    age = _format_cache_age(vix.last_cached_at())
+    thresholds = {
+        "low":      "< 20",
+        "elevated": "20 <= x < 30",
+        "high":     "30 <= x < 40",
+        "extreme":  ">= 40",
+        "unknown":  "fetch failed",
+    }
+    thr = thresholds.get(snap.vix_band, "")
+    print(f"VIX: {snap.vix_level:.1f} ({snap.vix_band})")
+    print("-" * 38)
+    print(f"Level:         {snap.vix_level:.1f}")
+    print(f"Band:          {snap.vix_band:<8} (threshold: {thr})")
+    print(f"Snapshot age:  {age}")
+
+
+def cmd_vix_history(days: int) -> None:
+    rows = db.get_vix_snapshots(limit=days)
+    if not rows:
+        print("VIX history")
+        print("  (no snapshots recorded)")
+        return
+    print("VIX history")
+    print(f"  {'Date':<12} {'Level':>7}   {'Band':<10}")
+    for row in rows:
+        print(
+            f"  {row['date']:<12} {row['vix_level']:>7.2f}   {row['vix_band']:<10}"
+        )
+
+
+def cmd_vix_backfill() -> None:
+    summary = vix.backfill_trade_vix()
+    print(
+        f"Backfilled {summary['trades_updated']} trades across "
+        f"{summary['dates_snapshotted']} unique dates. "
+        f"{summary['errors']} errors."
+    )
+    if summary["skipped_no_data"] > 0:
+        print(
+            f"  ({summary['skipped_no_data']} trades skipped — "
+            f"opened_at fell on a non-trading date or pre-history)"
+        )
+
+
+def cmd_report_by_vix() -> None:
+    stats = performance.stats_by_vix_band()
+    if not stats:
+        print("BY VIX BAND\n  (no closed trades)")
+        return
+    print("BY VIX BAND")
+    print(
+        f"  {'Band':<12} {'Trades':>6}  {'Wins':>4}  {'Losses':>6}  "
+        f"{'Expired':>7}  {'Win rate':>8}  {'Avg PnL':>8}"
+    )
+    for s in stats:
+        wr = "    -" if s.win_rate is None else f"{s.win_rate:.1f}%"
+        ap = (
+            "    -" if s.avg_pnl_pct is None
+            else f"{'+' if s.avg_pnl_pct >= 0 else ''}{s.avg_pnl_pct:.2f}%"
+        )
+        print(
+            f"  {s.label:<12} {s.total:>6}  {s.wins:>4}  {s.losses:>6}  "
+            f"{s.expired:>7}  {wr:>8}  {ap:>8}"
+        )
+
+
+def cmd_report_by_signal_vix() -> None:
+    rows = performance.stats_by_signal_type_with_vix()
+    print(_format_vix_matrix(
+        rows, title="BY SIGNAL TYPE x VIX", label_header="Signal",
+    ))
+
+
+def cmd_report_by_ticker_vix(asset_class: str | None) -> None:
+    rows = performance.stats_by_ticker_with_vix(asset_class=asset_class)
+    title = "BY TICKER x VIX"
+    if asset_class is not None:
+        title = f"BY TICKER x VIX ({asset_class})"
+    print(_format_vix_matrix(rows, title=title, label_header="Ticker"))
+
+
+def cmd_report_by_regime_vix() -> None:
+    """The headline Phase 2.2 view: every regime x VIX bucket with data,
+    sorted by trade count desc. See ``stats_by_regime_x_vix`` for the
+    aggregation rules."""
+    stats = performance.stats_by_regime_x_vix()
+    if not stats:
+        print("BY REGIME x VIX\n  (no closed trades)")
+        return
+    print("BY REGIME x VIX")
+    print(
+        f"  {'Regime':<10} {'VIX Band':<10} {'Trades':>6}  {'Wins':>4}  "
+        f"{'Losses':>6}  {'Expired':>7}  {'Win rate':>8}  {'Avg PnL':>8}"
+    )
+    for s in stats:
+        # label looks like "bull / low" — split for display.
+        if " / " in s.label:
+            regime_part, vix_part = s.label.split(" / ", 1)
+        else:  # pragma: no cover - defensive; aggregator always uses ' / '
+            regime_part, vix_part = s.label, "-"
+        wr = "    -" if s.win_rate is None else f"{s.win_rate:.1f}%"
+        ap = (
+            "    -" if s.avg_pnl_pct is None
+            else f"{'+' if s.avg_pnl_pct >= 0 else ''}{s.avg_pnl_pct:.2f}%"
+        )
+        print(
+            f"  {regime_part:<10} {vix_part:<10} {s.total:>6}  {s.wins:>4}  "
+            f"{s.losses:>6}  {s.expired:>7}  {wr:>8}  {ap:>8}"
+        )
 
 
 def cmd_report_daily(target_date: date | None) -> None:
@@ -433,19 +587,27 @@ def main() -> None:
     recent_p = report_sub.add_parser("recent")
     recent_p.add_argument("--days", type=int, default=30)
     bs_p = report_sub.add_parser("by-signal")
-    bs_p.add_argument("--by-regime", action="store_true",
-                      help="Break out win rates by macro regime (Phase 2.1)")
+    bs_axis = bs_p.add_mutually_exclusive_group()
+    bs_axis.add_argument("--by-regime", action="store_true",
+                         help="Break out win rates by macro regime (Phase 2.1)")
+    bs_axis.add_argument("--by-vix", action="store_true",
+                         help="Break out win rates by VIX band (Phase 2.2)")
     bt_p = report_sub.add_parser("by-ticker")
     bt_group = bt_p.add_mutually_exclusive_group()
     bt_group.add_argument("--stocks", action="store_true",
                           help="Restrict to asset_class='stock'")
     bt_group.add_argument("--crypto", action="store_true",
                           help="Restrict to asset_class='crypto'")
-    bt_p.add_argument("--by-regime", action="store_true",
-                      help="Break out win rates by macro regime (Phase 2.1)")
+    bt_axis = bt_p.add_mutually_exclusive_group()
+    bt_axis.add_argument("--by-regime", action="store_true",
+                         help="Break out win rates by macro regime (Phase 2.1)")
+    bt_axis.add_argument("--by-vix", action="store_true",
+                         help="Break out win rates by VIX band (Phase 2.2)")
     report_sub.add_parser("by-asset")
     report_sub.add_parser("cross")
     report_sub.add_parser("by-regime")
+    report_sub.add_parser("by-vix")
+    report_sub.add_parser("by-regime-vix")
     report_sub.add_parser("daily-backfill")
     daily_p = report_sub.add_parser("daily")
     daily_p.add_argument("--date", type=str, default=None,
@@ -459,6 +621,15 @@ def main() -> None:
     hist_p.add_argument("--days", type=int, default=30,
                         help="How many recent snapshots to show (default 30)")
     regime_sub.add_parser("backfill")
+
+    # vix (Phase 2.2)
+    vix_parser = sub.add_parser("vix")
+    vix_sub = vix_parser.add_subparsers(dest="vix_cmd", required=True)
+    vix_sub.add_parser("current")
+    vhist_p = vix_sub.add_parser("history")
+    vhist_p.add_argument("--days", type=int, default=30,
+                         help="How many recent snapshots to show (default 30)")
+    vix_sub.add_parser("backfill")
 
     args = parser.parse_args()
 
@@ -493,12 +664,16 @@ def main() -> None:
         elif args.report_cmd == "by-signal":
             if getattr(args, "by_regime", False):
                 cmd_report_by_signal_regime()
+            elif getattr(args, "by_vix", False):
+                cmd_report_by_signal_vix()
             else:
                 cmd_report_by_signal()
         elif args.report_cmd == "by-ticker":
             asset = "stock" if args.stocks else "crypto" if args.crypto else None
             if getattr(args, "by_regime", False):
                 cmd_report_by_ticker_regime(asset)
+            elif getattr(args, "by_vix", False):
+                cmd_report_by_ticker_vix(asset)
             else:
                 cmd_report_by_ticker(asset)
         elif args.report_cmd == "by-asset":
@@ -507,6 +682,10 @@ def main() -> None:
             cmd_report_cross()
         elif args.report_cmd == "by-regime":
             cmd_report_by_regime()
+        elif args.report_cmd == "by-vix":
+            cmd_report_by_vix()
+        elif args.report_cmd == "by-regime-vix":
+            cmd_report_by_regime_vix()
         elif args.report_cmd == "daily-backfill":
             cmd_report_daily_backfill()
         elif args.report_cmd == "daily":
@@ -519,6 +698,13 @@ def main() -> None:
             cmd_regime_history(args.days)
         elif args.regime_cmd == "backfill":
             cmd_regime_backfill()
+    elif args.command == "vix":
+        if args.vix_cmd == "current":
+            cmd_vix_current()
+        elif args.vix_cmd == "history":
+            cmd_vix_history(args.days)
+        elif args.vix_cmd == "backfill":
+            cmd_vix_backfill()
 
 
 if __name__ == "__main__":

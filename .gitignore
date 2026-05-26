@@ -26,3 +26,6 @@ htmlcov/
 
 # Phase 2.1 — macro regime cache (24h TTL, regenerated on demand)
 .regime_cache.json
+
+# Phase 2.2 — VIX cache (1h TTL, regenerated on demand)
+.vix_cache.json

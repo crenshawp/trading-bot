@@ -39,11 +39,13 @@ comment on the suppression.
 - [x] Phase 1.3 — Trade outcome tracking
 - [x] Phase 1.4 — Performance attribution
 - [x] Phase 2.1 — Macro regime detection (bull/bear/sideways)
+- [x] Phase 2.2 — VIX context (low/elevated/high/extreme + regime x vix matrix)
 
 ### Phase 2 sub-phases queued:
 
-- [ ] Phase 2.2 — VIX & breadth context (volatility regime layered on macro)
-- [ ] Phase 2.3 — Regime-aware reporting consolidation / News-aware weighting
+- [ ] Phase 2.3 — Regime+VIX consolidation: weighted scoring,
+      regime+vix filters, confidence flags emitted at signal fire,
+      News-aware weighting layered in
 - [ ] Phase 2.4 — Watchlist auto-discovery
 
 ## Outcome resolution
@@ -80,6 +82,10 @@ python -m trading_bot report by-ticker [--stocks | --crypto]
 python -m trading_bot report by-ticker --by-regime  # ticker x regime matrix (Phase 2.1)
 python -m trading_bot report by-asset             # stock vs crypto
 python -m trading_bot report by-regime            # per macro regime (Phase 2.1)
+python -m trading_bot report by-vix               # per VIX band (Phase 2.2)
+python -m trading_bot report by-regime-vix        # regime x vix matrix (Phase 2.2 headline view)
+python -m trading_bot report by-signal --by-vix   # signal x vix matrix (Phase 2.2)
+python -m trading_bot report by-ticker --by-vix   # ticker x vix matrix (Phase 2.2)
 python -m trading_bot report cross                # signal_type x ticker (>=3 trades)
 python -m trading_bot report daily-backfill       # one-shot daily_performance seed
 python -m trading_bot report daily [--date YYYY-MM-DD]
@@ -91,6 +97,14 @@ python -m trading_bot report daily [--date YYYY-MM-DD]
 python -m trading_bot regime current              # latest bull/bear/sideways + indicators
 python -m trading_bot regime history --days 30    # recent regime_snapshots
 python -m trading_bot regime backfill             # one-shot: tag closed trades w/ historical regime
+```
+
+### VIX CLI (Phase 2.2)
+
+```
+python -m trading_bot vix current                 # latest VIX level + band
+python -m trading_bot vix history --days 30       # recent vix_snapshots
+python -m trading_bot vix backfill                # one-shot: tag closed trades w/ historical VIX
 ```
 
 ### Aggregation rules (the only ones that matter)
@@ -147,6 +161,57 @@ classified from SPY:
 `'unknown'` plus a stderr log line. The signal still fires to
 Discord/Pushover and is still logged to the database — the regime
 column is the only thing affected.
+
+## VIX Context (Phase 2.2)
+
+Layered on top of macro regime. Every trade also carries a
+`vix_level` (float) and `vix_band` (one of below) at fire time. Regime
+tells us direction; VIX tells us how violently the market is moving.
+
+- **low** — `VIX < 20` (quiet, complacent)
+- **elevated** — `20 <= VIX < 30` (cautious, choppy)
+- **high** — `30 <= VIX < 40` (fear, fast moves)
+- **extreme** — `VIX >= 40` (panic, do not trade size)
+- **unknown** — fallback when yfinance is unreachable at fire time;
+  `vix_level` is NULL in this case, `vix_band` is `'unknown'`.
+  Signal still fires.
+
+Boundary values go to the **higher** band — VIX 20.0 is elevated, not
+low. Standard market convention.
+
+### Key rules
+
+- VIX is tagged at fire time, never retroactively (except via
+  `python -m trading_bot vix backfill`).
+- VIX drives context for ALL asset classes including crypto. A VIX
+  spike rattles crypto along with equities — that's relevant.
+- `vix_snapshots` table holds one row per trading date. Populated by:
+  1. the scheduled daily job at 09:36 EST (one minute after the
+     regime snapshot), and
+  2. the backfill subcommand (historical dates).
+- Cache: `get_current_vix()` is cached **1 hour** in memory + on disk
+  at `.vix_cache.json` (gitignored). The shorter TTL vs regime's 24h
+  reflects how much faster VIX moves; crypto scans (hourly) always
+  see fresh data.
+- VIX does **not** trade weekends. `vix_snapshots` is sparse on
+  Sat/Sun and on market holidays. Backfill skips those dates.
+
+### When yfinance fails
+
+`VixFetchError` is raised; the scanner catches it and tags the trade
+`vix_band='unknown'` with `vix_level=None`, plus a stderr log line.
+Signal capture is never blocked.
+
+### The `report by-regime-vix` view
+
+This is the single most important Phase 2 analytical surface. It
+answers: *which combinations of macro direction and volatility are
+actually profitable for us?* Once enough live data accumulates,
+Phase 4 (Strategy Evolution) will use this view to gate signals —
+suppress combos with negative expectancy, lean into the winners.
+
+Sort order is trade count descending so the most-populated buckets
+surface first. Empty buckets are omitted entirely (no `0/0` noise).
 
 ## Railway deployment notes
 

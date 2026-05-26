@@ -22,13 +22,13 @@ def _run(argv: list[str]) -> None:
 def test_cli_db_init_prints_version(tmp_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _run(["db", "init"])
     out = capsys.readouterr().out
-    assert "Schema version: 2" in out
+    assert "Schema version: 3" in out
 
 
 def test_cli_db_status_shows_counts(tmp_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _run(["db", "status"])
     out = capsys.readouterr().out
-    assert "Schema version: 2" in out
+    assert "Schema version: 3" in out
     assert "signals" in out
     assert "trades" in out
     assert "daily_performance" in out
@@ -501,6 +501,278 @@ def test_cli_report_by_signal_without_regime_flag_uses_old_view(
     )
     _run(["report", "by-signal"])
     assert "BY SIGNAL TYPE" in capsys.readouterr().out
+
+
+# ───────────────────── Phase 2.2 vix + by-vix + by-regime-vix ─────────────────────
+
+
+def test_cli_vix_current_happy_path(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    from trading_bot import vix as vix_mod
+
+    fake = vix_mod.VixSnapshot(
+        date="2026-05-26", vix_level=18.4, vix_band="low",
+        captured_at=_dt.now(_UTC).isoformat(),
+    )
+    monkeypatch.setattr("trading_bot.vix.get_current_vix", lambda **_: fake)
+    monkeypatch.setattr(
+        "trading_bot.vix.last_cached_at", lambda: _dt.now(_UTC),
+    )
+    _run(["vix", "current"])
+    out = capsys.readouterr().out
+    assert "VIX: 18.4 (low)" in out
+    assert "Level:         18.4" in out
+    assert "Band:          low" in out
+    assert "< 20" in out
+    assert "Snapshot age:" in out
+
+
+def test_cli_vix_current_uses_plain_ascii(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    from trading_bot import vix as vix_mod
+
+    fake = vix_mod.VixSnapshot(
+        date="2026-05-26", vix_level=35.0, vix_band="high",
+        captured_at=_dt.now(_UTC).isoformat(),
+    )
+    monkeypatch.setattr("trading_bot.vix.get_current_vix", lambda **_: fake)
+    monkeypatch.setattr("trading_bot.vix.last_cached_at", lambda: None)
+    _run(["vix", "current"])
+    out = capsys.readouterr().out
+    out.encode("cp1252")  # raises if any Unicode that cp1252 can't encode
+
+
+def test_cli_vix_current_fetch_error_exits_nonzero(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import vix as vix_mod
+
+    def boom(**_: object) -> vix_mod.VixSnapshot:
+        raise vix_mod.VixFetchError("net down")
+
+    monkeypatch.setattr("trading_bot.vix.get_current_vix", boom)
+    with pytest.raises(SystemExit) as exc:
+        _run(["vix", "current"])
+    assert exc.value.code == 1
+    assert "net down" in capsys.readouterr().err
+
+
+def test_cli_vix_history_renders_table(
+    tmp_db: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    from trading_bot import db
+
+    db.upsert_vix_snapshot(
+        snapshot_date="2026-05-26", vix_level=18.4, vix_band="low",
+        captured_at=_dt.now(_UTC),
+    )
+    db.upsert_vix_snapshot(
+        snapshot_date="2026-05-25", vix_level=21.7, vix_band="elevated",
+        captured_at=_dt.now(_UTC),
+    )
+    _run(["vix", "history", "--days", "10"])
+    out = capsys.readouterr().out
+    assert "2026-05-26" in out
+    assert "low" in out
+    assert "elevated" in out
+
+
+def test_cli_vix_history_empty(
+    tmp_db: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _run(["vix", "history"])
+    assert "no snapshots recorded" in capsys.readouterr().out
+
+
+def test_cli_vix_backfill_happy_path(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "trading_bot.vix.backfill_trade_vix",
+        lambda: {"trades_updated": 20, "dates_snapshotted": 14,
+                 "errors": 0, "skipped_no_data": 0},
+    )
+    _run(["vix", "backfill"])
+    assert "Backfilled 20 trades across 14 unique dates. 0 errors." \
+        in capsys.readouterr().out
+
+
+def test_cli_vix_backfill_no_op(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "trading_bot.vix.backfill_trade_vix",
+        lambda: {"trades_updated": 0, "dates_snapshotted": 0,
+                 "errors": 0, "skipped_no_data": 0},
+    )
+    _run(["vix", "backfill"])
+    assert "Backfilled 0 trades" in capsys.readouterr().out
+
+
+def test_cli_report_by_vix(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot.performance import PerfStats
+
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_by_vix_band",
+        lambda: [
+            PerfStats(label="low", total=14, wins=9, losses=5, expired=0,
+                      win_rate=64.3, avg_pnl_pct=1.5, best_pnl_pct=7.0, worst_pnl_pct=-3.0),
+            PerfStats(label="elevated", total=5, wins=2, losses=3, expired=0,
+                      win_rate=40.0, avg_pnl_pct=-0.5, best_pnl_pct=4.0, worst_pnl_pct=-5.0),
+        ],
+    )
+    _run(["report", "by-vix"])
+    out = capsys.readouterr().out
+    assert "BY VIX BAND" in out
+    assert "low" in out
+    assert "64.3%" in out
+    assert "elevated" in out
+    assert "40.0%" in out
+
+
+def test_cli_report_by_vix_empty(
+    tmp_db: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _run(["report", "by-vix"])
+    assert "(no closed trades)" in capsys.readouterr().out
+
+
+def test_cli_report_by_signal_with_vix(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot.performance import PerfStats, VixBreakdown
+
+    low = PerfStats(label="ema21_pullback / low", total=8, wins=6, losses=2,
+                    expired=0, win_rate=75.0, avg_pnl_pct=2.5,
+                    best_pnl_pct=6.0, worst_pnl_pct=-1.0)
+    elev = PerfStats(label="ema21_pullback / elevated", total=3, wins=2, losses=1,
+                     expired=0, win_rate=66.7, avg_pnl_pct=1.2,
+                     best_pnl_pct=4.0, worst_pnl_pct=-2.0)
+    overall = PerfStats(label="ema21_pullback", total=12, wins=9, losses=3,
+                        expired=0, win_rate=75.0, avg_pnl_pct=2.3,
+                        best_pnl_pct=6.0, worst_pnl_pct=-2.0)
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_by_signal_type_with_vix",
+        lambda: [VixBreakdown(
+            label="ema21_pullback",
+            by_vix={"low": low, "elevated": elev},
+            overall=overall,
+        )],
+    )
+    _run(["report", "by-signal", "--by-vix"])
+    out = capsys.readouterr().out
+    assert "BY SIGNAL TYPE x VIX" in out
+    assert "ema21_pullback" in out
+    assert "Low" in out
+    assert "Elevated" in out
+    assert "Extreme" in out
+    assert "6/8 75%" in out
+
+
+def test_cli_report_by_ticker_with_vix(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot.performance import PerfStats, VixBreakdown
+
+    received: dict[str, object] = {}
+
+    def spy(*, asset_class: str | None = None) -> list[VixBreakdown]:
+        received["asset_class"] = asset_class
+        return []
+
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_by_ticker_with_vix", spy
+    )
+    _run(["report", "by-ticker", "--by-vix", "--crypto"])
+    assert received["asset_class"] == "crypto"
+    assert "BY TICKER x VIX (crypto)" in capsys.readouterr().out
+    _ = PerfStats  # silence unused-import lint
+
+
+def test_cli_report_by_regime_vix_happy(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot.performance import PerfStats
+
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_by_regime_x_vix",
+        lambda: [
+            PerfStats(label="bull / low", total=9, wins=7, losses=2, expired=0,
+                      win_rate=77.8, avg_pnl_pct=2.5, best_pnl_pct=7.0, worst_pnl_pct=-2.0),
+            PerfStats(label="sideways / low", total=4, wins=2, losses=2, expired=0,
+                      win_rate=50.0, avg_pnl_pct=0.0, best_pnl_pct=3.0, worst_pnl_pct=-3.0),
+            PerfStats(label="bull / elevated", total=3, wins=1, losses=2, expired=0,
+                      win_rate=33.3, avg_pnl_pct=-1.0, best_pnl_pct=4.0, worst_pnl_pct=-4.0),
+        ],
+    )
+    _run(["report", "by-regime-vix"])
+    out = capsys.readouterr().out
+    assert "BY REGIME x VIX" in out
+    assert "bull" in out
+    assert "low" in out
+    assert "77.8%" in out
+    assert "sideways" in out
+    assert "elevated" in out
+
+
+def test_cli_report_by_regime_vix_empty(
+    tmp_db: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _run(["report", "by-regime-vix"])
+    assert "(no closed trades)" in capsys.readouterr().out
+
+
+def test_cli_report_by_regime_vix_sparse_one_bucket(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot.performance import PerfStats
+
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_by_regime_x_vix",
+        lambda: [PerfStats(
+            label="bull / low", total=1, wins=1, losses=0, expired=0,
+            win_rate=100.0, avg_pnl_pct=5.0, best_pnl_pct=5.0, worst_pnl_pct=5.0,
+        )],
+    )
+    _run(["report", "by-regime-vix"])
+    out = capsys.readouterr().out
+    assert "bull" in out
+    assert "low" in out
+    assert "100.0%" in out
 
 
 def test_report_recent_with_custom_days(

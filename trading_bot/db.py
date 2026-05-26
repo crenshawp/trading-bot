@@ -18,13 +18,15 @@ from trading_bot.models import (
     VALID_DIRECTIONS,
     VALID_MARKET_REGIMES,
     VALID_OUTCOMES,
+    VALID_VIX_BANDS,
     DailyPerf,
     Signal,
     Trade,
 )
 
+# Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -96,19 +98,30 @@ CREATE TABLE IF NOT EXISTS regime_snapshots (
     ema50_slope REAL NOT NULL,
     captured_at TEXT NOT NULL
 );
+
+-- Phase 2.2: historical VIX snapshots, one row per date. VIX does not trade
+-- weekends, so this table is sparse on Sat/Sun and market holidays.
+CREATE TABLE IF NOT EXISTS vix_snapshots (
+    date TEXT PRIMARY KEY,
+    vix_level REAL NOT NULL,
+    vix_band TEXT NOT NULL,
+    captured_at TEXT NOT NULL
+);
 """
 
 # Whitelist for update_trade — never interpolate user input into SQL column names.
-# market_regime was added in Phase 2.1 so backfill can set it on historical rows.
+# market_regime was added in Phase 2.1 + vix_level/vix_band in Phase 2.2 so the
+# backfills can set them on historical rows.
 _TRADE_UPDATABLE_FIELDS: frozenset[str] = frozenset(
     {
         "opened_at", "closed_at", "exit_price", "outcome",
         "pnl_pct", "pnl_dollars", "notes", "market_regime",
+        "vix_level", "vix_band",
     }
 )
 
 _TABLE_NAMES: tuple[str, ...] = (
-    "signals", "trades", "daily_performance", "regime_snapshots",
+    "signals", "trades", "daily_performance", "regime_snapshots", "vix_snapshots",
 )
 
 
@@ -142,12 +155,28 @@ def _migrate_to_v2(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE trades ADD COLUMN market_regime TEXT")
 
 
+def _migrate_to_v3(conn: sqlite3.Connection) -> None:
+    """Phase 2.2 migration step: add ``trades.vix_level`` + ``trades.vix_band``.
+
+    Both nullable — existing rows (including the regime-backfilled ones from
+    2.1) stay NULL until ``vix backfill`` runs. ``vix_snapshots`` itself is
+    created by the ``CREATE TABLE IF NOT EXISTS`` block above.
+    """
+    cur = conn.execute("PRAGMA table_info(trades)")
+    cols = {str(row[1]) for row in cur.fetchall()}
+    if "vix_level" not in cols:
+        conn.execute("ALTER TABLE trades ADD COLUMN vix_level REAL")
+    if "vix_band" not in cols:
+        conn.execute("ALTER TABLE trades ADD COLUMN vix_band TEXT")
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
     try:
         conn.executescript(_SCHEMA_SQL)
         _migrate_to_v2(conn)
+        _migrate_to_v3(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -346,11 +375,20 @@ def insert_trade(trade: Trade) -> int:
             f"Invalid market_regime '{trade.market_regime}' "
             f"(expected one of {sorted(VALID_MARKET_REGIMES)})"
         )
+    if (
+        trade.vix_band is not None
+        and trade.vix_band not in VALID_VIX_BANDS
+    ):
+        raise ValueError(
+            f"Invalid vix_band '{trade.vix_band}' "
+            f"(expected one of {sorted(VALID_VIX_BANDS)})"
+        )
     sql = """
         INSERT INTO trades (
             signal_id, opened_at, closed_at, exit_price,
-            outcome, pnl_pct, pnl_dollars, notes, market_regime
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            outcome, pnl_pct, pnl_dollars, notes, market_regime,
+            vix_level, vix_band
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = (
         trade.signal_id,
@@ -362,6 +400,8 @@ def insert_trade(trade: Trade) -> int:
         trade.pnl_dollars,
         trade.notes,
         trade.market_regime,
+        trade.vix_level,
+        trade.vix_band,
     )
     conn = get_connection()
     try:
@@ -411,6 +451,15 @@ def update_trade(trade_id: int, **fields: Any) -> None:
             f"Invalid market_regime '{normalized['market_regime']}' "
             f"(expected one of {sorted(VALID_MARKET_REGIMES)})"
         )
+    if (
+        "vix_band" in normalized
+        and normalized["vix_band"] is not None
+        and normalized["vix_band"] not in VALID_VIX_BANDS
+    ):
+        raise ValueError(
+            f"Invalid vix_band '{normalized['vix_band']}' "
+            f"(expected one of {sorted(VALID_VIX_BANDS)})"
+        )
 
     set_clause = ", ".join(f"{k} = ?" for k in normalized)  # keys are whitelisted
     sql = f"UPDATE trades SET {set_clause} WHERE id = ?"  # noqa: S608 - whitelisted columns
@@ -424,8 +473,9 @@ def update_trade(trade_id: int, **fields: Any) -> None:
 
 
 def _row_to_trade(row: sqlite3.Row) -> Trade:
-    # PRAGMA table_info shape varies between v1 (no market_regime) and v2; use
-    # row.keys() so the conversion stays robust mid-migration.
+    # Schema-version-aware: rows from a pre-v2 connection won't have
+    # market_regime, pre-v3 won't have vix_*. Use row.keys() so this stays
+    # robust mid-migration.
     keys = set(row.keys())
     return Trade(
         signal_id=int(row["signal_id"]),
@@ -439,6 +489,8 @@ def _row_to_trade(row: sqlite3.Row) -> Trade:
         pnl_dollars=row["pnl_dollars"],
         notes=row["notes"],
         market_regime=row["market_regime"] if "market_regime" in keys else None,
+        vix_level=row["vix_level"] if "vix_level" in keys else None,
+        vix_band=row["vix_band"] if "vix_band" in keys else None,
         id=int(row["id"]),
     )
 
@@ -620,6 +672,93 @@ def _regime_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "ema50_slope": float(row["ema50_slope"]),
         "captured_at": str(row["captured_at"]),
     }
+
+
+# ---- vix snapshots (Phase 2.2) ----
+
+
+def upsert_vix_snapshot(
+    *,
+    snapshot_date: str,
+    vix_level: float,
+    vix_band: str,
+    captured_at: datetime,
+) -> None:
+    """Insert or replace the vix_snapshots row for ``snapshot_date``.
+
+    Idempotent — same date overwrites. The daily scheduler relies on this
+    so a second run in the same UTC day does not create a duplicate row.
+    """
+    if vix_band not in VALID_VIX_BANDS:
+        raise ValueError(
+            f"Invalid vix_band '{vix_band}' "
+            f"(expected one of {sorted(VALID_VIX_BANDS)})"
+        )
+    sql = """
+        INSERT INTO vix_snapshots (date, vix_level, vix_band, captured_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(date) DO UPDATE SET
+            vix_level = excluded.vix_level,
+            vix_band = excluded.vix_band,
+            captured_at = excluded.captured_at
+    """
+    params = (snapshot_date, vix_level, vix_band, captured_at.isoformat())
+    conn = get_connection()
+    try:
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_vix_snapshot(snapshot_date: str) -> dict[str, Any] | None:
+    sql = "SELECT * FROM vix_snapshots WHERE date = ?"
+    conn = get_connection()
+    try:
+        row = conn.execute(sql, (snapshot_date,)).fetchone()
+    finally:
+        conn.close()
+    return _vix_row_to_dict(row) if row is not None else None
+
+
+def get_vix_snapshots(limit: int = 30) -> list[dict[str, Any]]:
+    """Return the most recent ``limit`` vix_snapshots rows, newest first."""
+    sql = "SELECT * FROM vix_snapshots ORDER BY date DESC LIMIT ?"
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, (limit,)).fetchall()
+    finally:
+        conn.close()
+    return [_vix_row_to_dict(r) for r in rows]
+
+
+def _vix_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "date": str(row["date"]),
+        "vix_level": float(row["vix_level"]),
+        "vix_band": str(row["vix_band"]),
+        "captured_at": str(row["captured_at"]),
+    }
+
+
+def get_closed_trades_missing_vix() -> list[Trade]:
+    """Closed trades (win/loss/expired) where vix_band IS NULL.
+
+    Used by the Phase 2.2 backfill subcommand. Independent of the regime
+    backfill — a trade that already has a regime tag but no VIX tag is a
+    legitimate candidate. Open trades are excluded.
+    """
+    sql = (
+        "SELECT * FROM trades "
+        "WHERE outcome IN ('win','loss','expired') AND vix_band IS NULL "
+        "ORDER BY opened_at ASC"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_trade(r) for r in rows]
 
 
 def get_closed_trades_missing_regime() -> list[Trade]:

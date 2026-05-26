@@ -39,6 +39,10 @@ _CLOSED_OUTCOMES = ("win", "loss", "expired")
 # it's a fallback bucket, not a regime in its own right.
 _REGIME_ORDER = ("bull", "sideways", "bear", "unknown")
 
+# Display ordering for VIX bands: low → elevated → high → extreme → unknown.
+# Same convention — quietest first, fallback bucket last.
+_VIX_ORDER = ("low", "elevated", "high", "extreme", "unknown")
+
 
 @dataclass(frozen=True)
 class PerfStats:
@@ -70,6 +74,19 @@ class RegimeBreakdown:
     """
     label: str
     by_regime: dict[str, PerfStats]
+    overall: PerfStats
+
+
+@dataclass(frozen=True)
+class VixBreakdown:
+    """A signal_type or ticker sliced across VIX bands (Phase 2.2).
+
+    Same shape as :class:`RegimeBreakdown` but on the volatility axis.
+    ``by_vix`` keys are 'low' / 'elevated' / 'high' / 'extreme' / 'unknown'.
+    Bands with no closed trades are absent from the dict.
+    """
+    label: str
+    by_vix: dict[str, PerfStats]
     overall: PerfStats
 
 
@@ -390,6 +407,163 @@ def stats_by_ticker_with_regime(
         extra_where="signals.asset_class = ?",
         extra_params=(asset_class,),
     )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# VIX-aware slices (Phase 2.2)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def stats_by_vix_band() -> list[PerfStats]:
+    """One :class:`PerfStats` per VIX band present in closed trades.
+
+    Ordered low → elevated → high → extreme → unknown. NULL ``vix_band`` is
+    folded into the ``unknown`` bucket.
+    """
+    sql = (
+        f"SELECT COALESCE(trades.vix_band, 'unknown') AS slice, "
+        f"{_AGGREGATE_COLS} "
+        "FROM trades "
+        "JOIN signals ON signals.id = trades.signal_id "
+        "WHERE trades.outcome IN ('win','loss','expired') "
+        "GROUP BY COALESCE(trades.vix_band, 'unknown')"
+    )
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+    result = [_row_to_stats(str(r["slice"]), r) for r in rows]
+    order_map = {b: i for i, b in enumerate(_VIX_ORDER)}
+    result.sort(key=lambda s: order_map.get(s.label, len(_VIX_ORDER)))
+    return result
+
+
+def _stats_grouped_by_vix(
+    group_col: str,
+    *,
+    extra_where: str = "",
+    extra_params: tuple[object, ...] = (),
+) -> list[VixBreakdown]:
+    """Parallel of ``_stats_grouped_by_regime`` for the VIX axis."""
+    if group_col not in {"signal_type", "ticker"}:
+        raise ValueError(
+            f"group_col must be 'signal_type' or 'ticker', got {group_col!r}"
+        )
+
+    where = "WHERE trades.outcome IN ('win','loss','expired')"
+    if extra_where:
+        where += f" AND {extra_where}"
+
+    by_vix_sql = (  # noqa: S608 - group_col and where fragments are whitelisted
+        f"SELECT signals.{group_col} AS slice, "
+        f"COALESCE(trades.vix_band, 'unknown') AS vix_band, "
+        f"{_AGGREGATE_COLS} "
+        "FROM trades "
+        "JOIN signals ON signals.id = trades.signal_id "
+        f"{where} "
+        f"GROUP BY signals.{group_col}, COALESCE(trades.vix_band, 'unknown')"
+    )
+    overall_sql = (  # noqa: S608 - group_col and where fragments are whitelisted
+        f"SELECT signals.{group_col} AS slice, {_AGGREGATE_COLS} "
+        "FROM trades "
+        "JOIN signals ON signals.id = trades.signal_id "
+        f"{where} "
+        f"GROUP BY signals.{group_col}"
+    )
+
+    conn = db.get_connection()
+    try:
+        axis_rows = conn.execute(by_vix_sql, extra_params).fetchall()
+        overall_rows = conn.execute(overall_sql, extra_params).fetchall()
+    finally:
+        conn.close()
+
+    by_label: dict[str, dict[str, PerfStats]] = {}
+    for row in axis_rows:
+        label = str(row["slice"])
+        vix_key = str(row["vix_band"])
+        by_label.setdefault(label, {})[vix_key] = _row_to_stats(
+            f"{label} / {vix_key}", row
+        )
+
+    overall_by_label: dict[str, PerfStats] = {
+        str(r["slice"]): _row_to_stats(str(r["slice"]), r) for r in overall_rows
+    }
+
+    breakdowns: list[VixBreakdown] = []
+    for label, overall in overall_by_label.items():
+        breakdowns.append(
+            VixBreakdown(
+                label=label,
+                by_vix=by_label.get(label, {}),
+                overall=overall,
+            )
+        )
+    breakdowns.sort(
+        key=lambda b: (b.overall.avg_pnl_pct is None, -(b.overall.avg_pnl_pct or 0.0))
+    )
+    return breakdowns
+
+
+def stats_by_signal_type_with_vix() -> list[VixBreakdown]:
+    """``stats_by_signal_type`` cross-tabbed by VIX band."""
+    return _stats_grouped_by_vix("signal_type")
+
+
+def stats_by_ticker_with_vix(
+    asset_class: str | None = None,
+) -> list[VixBreakdown]:
+    """``stats_by_ticker`` cross-tabbed by VIX band."""
+    if asset_class is not None and asset_class not in ("stock", "crypto"):
+        raise ValueError(
+            f"asset_class must be 'stock' or 'crypto', got {asset_class!r}"
+        )
+    if asset_class is None:
+        return _stats_grouped_by_vix("ticker")
+    return _stats_grouped_by_vix(
+        "ticker",
+        extra_where="signals.asset_class = ?",
+        extra_params=(asset_class,),
+    )
+
+
+def stats_by_regime_x_vix() -> list[PerfStats]:
+    """The full regime x VIX cross-tab — one row per non-empty bucket.
+
+    Sorted by trade count descending so the most-populated buckets surface
+    first (which is the most useful read for "where do I have enough data
+    to make a call?"). Empty buckets are omitted entirely, never returned
+    as 0/0 rows.
+
+    Labels look like ``"bull / low"`` — joining macro direction (regime)
+    with volatility band (vix). This is the foundation for Phase 4 strategy
+    evolution: once enough live data accumulates, this view tells us
+    exactly which regime x VIX combos are profitable for any given signal
+    or ticker.
+    """
+    sql = (
+        f"SELECT COALESCE(trades.market_regime, 'unknown') AS regime, "
+        f"COALESCE(trades.vix_band, 'unknown') AS vix_band, "
+        f"{_AGGREGATE_COLS} "
+        "FROM trades "
+        "JOIN signals ON signals.id = trades.signal_id "
+        "WHERE trades.outcome IN ('win','loss','expired') "
+        "GROUP BY COALESCE(trades.market_regime, 'unknown'), "
+        "COALESCE(trades.vix_band, 'unknown')"
+    )
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+    result = [
+        _row_to_stats(f"{r['regime']} / {r['vix_band']}", r) for r in rows
+    ]
+    # Trade-count descending (most data first). Stable secondary key on
+    # label keeps ordering deterministic when counts tie.
+    result.sort(key=lambda s: (-s.total, s.label))
+    return result
 
 
 # ────────────────────────────────────────────────────────────────────────────

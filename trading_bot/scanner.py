@@ -24,7 +24,7 @@ import requests
 import schedule
 import yfinance as yf
 
-from trading_bot import db, outcomes, performance, regime
+from trading_bot import db, outcomes, performance, regime, vix
 from trading_bot.models import Signal, Trade
 from trading_bot.secrets import get_required
 
@@ -447,12 +447,33 @@ def log_signal(signal: dict) -> int | None:
             )
             market_regime = "unknown"
 
+        # Phase 2.2: tag the trade with the current VIX. Independent of
+        # regime — VIX is the volatility axis, regime is the direction axis.
+        # Same fail-soft contract: a VixFetchError tags 'unknown' with a
+        # NULL level, but the signal still fires.
+        vix_level: float | None
+        vix_band: str
+        try:
+            vix_snap = vix.get_current_vix()
+            vix_level = vix_snap.vix_level
+            vix_band = vix_snap.vix_band
+        except vix.VixFetchError as exc:
+            import sys
+            print(
+                f"  vix fetch failed for {rec.ticker}, tagging trade as 'unknown': {exc}",
+                file=sys.stderr,
+            )
+            vix_level = None
+            vix_band = "unknown"
+
         db.insert_trade(
             Trade(
                 signal_id=signal_id,
                 opened_at=opened_at,
                 outcome="open",
                 market_regime=market_regime,
+                vix_level=vix_level,
+                vix_band=vix_band,
             )
         )
 
@@ -503,6 +524,32 @@ def _run_daily_regime_snapshot() -> None:
     except Exception as exc:
         import sys
         print(f"  regime snapshot error: {exc}", file=sys.stderr)
+
+
+def _run_daily_vix_snapshot() -> None:
+    """Phase 2.2: capture today's VIX and persist to vix_snapshots.
+
+    Scheduled at 09:36 EST — one minute after the regime snapshot. VIX
+    closes at 16:15 ET, but the latest daily candle is available from
+    yfinance shortly after market open of the next day; we want today's
+    morning value reflecting last close. Swallow-all on failure so a
+    transient yfinance hiccup doesn't kill the scheduling loop.
+    """
+    try:
+        snap = vix.get_current_vix(force_refresh=True)
+        db.upsert_vix_snapshot(
+            snapshot_date=snap.date,
+            vix_level=snap.vix_level,
+            vix_band=snap.vix_band,
+            captured_at=datetime.now(UTC),
+        )
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] vix snapshot: "
+            f"{snap.date} {snap.vix_level:.2f} ({snap.vix_band})"
+        )
+    except Exception as exc:
+        import sys
+        print(f"  vix snapshot error: {exc}", file=sys.stderr)
 
 
 def _run_daily_perf_update() -> None:
@@ -966,6 +1013,10 @@ def main() -> None:
     # scan so SPY's prior close is reflected and signals fired in scan_stocks
     # have already grabbed the cached value. Phase 2.1.
     schedule.every().day.at("09:35").do(_run_daily_regime_snapshot)
+
+    # Daily VIX snapshot at 09:36 EST — one minute after the regime snapshot.
+    # VIX moves faster than regime so we record it on its own row. Phase 2.2.
+    schedule.every().day.at("09:36").do(_run_daily_vix_snapshot)
     print(f"Schedules registered: {schedule.jobs}")
 
     while True:
