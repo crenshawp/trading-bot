@@ -22,13 +22,13 @@ def _run(argv: list[str]) -> None:
 def test_cli_db_init_prints_version(tmp_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _run(["db", "init"])
     out = capsys.readouterr().out
-    assert "Schema version: 1" in out
+    assert "Schema version: 2" in out
 
 
 def test_cli_db_status_shows_counts(tmp_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _run(["db", "status"])
     out = capsys.readouterr().out
-    assert "Schema version: 1" in out
+    assert "Schema version: 2" in out
     assert "signals" in out
     assert "trades" in out
     assert "daily_performance" in out
@@ -263,6 +263,244 @@ def test_report_daily_backfill_subcommand(
     )
     _run(["report", "daily-backfill"])
     assert "Backfilled daily_performance for 17 dates" in capsys.readouterr().out
+
+
+# ───────────────────── Phase 2.1 regime + by-regime subcommands ─────────────────────
+
+
+def test_cli_regime_current_happy_path(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    from trading_bot import regime as regime_mod
+
+    fake = regime_mod.RegimeSnapshot(
+        date="2026-05-26", regime="bull",
+        spy_close=612.45, ema50=598.21, ema200=571.88, ema50_slope=1.23,
+    )
+    monkeypatch.setattr("trading_bot.regime.get_current_regime", lambda **_: fake)
+    monkeypatch.setattr(
+        "trading_bot.regime.last_cached_at", lambda: _dt.now(_UTC),
+    )
+    _run(["regime", "current"])
+    out = capsys.readouterr().out
+    assert "Market Regime: BULL" in out
+    assert "SPY Close:    $612.45" in out
+    assert "50 EMA:       $598.21" in out
+    assert "above 200 EMA" in out
+    assert "200 EMA:      $571.88" in out
+    assert "+1.23/day" in out
+    assert "positive" in out
+    assert "Snapshot age:" in out
+
+
+def test_cli_regime_current_uses_plain_ascii_only(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """No Unicode like checkmarks / >= — Windows cp1252 can't encode them."""
+    from trading_bot import regime as regime_mod
+
+    fake = regime_mod.RegimeSnapshot(
+        date="2026-05-26", regime="sideways",
+        spy_close=540.0, ema50=545.0, ema200=550.0, ema50_slope=-0.5,
+    )
+    monkeypatch.setattr("trading_bot.regime.get_current_regime", lambda **_: fake)
+    monkeypatch.setattr("trading_bot.regime.last_cached_at", lambda: None)
+    _run(["regime", "current"])
+    out = capsys.readouterr().out
+    # cp1252-encodable characters only
+    out.encode("cp1252")
+
+
+def test_cli_regime_current_fetch_error_exits_nonzero(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import regime as regime_mod
+
+    def boom(**_: object) -> regime_mod.RegimeSnapshot:
+        raise regime_mod.RegimeFetchError("network down")
+
+    monkeypatch.setattr("trading_bot.regime.get_current_regime", boom)
+    with pytest.raises(SystemExit) as exc:
+        _run(["regime", "current"])
+    assert exc.value.code == 1
+    assert "network down" in capsys.readouterr().err
+
+
+def test_cli_regime_history_renders_table(
+    tmp_db: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    from trading_bot import db
+
+    db.upsert_regime_snapshot(
+        snapshot_date="2026-05-26", regime="bull", spy_close=612.45,
+        ema50=598.21, ema200=571.88, ema50_slope=1.23,
+        captured_at=_dt.now(_UTC),
+    )
+    db.upsert_regime_snapshot(
+        snapshot_date="2026-05-25", regime="sideways", spy_close=608.91,
+        ema50=597.15, ema200=571.01, ema50_slope=0.4,
+        captured_at=_dt.now(_UTC),
+    )
+    _run(["regime", "history", "--days", "10"])
+    out = capsys.readouterr().out
+    assert "2026-05-26" in out
+    assert "bull" in out
+    assert "2026-05-25" in out
+    assert "sideways" in out
+
+
+def test_cli_regime_history_empty_message(
+    tmp_db: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _run(["regime", "history"])
+    assert "no snapshots recorded" in capsys.readouterr().out
+
+
+def test_cli_regime_backfill_happy_path(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "trading_bot.regime.backfill_trade_regimes",
+        lambda: {"trades_updated": 20, "dates_snapshotted": 14,
+                 "errors": 0, "skipped_no_data": 0},
+    )
+    _run(["regime", "backfill"])
+    out = capsys.readouterr().out
+    assert "Backfilled 20 trades across 14 unique dates. 0 errors." in out
+
+
+def test_cli_regime_backfill_already_done_no_op(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "trading_bot.regime.backfill_trade_regimes",
+        lambda: {"trades_updated": 0, "dates_snapshotted": 0,
+                 "errors": 0, "skipped_no_data": 0},
+    )
+    _run(["regime", "backfill"])
+    out = capsys.readouterr().out
+    assert "Backfilled 0 trades" in out
+
+
+def test_cli_report_by_regime(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot.performance import PerfStats
+
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_by_regime",
+        lambda: [
+            PerfStats(label="bull", total=12, wins=8, losses=4, expired=0,
+                      win_rate=66.7, avg_pnl_pct=2.10, best_pnl_pct=8.0, worst_pnl_pct=-3.0),
+            PerfStats(label="sideways", total=6, wins=3, losses=3, expired=0,
+                      win_rate=50.0, avg_pnl_pct=0.5, best_pnl_pct=5.0, worst_pnl_pct=-4.0),
+            PerfStats(label="bear", total=2, wins=0, losses=2, expired=0,
+                      win_rate=0.0, avg_pnl_pct=-2.5, best_pnl_pct=-1.0, worst_pnl_pct=-4.0),
+        ],
+    )
+    _run(["report", "by-regime"])
+    out = capsys.readouterr().out
+    assert "BY MARKET REGIME" in out
+    assert "bull" in out
+    assert "66.7%" in out
+    assert "sideways" in out
+    assert "bear" in out
+
+
+def test_cli_report_by_regime_empty(
+    tmp_db: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _run(["report", "by-regime"])
+    assert "(no closed trades)" in capsys.readouterr().out
+
+
+def test_cli_report_by_signal_with_regime(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot.performance import PerfStats, RegimeBreakdown
+
+    bull_stats = PerfStats(label="ema21_pullback / bull", total=10, wins=8, losses=2,
+                           expired=0, win_rate=80.0, avg_pnl_pct=3.0,
+                           best_pnl_pct=8.0, worst_pnl_pct=-1.0)
+    side_stats = PerfStats(label="ema21_pullback / sideways", total=2, wins=1, losses=1,
+                           expired=0, win_rate=50.0, avg_pnl_pct=0.5,
+                           best_pnl_pct=2.0, worst_pnl_pct=-1.0)
+    overall = PerfStats(label="ema21_pullback", total=12, wins=9, losses=3,
+                        expired=0, win_rate=75.0, avg_pnl_pct=2.6,
+                        best_pnl_pct=8.0, worst_pnl_pct=-1.0)
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_by_signal_type_with_regime",
+        lambda: [RegimeBreakdown(
+            label="ema21_pullback",
+            by_regime={"bull": bull_stats, "sideways": side_stats},
+            overall=overall,
+        )],
+    )
+    _run(["report", "by-signal", "--by-regime"])
+    out = capsys.readouterr().out
+    assert "BY SIGNAL TYPE x REGIME" in out
+    assert "ema21_pullback" in out
+    assert "Bull" in out
+    assert "Sideways" in out
+    assert "Bear" in out
+    assert "8/10 80%" in out
+
+
+def test_cli_report_by_ticker_with_regime_and_stocks_filter(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot.performance import RegimeBreakdown
+
+    received: dict[str, object] = {}
+
+    def spy(*, asset_class: str | None = None) -> list[RegimeBreakdown]:
+        received["asset_class"] = asset_class
+        return []
+
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_by_ticker_with_regime", spy
+    )
+    _run(["report", "by-ticker", "--by-regime", "--stocks"])
+    assert received["asset_class"] == "stock"
+    assert "BY TICKER x REGIME (stock)" in capsys.readouterr().out
+
+
+def test_cli_report_by_signal_without_regime_flag_uses_old_view(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Without --by-regime, the Phase 1.4 by-signal output is unchanged.
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_by_signal_type", lambda: [],
+    )
+    _run(["report", "by-signal"])
+    assert "BY SIGNAL TYPE" in capsys.readouterr().out
 
 
 def test_report_recent_with_custom_days(

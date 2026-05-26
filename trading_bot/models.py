@@ -38,6 +38,7 @@ class Trade:
     pnl_pct: float | None = None
     pnl_dollars: float | None = None
     notes: str | None = None
+    market_regime: str | None = None  # "bull" | "bear" | "sideways" | "unknown" (Phase 2.1)
     id: int | None = None
 
 
@@ -58,4 +59,9 @@ VALID_ASSET_CLASSES: frozenset[str] = frozenset({"stock", "crypto"})
 VALID_DIRECTIONS: frozenset[str] = frozenset({"call", "put", "long", "short"})
 VALID_OUTCOMES: frozenset[str] = frozenset(
     {"win", "loss", "breakeven", "open", "expired"}
+)
+# Phase 2.1 macro regime tags. "unknown" is the fallback when SPY data is
+# unfetchable at signal fire time — we still log the trade rather than skip it.
+VALID_MARKET_REGIMES: frozenset[str] = frozenset(
+    {"bull", "bear", "sideways", "unknown"}
 )

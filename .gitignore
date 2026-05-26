@@ -23,3 +23,6 @@ htmlcov/
 # Local secrets (for future phases)
 .env
 .env.local
+
+# Phase 2.1 — macro regime cache (24h TTL, regenerated on demand)
+.regime_cache.json

@@ -34,6 +34,11 @@ from trading_bot.models import DailyPerf
 
 _CLOSED_OUTCOMES = ("win", "loss", "expired")
 
+# Display ordering for regime slices: bull → sideways → bear → unknown.
+# bull/sideways/bear is the natural macro continuum; unknown trails because
+# it's a fallback bucket, not a regime in its own right.
+_REGIME_ORDER = ("bull", "sideways", "bear", "unknown")
+
 
 @dataclass(frozen=True)
 class PerfStats:
@@ -52,6 +57,20 @@ class PerfStats:
     avg_pnl_pct: float | None
     best_pnl_pct: float | None
     worst_pnl_pct: float | None
+
+
+@dataclass(frozen=True)
+class RegimeBreakdown:
+    """A signal_type or ticker sliced across macro regimes.
+
+    ``by_regime`` maps regime ('bull' / 'sideways' / 'bear' / 'unknown') to
+    that slice's :class:`PerfStats`. Regimes with no closed trades for this
+    key are simply absent from the dict — callers render those as ``-``.
+    ``overall`` is the aggregate across all regimes for the same key.
+    """
+    label: str
+    by_regime: dict[str, PerfStats]
+    overall: PerfStats
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -244,6 +263,133 @@ def stats_by_signal_type_and_ticker(min_trades: int = 3) -> list[PerfStats]:
     ]
     result.sort(key=lambda s: (s.avg_pnl_pct is None, -(s.avg_pnl_pct or 0.0)))
     return result
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Regime-aware slices (Phase 2.1)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def stats_by_regime() -> list[PerfStats]:
+    """One :class:`PerfStats` per macro regime present in closed trades.
+
+    Ordered bull → sideways → bear → unknown (any extra regime, if a
+    historical row ever held a non-canonical value, sorts to the end).
+    NULL ``market_regime`` is folded into the ``unknown`` bucket.
+    """
+    sql = (
+        f"SELECT COALESCE(trades.market_regime, 'unknown') AS slice, "
+        f"{_AGGREGATE_COLS} "
+        "FROM trades "
+        "JOIN signals ON signals.id = trades.signal_id "
+        "WHERE trades.outcome IN ('win','loss','expired') "
+        "GROUP BY COALESCE(trades.market_regime, 'unknown')"
+    )
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+    result = [_row_to_stats(str(r["slice"]), r) for r in rows]
+    order_map = {r: i for i, r in enumerate(_REGIME_ORDER)}
+    result.sort(key=lambda s: order_map.get(s.label, len(_REGIME_ORDER)))
+    return result
+
+
+def _stats_grouped_by_regime(
+    group_col: str,
+    *,
+    extra_where: str = "",
+    extra_params: tuple[object, ...] = (),
+) -> list[RegimeBreakdown]:
+    """Build a regime-cross-tab for an arbitrary signals column.
+
+    Two queries: one grouped by (group_col, regime) and one grouped by
+    group_col alone for the ``overall`` column. Results are merged in
+    Python so an empty regime slice doesn't pollute the overall stat.
+    ``group_col`` MUST be a whitelisted column name on ``signals``.
+    """
+    if group_col not in {"signal_type", "ticker"}:
+        raise ValueError(
+            f"group_col must be 'signal_type' or 'ticker', got {group_col!r}"
+        )
+
+    where = "WHERE trades.outcome IN ('win','loss','expired')"
+    if extra_where:
+        where += f" AND {extra_where}"
+
+    by_regime_sql = (  # noqa: S608 - group_col and where fragments are whitelisted
+        f"SELECT signals.{group_col} AS slice, "
+        f"COALESCE(trades.market_regime, 'unknown') AS regime, "
+        f"{_AGGREGATE_COLS} "
+        "FROM trades "
+        "JOIN signals ON signals.id = trades.signal_id "
+        f"{where} "
+        f"GROUP BY signals.{group_col}, COALESCE(trades.market_regime, 'unknown')"
+    )
+    overall_sql = (  # noqa: S608 - group_col and where fragments are whitelisted
+        f"SELECT signals.{group_col} AS slice, {_AGGREGATE_COLS} "
+        "FROM trades "
+        "JOIN signals ON signals.id = trades.signal_id "
+        f"{where} "
+        f"GROUP BY signals.{group_col}"
+    )
+
+    conn = db.get_connection()
+    try:
+        regime_rows = conn.execute(by_regime_sql, extra_params).fetchall()
+        overall_rows = conn.execute(overall_sql, extra_params).fetchall()
+    finally:
+        conn.close()
+
+    by_label: dict[str, dict[str, PerfStats]] = {}
+    for row in regime_rows:
+        label = str(row["slice"])
+        regime_key = str(row["regime"])
+        by_label.setdefault(label, {})[regime_key] = _row_to_stats(
+            f"{label} / {regime_key}", row
+        )
+
+    overall_by_label: dict[str, PerfStats] = {
+        str(r["slice"]): _row_to_stats(str(r["slice"]), r) for r in overall_rows
+    }
+
+    breakdowns: list[RegimeBreakdown] = []
+    for label, overall in overall_by_label.items():
+        breakdowns.append(
+            RegimeBreakdown(
+                label=label,
+                by_regime=by_label.get(label, {}),
+                overall=overall,
+            )
+        )
+    # Sort by overall avg_pnl_pct desc, matching stats_by_ticker / by_signal.
+    breakdowns.sort(
+        key=lambda b: (b.overall.avg_pnl_pct is None, -(b.overall.avg_pnl_pct or 0.0))
+    )
+    return breakdowns
+
+
+def stats_by_signal_type_with_regime() -> list[RegimeBreakdown]:
+    """``stats_by_signal_type`` cross-tabbed by macro regime."""
+    return _stats_grouped_by_regime("signal_type")
+
+
+def stats_by_ticker_with_regime(
+    asset_class: str | None = None,
+) -> list[RegimeBreakdown]:
+    """``stats_by_ticker`` cross-tabbed by macro regime."""
+    if asset_class is not None and asset_class not in ("stock", "crypto"):
+        raise ValueError(
+            f"asset_class must be 'stock' or 'crypto', got {asset_class!r}"
+        )
+    if asset_class is None:
+        return _stats_grouped_by_regime("ticker")
+    return _stats_grouped_by_regime(
+        "ticker",
+        extra_where="signals.asset_class = ?",
+        extra_params=(asset_class,),
+    )
 
 
 # ────────────────────────────────────────────────────────────────────────────

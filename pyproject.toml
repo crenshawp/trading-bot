@@ -78,7 +78,7 @@ ignore_errors = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-v --cov=trading_bot --cov-report=term-missing --cov-fail-under=85"
+addopts = "-v --cov=trading_bot --cov-report=term-missing --cov-fail-under=91"
 
 [tool.coverage.run]
 # scanner.py is omitted from coverage — see CLAUDE.md "Deferred cleanup".

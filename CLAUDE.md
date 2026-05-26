@@ -38,12 +38,13 @@ comment on the suppression.
 - [x] Phase 1.2 — Migrate live scanner to SQLite
 - [x] Phase 1.3 — Trade outcome tracking
 - [x] Phase 1.4 — Performance attribution
+- [x] Phase 2.1 — Macro regime detection (bull/bear/sideways)
 
-### Phase 1 complete. Phase 2 sub-phases queued:
+### Phase 2 sub-phases queued:
 
-- [ ] Phase 2.1 — Market context (regime detection, breadth, VIX)
-- [ ] Phase 2.2 — News-aware signal weighting
-- [ ] Phase 2.3 — Watchlist auto-discovery
+- [ ] Phase 2.2 — VIX & breadth context (volatility regime layered on macro)
+- [ ] Phase 2.3 — Regime-aware reporting consolidation / News-aware weighting
+- [ ] Phase 2.4 — Watchlist auto-discovery
 
 ## Outcome resolution
 
@@ -74,11 +75,22 @@ and never hits the network.
 python -m trading_bot report overall              # single-block summary
 python -m trading_bot report recent --days 30     # last N days
 python -m trading_bot report by-signal            # per signal_type
+python -m trading_bot report by-signal --by-regime  # signal x regime matrix (Phase 2.1)
 python -m trading_bot report by-ticker [--stocks | --crypto]
+python -m trading_bot report by-ticker --by-regime  # ticker x regime matrix (Phase 2.1)
 python -m trading_bot report by-asset             # stock vs crypto
-python -m trading_bot report cross                # signal_type × ticker (≥3 trades)
+python -m trading_bot report by-regime            # per macro regime (Phase 2.1)
+python -m trading_bot report cross                # signal_type x ticker (>=3 trades)
 python -m trading_bot report daily-backfill       # one-shot daily_performance seed
 python -m trading_bot report daily [--date YYYY-MM-DD]
+```
+
+### Regime CLI (Phase 2.1)
+
+```
+python -m trading_bot regime current              # latest bull/bear/sideways + indicators
+python -m trading_bot regime history --days 30    # recent regime_snapshots
+python -m trading_bot regime backfill             # one-shot: tag closed trades w/ historical regime
 ```
 
 ### Aggregation rules (the only ones that matter)
@@ -101,6 +113,40 @@ each day (covers yesterday's trades). The hourly outcome resolver runs
 first, so most decisions are settled by the time daily perf updates. Use
 `python -m trading_bot report daily-backfill` once after a long downtime
 to fill in any gaps; afterward the scheduler keeps it fresh.
+
+## Macro Regime (Phase 2.1)
+
+Every trade carries a `market_regime` tag at fire time. Three regimes,
+classified from SPY:
+
+- **bull** — SPY > 200 EMA AND 50 EMA > 200 EMA AND 5-day slope of 50 EMA > 0
+- **bear** — SPY < 200 EMA AND 50 EMA < 200 EMA AND 5-day slope < 0
+- **sideways** — anything else (mixed / boundary / transitional)
+- **unknown** — fallback when yfinance is unreachable at fire time;
+  signal capture is more important than regime tagging, so we log the
+  trade with `regime='unknown'` rather than skipping it.
+
+### Key rules
+
+- Regime is tagged at **fire time**, never retroactively. The single
+  exception is `python -m trading_bot regime backfill`, a one-shot that
+  fills `market_regime` for closed trades that pre-date Phase 2.1.
+- SPY drives regime for **all** asset classes — including crypto. A
+  bear market in equities is relevant context for any trade fired
+  during it.
+- `regime_snapshots` table holds one row per date. Populated by:
+  1. the scheduled daily job at 09:35 EST (live), and
+  2. the backfill subcommand (historical dates).
+- Cache: `get_current_regime()` is cached 24h in memory + on disk at
+  `.regime_cache.json` (gitignored). Pass `force_refresh=True` to
+  bypass — the daily snapshot job does this.
+
+### When yfinance fails
+
+`RegimeFetchError` is raised; the scanner catches it and tags the trade
+`'unknown'` plus a stderr log line. The signal still fires to
+Discord/Pushover and is still logged to the database — the regime
+column is the only thing affected.
 
 ## Railway deployment notes
 

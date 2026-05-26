@@ -412,3 +412,115 @@ def test_stats_by_asset_class_empty_database(tmp_db: Path) -> None:
 
 def test_stats_cross_empty_database(tmp_db: Path) -> None:
     assert performance.stats_by_signal_type_and_ticker() == []
+
+
+# ────────────────────── regime-aware slices (Phase 2.1) ──────────────────────
+
+
+def _seed_with_regime(
+    *, regime: str, ticker: str = "GOOGL", signal_type: str = "ema21_pullback",
+    asset_class: str = "stock", direction: str = "call",
+    outcome: str = "win", pnl_pct: float = 5.0,
+    timestamp: datetime | None = None,
+) -> int:
+    """Insert a signal + trade with the given market_regime tag."""
+    ts = timestamp if timestamp is not None else datetime(2026, 4, 1, tzinfo=UTC)
+    sid = db.insert_signal(Signal(
+        timestamp=ts, ticker=ticker, asset_class=asset_class,
+        signal_type=signal_type, direction=direction,
+        entry_price=100.0, take_profit=110.0, stop_loss=95.0,
+    ))
+    return db.insert_trade(Trade(
+        signal_id=sid, opened_at=ts,
+        closed_at=ts + timedelta(days=2),
+        outcome=outcome, exit_price=105.0, pnl_pct=pnl_pct,
+        market_regime=regime,
+    ))
+
+
+def test_stats_by_regime_orders_bull_sideways_bear_unknown(tmp_db: Path) -> None:
+    base = datetime(2026, 4, 1, tzinfo=UTC)
+    _seed_with_regime(regime="bear",     timestamp=base + timedelta(seconds=1), outcome="loss", pnl_pct=-3.0)
+    _seed_with_regime(regime="unknown",  timestamp=base + timedelta(seconds=2))
+    _seed_with_regime(regime="bull",     timestamp=base + timedelta(seconds=3))
+    _seed_with_regime(regime="sideways", timestamp=base + timedelta(seconds=4))
+    result = performance.stats_by_regime()
+    assert [s.label for s in result] == ["bull", "sideways", "bear", "unknown"]
+
+
+def test_stats_by_regime_folds_null_into_unknown(tmp_db: Path) -> None:
+    # No market_regime tag — falls into 'unknown' bucket
+    ts = datetime(2026, 4, 1, tzinfo=UTC)
+    sid = db.insert_signal(Signal(
+        timestamp=ts, ticker="GOOGL", asset_class="stock",
+        signal_type="ema21_pullback", direction="call",
+        entry_price=100.0, take_profit=110.0, stop_loss=95.0,
+    ))
+    db.insert_trade(Trade(
+        signal_id=sid, opened_at=ts, closed_at=ts + timedelta(days=2),
+        outcome="win", exit_price=105.0, pnl_pct=5.0,
+        market_regime=None,
+    ))
+    result = performance.stats_by_regime()
+    assert len(result) == 1
+    assert result[0].label == "unknown"
+    assert result[0].wins == 1
+
+
+def test_stats_by_signal_type_with_regime_builds_matrix(tmp_db: Path) -> None:
+    base = datetime(2026, 4, 1, tzinfo=UTC)
+    _seed_with_regime(regime="bull", signal_type="ema21_pullback",
+                      timestamp=base, outcome="win", pnl_pct=5.0)
+    _seed_with_regime(regime="bull", signal_type="ema21_pullback",
+                      timestamp=base + timedelta(seconds=1),
+                      outcome="win", pnl_pct=3.0)
+    _seed_with_regime(regime="sideways", signal_type="ema21_pullback",
+                      timestamp=base + timedelta(seconds=2),
+                      outcome="loss", pnl_pct=-2.0)
+    _seed_with_regime(regime="bull", signal_type="oversold_reversal",
+                      ticker="BTC-USD", asset_class="crypto", direction="long",
+                      timestamp=base + timedelta(seconds=3),
+                      outcome="win", pnl_pct=7.0)
+
+    rows = performance.stats_by_signal_type_with_regime()
+    by_label = {r.label: r for r in rows}
+
+    ep = by_label["ema21_pullback"]
+    assert ep.overall.total == 3
+    assert ep.by_regime["bull"].wins == 2
+    assert ep.by_regime["sideways"].losses == 1
+    assert "bear" not in ep.by_regime  # no bear trades for this signal
+
+    osr = by_label["oversold_reversal"]
+    assert osr.overall.total == 1
+    assert osr.by_regime["bull"].wins == 1
+
+
+def test_stats_by_ticker_with_regime_filters_by_asset_class(tmp_db: Path) -> None:
+    base = datetime(2026, 4, 1, tzinfo=UTC)
+    _seed_with_regime(regime="bull", ticker="GOOGL",
+                      timestamp=base, outcome="win", pnl_pct=5.0)
+    _seed_with_regime(regime="bull", ticker="BTC-USD", asset_class="crypto",
+                      direction="long", signal_type="oversold_reversal",
+                      timestamp=base + timedelta(seconds=1),
+                      outcome="win", pnl_pct=7.0)
+
+    stocks = performance.stats_by_ticker_with_regime(asset_class="stock")
+    tickers = {r.label for r in stocks}
+    assert tickers == {"GOOGL"}
+
+    crypto = performance.stats_by_ticker_with_regime(asset_class="crypto")
+    assert {r.label for r in crypto} == {"BTC-USD"}
+
+
+def test_stats_by_ticker_with_regime_rejects_bad_asset_class(tmp_db: Path) -> None:
+    with pytest.raises(ValueError, match="asset_class"):
+        performance.stats_by_ticker_with_regime(asset_class="forex")
+
+
+def test_stats_by_regime_empty_database(tmp_db: Path) -> None:
+    assert performance.stats_by_regime() == []
+
+
+def test_stats_by_signal_type_with_regime_empty(tmp_db: Path) -> None:
+    assert performance.stats_by_signal_type_with_regime() == []

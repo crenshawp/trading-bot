@@ -24,7 +24,7 @@ import requests
 import schedule
 import yfinance as yf
 
-from trading_bot import db, outcomes, performance
+from trading_bot import db, outcomes, performance, regime
 from trading_bot.models import Signal, Trade
 from trading_bot.secrets import get_required
 
@@ -432,7 +432,29 @@ def log_signal(signal: dict) -> int | None:
         # converge on the same opened_at after a dedupe collision.
         persisted = db.get_signal_by_id(signal_id)
         opened_at = persisted.timestamp if persisted is not None else rec.timestamp
-        db.insert_trade(Trade(signal_id=signal_id, opened_at=opened_at, outcome="open"))
+
+        # Phase 2.1: tag the trade with the current macro regime. SPY-based
+        # regime applies to all asset classes (crypto included) — a bear in
+        # equities is relevant context for any trade fired during it. A
+        # RegimeFetchError must NOT block signal capture; we tag 'unknown'.
+        try:
+            market_regime = regime.get_current_regime().regime
+        except regime.RegimeFetchError as exc:
+            import sys
+            print(
+                f"  regime fetch failed for {rec.ticker}, tagging trade as 'unknown': {exc}",
+                file=sys.stderr,
+            )
+            market_regime = "unknown"
+
+        db.insert_trade(
+            Trade(
+                signal_id=signal_id,
+                opened_at=opened_at,
+                outcome="open",
+                market_regime=market_regime,
+            )
+        )
 
     return signal_id
 
@@ -453,6 +475,34 @@ def _run_outcome_resolver() -> None:
     except Exception as exc:
         import sys
         print(f"  outcome resolver error: {exc}", file=sys.stderr)
+
+
+def _run_daily_regime_snapshot() -> None:
+    """Phase 2.1: capture today's macro regime and persist to regime_snapshots.
+
+    Scheduled at 09:35 EST — four minutes after the stock scan so the most
+    recent SPY close is already digested. Force-refresh bypasses the 24h
+    cache so this is genuinely today's snapshot. Swallow-all on failure so a
+    transient yfinance hiccup doesn't kill the scheduling loop.
+    """
+    try:
+        snap = regime.get_current_regime(force_refresh=True)
+        db.upsert_regime_snapshot(
+            snapshot_date=snap.date,
+            regime=snap.regime,
+            spy_close=snap.spy_close,
+            ema50=snap.ema50,
+            ema200=snap.ema200,
+            ema50_slope=snap.ema50_slope,
+            captured_at=datetime.now(UTC),
+        )
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] regime snapshot: "
+            f"{snap.date} {snap.regime} (SPY ${snap.spy_close:.2f})"
+        )
+    except Exception as exc:
+        import sys
+        print(f"  regime snapshot error: {exc}", file=sys.stderr)
 
 
 def _run_daily_perf_update() -> None:
@@ -911,6 +961,11 @@ def main() -> None:
     # Materialize yesterday's daily_performance row daily at 00:30 UTC
     # (~20:30 ET, well after market close and the hourly resolver). Phase 1.4.
     schedule.every().day.at("00:30", "UTC").do(_run_daily_perf_update)
+
+    # Daily macro regime snapshot at 09:35 EST — four minutes after the stock
+    # scan so SPY's prior close is reflected and signals fired in scan_stocks
+    # have already grabbed the cached value. Phase 2.1.
+    schedule.every().day.at("09:35").do(_run_daily_regime_snapshot)
     print(f"Schedules registered: {schedule.jobs}")
 
     while True:

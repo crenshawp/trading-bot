@@ -16,13 +16,15 @@ from trading_bot import config
 from trading_bot.models import (
     VALID_ASSET_CLASSES,
     VALID_DIRECTIONS,
+    VALID_MARKET_REGIMES,
     VALID_OUTCOMES,
     DailyPerf,
     Signal,
     Trade,
 )
 
-SCHEMA_VERSION = 1
+# Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
+SCHEMA_VERSION = 2
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -83,14 +85,31 @@ CREATE TABLE IF NOT EXISTS daily_performance (
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
 );
+
+-- Phase 2.1: historical macro regime snapshots, one row per date.
+CREATE TABLE IF NOT EXISTS regime_snapshots (
+    date TEXT PRIMARY KEY,
+    regime TEXT NOT NULL,
+    spy_close REAL NOT NULL,
+    ema50 REAL NOT NULL,
+    ema200 REAL NOT NULL,
+    ema50_slope REAL NOT NULL,
+    captured_at TEXT NOT NULL
+);
 """
 
 # Whitelist for update_trade — never interpolate user input into SQL column names.
+# market_regime was added in Phase 2.1 so backfill can set it on historical rows.
 _TRADE_UPDATABLE_FIELDS: frozenset[str] = frozenset(
-    {"opened_at", "closed_at", "exit_price", "outcome", "pnl_pct", "pnl_dollars", "notes"}
+    {
+        "opened_at", "closed_at", "exit_price", "outcome",
+        "pnl_pct", "pnl_dollars", "notes", "market_regime",
+    }
 )
 
-_TABLE_NAMES: tuple[str, ...] = ("signals", "trades", "daily_performance")
+_TABLE_NAMES: tuple[str, ...] = (
+    "signals", "trades", "daily_performance", "regime_snapshots",
+)
 
 
 def _ensure_parent_dir(path: Path) -> None:
@@ -110,15 +129,34 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+def _migrate_to_v2(conn: sqlite3.Connection) -> None:
+    """Phase 2.1 migration step: add ``trades.market_regime`` if absent.
+
+    ``CREATE TABLE IF NOT EXISTS`` covers the new ``regime_snapshots`` table,
+    but column additions on existing tables need an explicit ALTER. Safe to
+    run on a fresh schema (just becomes a no-op).
+    """
+    cur = conn.execute("PRAGMA table_info(trades)")
+    cols = {str(row[1]) for row in cur.fetchall()}
+    if "market_regime" not in cols:
+        conn.execute("ALTER TABLE trades ADD COLUMN market_regime TEXT")
+
+
 def init_db() -> None:
-    """Create the schema if absent. Idempotent."""
+    """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
     try:
         conn.executescript(_SCHEMA_SQL)
+        _migrate_to_v2(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
-        if cur.fetchone() is None:
+        row = cur.fetchone()
+        if row is None:
             conn.execute(
                 "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,)
+            )
+        elif int(row["version"]) < SCHEMA_VERSION:
+            conn.execute(
+                "UPDATE schema_version SET version = ?", (SCHEMA_VERSION,)
             )
         conn.commit()
     finally:
@@ -300,11 +338,19 @@ def insert_trade(trade: Trade) -> int:
             f"Invalid outcome '{trade.outcome}' "
             f"(expected one of {sorted(VALID_OUTCOMES)})"
         )
+    if (
+        trade.market_regime is not None
+        and trade.market_regime not in VALID_MARKET_REGIMES
+    ):
+        raise ValueError(
+            f"Invalid market_regime '{trade.market_regime}' "
+            f"(expected one of {sorted(VALID_MARKET_REGIMES)})"
+        )
     sql = """
         INSERT INTO trades (
             signal_id, opened_at, closed_at, exit_price,
-            outcome, pnl_pct, pnl_dollars, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            outcome, pnl_pct, pnl_dollars, notes, market_regime
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = (
         trade.signal_id,
@@ -315,6 +361,7 @@ def insert_trade(trade: Trade) -> int:
         trade.pnl_pct,
         trade.pnl_dollars,
         trade.notes,
+        trade.market_regime,
     )
     conn = get_connection()
     try:
@@ -355,6 +402,15 @@ def update_trade(trade_id: int, **fields: Any) -> None:
             f"Invalid outcome '{normalized['outcome']}' "
             f"(expected one of {sorted(VALID_OUTCOMES)})"
         )
+    if (
+        "market_regime" in normalized
+        and normalized["market_regime"] is not None
+        and normalized["market_regime"] not in VALID_MARKET_REGIMES
+    ):
+        raise ValueError(
+            f"Invalid market_regime '{normalized['market_regime']}' "
+            f"(expected one of {sorted(VALID_MARKET_REGIMES)})"
+        )
 
     set_clause = ", ".join(f"{k} = ?" for k in normalized)  # keys are whitelisted
     sql = f"UPDATE trades SET {set_clause} WHERE id = ?"  # noqa: S608 - whitelisted columns
@@ -368,6 +424,9 @@ def update_trade(trade_id: int, **fields: Any) -> None:
 
 
 def _row_to_trade(row: sqlite3.Row) -> Trade:
+    # PRAGMA table_info shape varies between v1 (no market_regime) and v2; use
+    # row.keys() so the conversion stays robust mid-migration.
+    keys = set(row.keys())
     return Trade(
         signal_id=int(row["signal_id"]),
         opened_at=datetime.fromisoformat(row["opened_at"]),
@@ -379,6 +438,7 @@ def _row_to_trade(row: sqlite3.Row) -> Trade:
         pnl_pct=row["pnl_pct"],
         pnl_dollars=row["pnl_dollars"],
         notes=row["notes"],
+        market_regime=row["market_regime"] if "market_regime" in keys else None,
         id=int(row["id"]),
     )
 
@@ -471,6 +531,115 @@ def get_daily_performance(target_date: date) -> DailyPerf | None:
         total_pnl_pct=row["total_pnl_pct"],
         id=int(row["id"]),
     )
+
+
+# ---- regime snapshots (Phase 2.1) ----
+
+
+def upsert_regime_snapshot(
+    *,
+    snapshot_date: str,
+    regime: str,
+    spy_close: float,
+    ema50: float,
+    ema200: float,
+    ema50_slope: float,
+    captured_at: datetime,
+) -> None:
+    """Insert or replace the regime_snapshots row for ``snapshot_date``.
+
+    Idempotent: re-running with the same date overwrites the prior row. The
+    daily scheduler relies on this — a second run inside the same UTC day
+    must not create a duplicate.
+    """
+    if regime not in VALID_MARKET_REGIMES:
+        raise ValueError(
+            f"Invalid regime '{regime}' "
+            f"(expected one of {sorted(VALID_MARKET_REGIMES)})"
+        )
+    sql = """
+        INSERT INTO regime_snapshots (
+            date, regime, spy_close, ema50, ema200, ema50_slope, captured_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(date) DO UPDATE SET
+            regime = excluded.regime,
+            spy_close = excluded.spy_close,
+            ema50 = excluded.ema50,
+            ema200 = excluded.ema200,
+            ema50_slope = excluded.ema50_slope,
+            captured_at = excluded.captured_at
+    """
+    params = (
+        snapshot_date,
+        regime,
+        spy_close,
+        ema50,
+        ema200,
+        ema50_slope,
+        captured_at.isoformat(),
+    )
+    conn = get_connection()
+    try:
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_regime_snapshot(snapshot_date: str) -> dict[str, Any] | None:
+    """Fetch a single snapshot by date, or None if absent."""
+    sql = "SELECT * FROM regime_snapshots WHERE date = ?"
+    conn = get_connection()
+    try:
+        row = conn.execute(sql, (snapshot_date,)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return _regime_row_to_dict(row)
+
+
+def get_regime_snapshots(limit: int = 30) -> list[dict[str, Any]]:
+    """Return the most recent ``limit`` regime_snapshots, newest first."""
+    sql = "SELECT * FROM regime_snapshots ORDER BY date DESC LIMIT ?"
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, (limit,)).fetchall()
+    finally:
+        conn.close()
+    return [_regime_row_to_dict(r) for r in rows]
+
+
+def _regime_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "date": str(row["date"]),
+        "regime": str(row["regime"]),
+        "spy_close": float(row["spy_close"]),
+        "ema50": float(row["ema50"]),
+        "ema200": float(row["ema200"]),
+        "ema50_slope": float(row["ema50_slope"]),
+        "captured_at": str(row["captured_at"]),
+    }
+
+
+def get_closed_trades_missing_regime() -> list[Trade]:
+    """Return every closed trade (win/loss/expired) where market_regime IS NULL.
+
+    Used by the Phase 2.1 backfill subcommand. Open trades are intentionally
+    excluded — only closed trades have a historical regime worth backfilling,
+    and live trades get tagged at fire time going forward.
+    """
+    sql = (
+        "SELECT * FROM trades "
+        "WHERE outcome IN ('win','loss','expired') AND market_regime IS NULL "
+        "ORDER BY opened_at ASC"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_trade(r) for r in rows]
 
 
 # ---- diagnostics ----
