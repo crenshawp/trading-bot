@@ -22,13 +22,13 @@ def _run(argv: list[str]) -> None:
 def test_cli_db_init_prints_version(tmp_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _run(["db", "init"])
     out = capsys.readouterr().out
-    assert "Schema version: 3" in out
+    assert "Schema version: 4" in out
 
 
 def test_cli_db_status_shows_counts(tmp_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _run(["db", "status"])
     out = capsys.readouterr().out
-    assert "Schema version: 3" in out
+    assert "Schema version: 4" in out
     assert "signals" in out
     assert "trades" in out
     assert "daily_performance" in out
@@ -773,6 +773,255 @@ def test_cli_report_by_regime_vix_sparse_one_bucket(
     assert "bull" in out
     assert "low" in out
     assert "100.0%" in out
+
+
+# ───────────────────── Phase 2.2b predictions CLI ─────────────────────
+
+
+def test_cli_predictions_enable_then_disable(
+    tmp_db: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import settings
+
+    _run(["predictions", "enable"])
+    out = capsys.readouterr().out
+    assert "Predictions: ENABLED" in out
+    assert settings.get_bool("predictions.enabled") is True
+
+    _run(["predictions", "disable"])
+    out = capsys.readouterr().out
+    assert "Predictions: DISABLED" in out
+    assert settings.get_bool("predictions.enabled") is False
+
+
+def test_cli_predictions_status_default_disabled(
+    tmp_db: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _run(["predictions", "status"])
+    out = capsys.readouterr().out
+    assert "Predictions: DISABLED" in out
+    assert "BTC-USD,ETH-USD" in out
+    assert "Accuracy:             N/A" in out
+
+
+def test_cli_predictions_status_enabled_with_prediction(
+    tmp_db: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
+
+    from trading_bot import db, settings
+    from trading_bot.models import Prediction
+
+    settings.set_bool("predictions.enabled", True)
+    db.insert_prediction(Prediction(
+        ticker="BTC-USD", direction="HIGHER", confidence=72.0,
+        entry_price=94000.0,
+        target_window_end=_dt.now(_UTC) - _td(minutes=10),
+        signals_used="{}",
+        created_at=_dt.now(_UTC) - _td(minutes=25),
+        market_regime="bull", vix_band="low", vix_level=18.0,
+        outcome="correct", exit_price=94050.0,
+        resolved_at=_dt.now(_UTC) - _td(minutes=8),
+    ))
+    _run(["predictions", "status"])
+    out = capsys.readouterr().out
+    assert "ENABLED" in out
+    assert "Predictions made:     1" in out
+    assert "Most recent:" in out
+
+
+def test_cli_predictions_window_happy(
+    tmp_db: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import settings
+
+    _run(["predictions", "window", "--start", "09:00", "--end", "17:00"])
+    out = capsys.readouterr().out
+    assert "09:00 - 17:00 ET" in out
+    assert settings.get("predictions.window_start") == "09:00"
+    assert settings.get("predictions.window_end") == "17:00"
+
+
+def test_cli_predictions_window_rejects_bad_format(
+    tmp_db: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        _run(["predictions", "window", "--start", "9am", "--end", "5pm"])
+    assert exc.value.code == 1
+    assert "Invalid window" in capsys.readouterr().err
+
+
+def test_cli_predictions_window_rejects_end_before_start(
+    tmp_db: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        _run(["predictions", "window", "--start", "22:00", "--end", "08:00"])
+    assert exc.value.code == 1
+    assert "end" in capsys.readouterr().err
+
+
+def test_cli_predictions_tickers_happy(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import pandas as pd
+
+    from trading_bot import settings
+
+    # Stub _fetch_15m_candles to return a non-None DataFrame for any ticker.
+    monkeypatch.setattr(
+        "trading_bot.predictions._fetch_15m_candles",
+        lambda _t: pd.DataFrame({"x": [1]}),
+    )
+    _run(["predictions", "tickers", "--set", "BTC-USD,ETH-USD"])
+    assert "BTC-USD, ETH-USD" in capsys.readouterr().out
+    assert settings.get("predictions.tickers") == "BTC-USD,ETH-USD"
+
+
+def test_cli_predictions_tickers_rejects_unresolvable(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "trading_bot.predictions._fetch_15m_candles", lambda _t: None,
+    )
+    with pytest.raises(SystemExit) as exc:
+        _run(["predictions", "tickers", "--set", "BOGUS-USD"])
+    assert exc.value.code == 1
+    assert "failed yfinance validation" in capsys.readouterr().err
+
+
+def test_cli_predictions_pause_sets_until(
+    tmp_db: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import settings
+
+    _run(["predictions", "pause", "--minutes", "30"])
+    out = capsys.readouterr().out
+    assert "paused until" in out.lower()
+    until_raw = settings.get("predictions.pause_until")
+    assert until_raw is not None
+
+
+def test_cli_predictions_pause_rejects_zero(
+    tmp_db: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        _run(["predictions", "pause", "--minutes", "0"])
+    assert exc.value.code == 1
+    assert "must be positive" in capsys.readouterr().err
+
+
+def test_cli_report_predictions_empty(
+    tmp_db: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _run(["report", "predictions"])
+    assert "(no predictions yet)" in capsys.readouterr().out
+
+
+def test_cli_report_predictions_happy(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot.performance import PredictionStats
+
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_predictions_by_ticker",
+        lambda: [
+            PredictionStats("BTC-USD", total=48, correct=31, incorrect=16,
+                            push=1, unresolved=0, accuracy=66.0),
+            PredictionStats("ETH-USD", total=52, correct=29, incorrect=22,
+                            push=1, unresolved=0, accuracy=56.9),
+        ],
+    )
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_predictions_overall",
+        lambda: PredictionStats(
+            "TOTAL", total=100, correct=60, incorrect=38, push=2,
+            unresolved=0, accuracy=61.2,
+        ),
+    )
+    _run(["report", "predictions"])
+    out = capsys.readouterr().out
+    assert "Prediction accuracy" in out
+    assert "BTC-USD" in out
+    assert "ETH-USD" in out
+    assert "TOTAL" in out
+    assert "61.2%" in out
+
+
+def test_cli_report_predictions_by_regime(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot.performance import PredictionStats
+
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_predictions_by_regime",
+        lambda: [PredictionStats(
+            "bull", total=20, correct=15, incorrect=4, push=1,
+            unresolved=0, accuracy=78.9,
+        )],
+    )
+    _run(["report", "predictions", "--by-regime"])
+    out = capsys.readouterr().out
+    assert "by regime" in out
+    assert "bull" in out
+    assert "78.9%" in out
+
+
+def test_cli_report_predictions_by_vix(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot.performance import PredictionStats
+
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_predictions_by_vix",
+        lambda: [PredictionStats(
+            "low", total=12, correct=8, incorrect=4, push=0,
+            unresolved=0, accuracy=66.7,
+        )],
+    )
+    _run(["report", "predictions", "--by-vix"])
+    out = capsys.readouterr().out
+    assert "by VIX band" in out
+    assert "low" in out
+
+
+def test_cli_report_predictions_by_time(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot.performance import PredictionStats
+
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_predictions_by_hour",
+        lambda: [
+            PredictionStats("09", total=12, correct=9, incorrect=3, push=0,
+                            unresolved=0, accuracy=75.0),
+            PredictionStats("14", total=18, correct=10, incorrect=8, push=0,
+                            unresolved=0, accuracy=55.5),
+        ],
+    )
+    _run(["report", "predictions", "--by-time"])
+    out = capsys.readouterr().out
+    assert "by hour" in out
+    assert "75.0%" in out
+    assert "55.5%" in out
 
 
 def test_report_recent_with_custom_days(

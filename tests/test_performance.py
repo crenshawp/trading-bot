@@ -669,3 +669,114 @@ def test_stats_by_regime_x_vix_empty(tmp_db: Path) -> None:
 
 def test_stats_by_signal_type_with_vix_empty(tmp_db: Path) -> None:
     assert performance.stats_by_signal_type_with_vix() == []
+
+
+# ────────────────────── prediction aggregations (Phase 2.2b) ──────────────────────
+
+
+def _seed_prediction(
+    *,
+    ticker: str = "BTC-USD",
+    direction: str = "HIGHER",
+    confidence: float = 70.0,
+    entry: float = 100.0,
+    outcome: str | None = None,
+    exit_price: float | None = None,
+    market_regime: str | None = "bull",
+    vix_band: str | None = "low",
+    created_at: datetime | None = None,
+) -> int:
+    """Insert a prediction row with the given context."""
+    from trading_bot.models import Prediction
+    ts = created_at if created_at is not None else datetime(2026, 5, 26, 14, 0, tzinfo=UTC)
+    target = ts + timedelta(minutes=15)
+    resolved_at = (
+        ts + timedelta(minutes=16)
+        if outcome is not None else None
+    )
+    return db.insert_prediction(Prediction(
+        ticker=ticker, direction=direction, confidence=confidence,
+        entry_price=entry, target_window_end=target,
+        signals_used="{}", created_at=ts,
+        market_regime=market_regime, vix_band=vix_band, vix_level=18.0,
+        resolved_at=resolved_at, exit_price=exit_price, outcome=outcome,
+    ))
+
+
+def test_predictions_overall_excludes_pushes_from_accuracy(tmp_db: Path) -> None:
+    _seed_prediction(outcome="correct")
+    _seed_prediction(outcome="correct", created_at=datetime(2026, 5, 26, 14, 30, tzinfo=UTC))
+    _seed_prediction(outcome="incorrect", created_at=datetime(2026, 5, 26, 15, 0, tzinfo=UTC))
+    _seed_prediction(outcome="push", created_at=datetime(2026, 5, 26, 15, 30, tzinfo=UTC))
+    stats = performance.stats_predictions_overall()
+    assert stats.total == 4
+    assert stats.correct == 2
+    assert stats.incorrect == 1
+    assert stats.push == 1
+    assert stats.accuracy == pytest.approx(2 / 3 * 100, rel=1e-3)
+
+
+def test_predictions_overall_empty(tmp_db: Path) -> None:
+    stats = performance.stats_predictions_overall()
+    assert stats.total == 0
+    assert stats.accuracy is None
+
+
+def test_predictions_by_ticker_groups(tmp_db: Path) -> None:
+    _seed_prediction(ticker="BTC-USD", outcome="correct")
+    _seed_prediction(ticker="BTC-USD", outcome="incorrect",
+                     created_at=datetime(2026, 5, 26, 14, 30, tzinfo=UTC))
+    _seed_prediction(ticker="ETH-USD", outcome="correct",
+                     created_at=datetime(2026, 5, 26, 15, 0, tzinfo=UTC))
+    rows = performance.stats_predictions_by_ticker()
+    by_label = {r.label: r for r in rows}
+    assert by_label["BTC-USD"].total == 2
+    assert by_label["BTC-USD"].correct == 1
+    assert by_label["ETH-USD"].total == 1
+
+
+def test_predictions_by_regime_orders_canonically(tmp_db: Path) -> None:
+    base = datetime(2026, 5, 26, 14, 0, tzinfo=UTC)
+    _seed_prediction(market_regime="bear", outcome="incorrect",
+                     created_at=base + timedelta(seconds=1))
+    _seed_prediction(market_regime="unknown", outcome="correct",
+                     created_at=base + timedelta(seconds=2))
+    _seed_prediction(market_regime="bull", outcome="correct",
+                     created_at=base + timedelta(seconds=3))
+    _seed_prediction(market_regime="sideways", outcome="correct",
+                     created_at=base + timedelta(seconds=4))
+    result = performance.stats_predictions_by_regime()
+    assert [r.label for r in result] == ["bull", "sideways", "bear", "unknown"]
+
+
+def test_predictions_by_vix_orders_canonically(tmp_db: Path) -> None:
+    base = datetime(2026, 5, 26, 14, 0, tzinfo=UTC)
+    _seed_prediction(vix_band="extreme", outcome="incorrect",
+                     created_at=base + timedelta(seconds=1))
+    _seed_prediction(vix_band="low", outcome="correct",
+                     created_at=base + timedelta(seconds=2))
+    _seed_prediction(vix_band="elevated", outcome="correct",
+                     created_at=base + timedelta(seconds=3))
+    result = performance.stats_predictions_by_vix()
+    assert [r.label for r in result] == ["low", "elevated", "extreme"]
+
+
+def test_predictions_by_hour_uses_et(tmp_db: Path) -> None:
+    # 14:00 UTC = 10:00 ET (during DST in May 2026).
+    _seed_prediction(
+        outcome="correct",
+        created_at=datetime(2026, 5, 26, 14, 0, tzinfo=UTC),
+    )
+    _seed_prediction(
+        outcome="incorrect",
+        created_at=datetime(2026, 5, 26, 14, 30, tzinfo=UTC),
+    )
+    rows = performance.stats_predictions_by_hour()
+    assert len(rows) == 1
+    assert rows[0].label == "10"
+    assert rows[0].total == 2
+    assert rows[0].accuracy == pytest.approx(50.0)
+
+
+def test_predictions_by_hour_empty(tmp_db: Path) -> None:
+    assert performance.stats_predictions_by_hour() == []

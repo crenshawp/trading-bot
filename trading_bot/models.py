@@ -72,3 +72,36 @@ VALID_MARKET_REGIMES: frozenset[str] = frozenset(
 VALID_VIX_BANDS: frozenset[str] = frozenset(
     {"low", "elevated", "high", "extreme", "unknown"}
 )
+# Phase 2.2b 15-min prediction outcomes. "push" handles exit == entry
+# (rare on crypto but possible). NULL means not yet resolved.
+VALID_PREDICTION_OUTCOMES: frozenset[str] = frozenset(
+    {"correct", "incorrect", "push"}
+)
+VALID_PREDICTION_DIRECTIONS: frozenset[str] = frozenset({"HIGHER", "LOWER"})
+
+
+@dataclass(frozen=True)
+class Prediction:
+    """A 15-min direction prediction (Phase 2.2b).
+
+    Tracked entirely separately from trades — different table, different
+    reports. Created at fire time, resolved 15 minutes later when the
+    target candle closes. ``signals_used`` is a JSON-encoded string
+    persisted verbatim into the DB so we can audit per-prediction what
+    each indicator contributed.
+    """
+    ticker: str
+    direction: str                # 'HIGHER' | 'LOWER'
+    confidence: float             # 0-100
+    entry_price: float
+    target_window_end: datetime
+    signals_used: str             # JSON-encoded dict
+    created_at: datetime
+    market_regime: str | None = None
+    vix_band: str | None = None
+    vix_level: float | None = None
+    resolved_at: datetime | None = None
+    exit_price: float | None = None
+    outcome: str | None = None    # 'correct' | 'incorrect' | 'push' | None
+    notified: bool = False
+    id: int | None = None

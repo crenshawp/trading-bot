@@ -14,6 +14,7 @@ is annotated regardless.
 """
 
 import argparse
+import sys
 import time
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
@@ -24,7 +25,7 @@ import requests
 import schedule
 import yfinance as yf
 
-from trading_bot import db, outcomes, performance, regime, vix
+from trading_bot import db, outcomes, performance, predictions, regime, settings, vix
 from trading_bot.models import Signal, Trade
 from trading_bot.secrets import get_required
 
@@ -526,6 +527,253 @@ def _run_daily_regime_snapshot() -> None:
         print(f"  regime snapshot error: {exc}", file=sys.stderr)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PREDICTION ENGINE (Phase 2.2b)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Default settings for the prediction engine. These are written to the
+# settings table on first run only — subsequent runs respect whatever the
+# user configured via the CLI.
+_PRED_DEFAULTS = {
+    "predictions.enabled":           "false",
+    "predictions.window_start":      "08:00",
+    "predictions.window_end":        "22:00",
+    "predictions.tickers":           "BTC-USD,ETH-USD",
+    "predictions.notify_resolution": "false",
+}
+
+
+def _seed_prediction_defaults() -> None:
+    """Write any missing prediction settings to their defaults. Idempotent."""
+    for key, value in _PRED_DEFAULTS.items():
+        if settings.get(key) is None:
+            settings.set(key, value)
+
+
+def _parse_hhmm(s: str) -> tuple[int, int] | None:
+    parts = s.strip().split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        hh = int(parts[0])
+        mm = int(parts[1])
+    except ValueError:
+        return None
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+    return (hh, mm)
+
+
+def _within_prediction_window(now_et: datetime) -> bool:
+    """Inclusive on both ends. start <= now < end (end-exclusive feels
+    natural; a 22:00 end means stop sending at 22:00 sharp)."""
+    start = _parse_hhmm(settings.get("predictions.window_start", "08:00") or "08:00")
+    end = _parse_hhmm(settings.get("predictions.window_end", "22:00") or "22:00")
+    if start is None or end is None:
+        return False
+    now_minutes = now_et.hour * 60 + now_et.minute
+    start_minutes = start[0] * 60 + start[1]
+    end_minutes = end[0] * 60 + end[1]
+    return start_minutes <= now_minutes < end_minutes
+
+
+def _check_pause_until(now: datetime) -> bool:
+    """Return True if predictions are currently paused. Auto-clears an
+    expired pause_until so the next sweep doesn't keep checking it."""
+    raw = settings.get("predictions.pause_until")
+    if not raw:
+        return False
+    try:
+        until = datetime.fromisoformat(raw)
+    except ValueError:
+        settings.delete("predictions.pause_until")
+        return False
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=UTC)
+    if now < until:
+        return True
+    settings.delete("predictions.pause_until")
+    return False
+
+
+def _send_prediction_notification(pred: object) -> None:
+    """Send the prediction alert via Discord + Pushover. Plain ASCII."""
+    # ``pred`` typed as object to keep this function importable without the
+    # Prediction class at module-load time; runtime asserts the shape.
+    p = pred  # alias
+    ticker = getattr(p, "ticker")  # noqa: B009
+    direction = getattr(p, "direction")  # noqa: B009
+    confidence = float(getattr(p, "confidence"))  # noqa: B009
+    entry = float(getattr(p, "entry_price"))  # noqa: B009
+    target_end = getattr(p, "target_window_end")  # noqa: B009
+    regime_tag = getattr(p, "market_regime") or "unknown"  # noqa: B009
+    vix_tag = getattr(p, "vix_band") or "unknown"  # noqa: B009
+
+    et = ZoneInfo("America/New_York")
+    created_at = getattr(p, "created_at")  # noqa: B009
+    created_et = created_at.astimezone(et) if created_at.tzinfo else created_at
+    target_et = target_end.astimezone(et) if target_end.tzinfo else target_end
+
+    msg = (
+        f"[PREDICTION] {ticker} -> {direction} ({confidence:.0f}% confidence)\n"
+        f"Entry: ${entry:,.2f} @ {created_et.strftime('%H:%M ET')}\n"
+        f"Window closes: {target_et.strftime('%H:%M ET')}\n"
+        f"Context: {regime_tag} / {vix_tag} VIX"
+    )
+
+    if DRY_RUN:
+        print("\n--- DRY-RUN prediction (no Discord/Pushover) ---")
+        print(msg)
+        return
+
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+    except Exception as exc:
+        print(f"  prediction Discord error: {exc}", file=sys.stderr)
+    try:
+        requests.post("https://api.pushover.net/1/messages.json", data={
+            "token": PUSHOVER_APP_TOKEN,
+            "user":  PUSHOVER_USER_KEY,
+            "title": f"Prediction: {ticker} {direction}",
+            "message": msg,
+        })
+    except Exception as exc:
+        print(f"  prediction Pushover error: {exc}", file=sys.stderr)
+
+
+def _send_resolution_notification(
+    pred: object, result: object,
+) -> None:
+    """Sent only when ``predictions.notify_resolution`` is on."""
+    ticker = getattr(pred, "ticker")  # noqa: B009
+    direction = getattr(pred, "direction")  # noqa: B009
+    confidence = float(getattr(pred, "confidence"))  # noqa: B009
+    entry = float(getattr(pred, "entry_price"))  # noqa: B009
+    exit_price = getattr(result, "exit_price")  # noqa: B009
+    outcome = getattr(result, "outcome")  # noqa: B009
+
+    outcome_label = {
+        "correct":   "[WIN]",
+        "incorrect": "[LOSS]",
+        "push":      "[PUSH]",
+    }.get(outcome or "", "[?]")
+
+    if exit_price is not None and entry != 0:
+        pct = (exit_price - entry) / entry * 100.0
+        sign = "+" if pct >= 0 else ""
+        change = f"({sign}{pct:.2f}%)"
+        exit_str = f"${exit_price:,.2f}"
+    else:
+        change = ""
+        exit_str = "n/a"
+
+    msg = (
+        f"[PREDICTION RESOLVED] {ticker} -> {direction} {outcome_label}\n"
+        f"Entry: ${entry:,.2f}  Exit: {exit_str}  {change}\n"
+        f"{outcome or 'unresolved'} ({confidence:.0f}% confidence)"
+    )
+
+    if DRY_RUN:
+        print("\n--- DRY-RUN resolution (no Discord/Pushover) ---")
+        print(msg)
+        return
+
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+    except Exception as exc:
+        print(f"  resolution Discord error: {exc}", file=sys.stderr)
+    try:
+        requests.post("https://api.pushover.net/1/messages.json", data={
+            "token": PUSHOVER_APP_TOKEN,
+            "user":  PUSHOVER_USER_KEY,
+            "title": f"Resolved: {ticker} {outcome_label}",
+            "message": msg,
+        })
+    except Exception as exc:
+        print(f"  resolution Pushover error: {exc}", file=sys.stderr)
+
+
+def _gated_skip_reason(now_utc: datetime) -> str | None:
+    """Why predictions are skipped this tick, or None if they should run."""
+    if not settings.get_bool("predictions.enabled", default=False):
+        return "disabled"
+    if _check_pause_until(now_utc):
+        return "paused"
+    et = ZoneInfo("America/New_York")
+    now_et = now_utc.astimezone(et)
+    if not _within_prediction_window(now_et):
+        return "outside_window"
+    return None
+
+
+def _run_prediction_sweep() -> None:
+    """15-min cron tick. Gated by settings + active window + pause."""
+    now_utc = datetime.now(UTC)
+    skip = _gated_skip_reason(now_utc)
+    if skip is not None:
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] prediction sweep "
+            f"skipped: {skip}"
+        )
+        return
+
+    raw_tickers = settings.get("predictions.tickers", "BTC-USD,ETH-USD") or ""
+    tickers = [t.strip() for t in raw_tickers.split(",") if t.strip()]
+    for ticker in tickers:
+        try:
+            pred = predictions.predict_direction(ticker, now=now_utc)
+        except Exception as exc:  # noqa: BLE001 - never let one ticker kill the sweep
+            print(f"  prediction error for {ticker}: {exc}", file=sys.stderr)
+            continue
+        if pred is None:
+            print(f"  {ticker}: signals mixed or data unavailable")
+            continue
+        try:
+            pid = db.insert_prediction(pred)
+            _send_prediction_notification(pred)
+            db.update_prediction(pid, notified=True)
+            print(
+                f"  {ticker}: {pred.direction} {pred.confidence:.0f}% "
+                f"(window ends {pred.target_window_end.strftime('%H:%M UTC')})"
+            )
+        except Exception as exc:  # noqa: BLE001 - per-ticker safety
+            print(f"  prediction persist error for {ticker}: {exc}", file=sys.stderr)
+
+
+def _run_prediction_resolution() -> None:
+    """5-min cron tick. Resolves any predictions whose target candle has closed."""
+    try:
+        results = predictions.resolve_due_predictions()
+    except Exception as exc:  # noqa: BLE001 - resolver must never kill the loop
+        print(f"  prediction resolver error: {exc}", file=sys.stderr)
+        return
+
+    notify_resolution = settings.get_bool(
+        "predictions.notify_resolution", default=False,
+    )
+    resolved = sum(1 for r in results if r.status == "resolved")
+    if resolved:
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] resolved {resolved} "
+            f"predictions"
+        )
+
+    if notify_resolution:
+        for result in results:
+            if result.status != "resolved":
+                continue
+            pred = db.get_prediction(result.prediction_id)
+            if pred is None:
+                continue
+            try:
+                _send_resolution_notification(pred, result)
+            except Exception as exc:  # noqa: BLE001 - notification is best-effort
+                print(
+                    f"  resolution notify error for {result.prediction_id}: {exc}",
+                    file=sys.stderr,
+                )
+
+
 def _run_daily_vix_snapshot() -> None:
     """Phase 2.2: capture today's VIX and persist to vix_snapshots.
 
@@ -1017,6 +1265,16 @@ def main() -> None:
     # Daily VIX snapshot at 09:36 EST — one minute after the regime snapshot.
     # VIX moves faster than regime so we record it on its own row. Phase 2.2.
     schedule.every().day.at("09:36").do(_run_daily_vix_snapshot)
+
+    # Phase 2.2b — prediction engine. OFF by default; the sweep self-skips
+    # until the user enables it via `python -m trading_bot predictions enable`.
+    _seed_prediction_defaults()
+    # 15-min prediction sweep at :00, :15, :30, :45.
+    for minute in ("00", "15", "30", "45"):
+        schedule.every().hour.at(f":{minute}").do(_run_prediction_sweep)
+    # Resolution sweep every 5 minutes — closes out predictions whose
+    # 15-min target window has passed and whose candle is now available.
+    schedule.every(5).minutes.do(_run_prediction_resolution)
     print(f"Schedules registered: {schedule.jobs}")
 
     while True:

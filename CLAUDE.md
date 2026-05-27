@@ -40,12 +40,15 @@ comment on the suppression.
 - [x] Phase 1.4 — Performance attribution
 - [x] Phase 2.1 — Macro regime detection (bull/bear/sideways)
 - [x] Phase 2.2 — VIX context (low/elevated/high/extreme + regime x vix matrix)
+- [x] Phase 2.2b — 15-min direction prediction engine for crypto event markets
 
 ### Phase 2 sub-phases queued:
 
 - [ ] Phase 2.3 — Regime+VIX consolidation: weighted scoring,
       regime+vix filters, confidence flags emitted at signal fire,
-      News-aware weighting layered in
+      News-aware weighting layered in. The prediction engine benefits
+      from the same consolidation — high-confidence regime/VIX combos
+      may warrant higher-conviction predictions.
 - [ ] Phase 2.4 — Watchlist auto-discovery
 
 ## Outcome resolution
@@ -84,6 +87,10 @@ python -m trading_bot report by-asset             # stock vs crypto
 python -m trading_bot report by-regime            # per macro regime (Phase 2.1)
 python -m trading_bot report by-vix               # per VIX band (Phase 2.2)
 python -m trading_bot report by-regime-vix        # regime x vix matrix (Phase 2.2 headline view)
+python -m trading_bot report predictions          # prediction accuracy (Phase 2.2b)
+python -m trading_bot report predictions --by-regime
+python -m trading_bot report predictions --by-vix
+python -m trading_bot report predictions --by-time  # accuracy by hour-of-day ET
 python -m trading_bot report by-signal --by-vix   # signal x vix matrix (Phase 2.2)
 python -m trading_bot report by-ticker --by-vix   # ticker x vix matrix (Phase 2.2)
 python -m trading_bot report cross                # signal_type x ticker (>=3 trades)
@@ -105,6 +112,17 @@ python -m trading_bot regime backfill             # one-shot: tag closed trades 
 python -m trading_bot vix current                 # latest VIX level + band
 python -m trading_bot vix history --days 30       # recent vix_snapshots
 python -m trading_bot vix backfill                # one-shot: tag closed trades w/ historical VIX
+```
+
+### Predictions CLI (Phase 2.2b)
+
+```
+python -m trading_bot predictions enable          # flip master switch ON
+python -m trading_bot predictions disable         # flip master switch OFF (default)
+python -m trading_bot predictions status          # show settings + last-24h activity
+python -m trading_bot predictions window --start HH:MM --end HH:MM
+python -m trading_bot predictions tickers --set BTC-USD,ETH-USD
+python -m trading_bot predictions pause --minutes 60   # temporarily mute
 ```
 
 ### Aggregation rules (the only ones that matter)
@@ -212,6 +230,91 @@ suppress combos with negative expectancy, lean into the winners.
 
 Sort order is trade count descending so the most-populated buckets
 surface first. Empty buckets are omitted entirely (no `0/0` noise).
+
+## Prediction Engine (Phase 2.2b)
+
+A parallel subsystem alongside the swing trade scanner. Predicts
+**HIGHER / LOWER** for a 15-minute window on crypto tickers — designed
+to feed signals for Robinhood's event-contract prediction markets
+("will BTC be higher in 15 min?").
+
+### What it does NOT do
+
+- **No auto-betting.** Robinhood has no public API for event contracts.
+  This is permanent — not a limitation we plan to remove. The bot
+  notifies you; you place the bet manually on Robinhood.
+- **No strike-price prediction.** Direction only — higher or lower
+  than the entry price recorded at prediction time.
+- **No swing-trade interference.** Predictions and trades are entirely
+  separate: separate `predictions` table, separate scanner sweep,
+  separate report (`report predictions`). No commingling.
+
+### The six voting indicators
+
+Each indicator votes +1 (HIGHER), -1 (LOWER), or 0 (NEUTRAL) on the
+last 30 closed 15-min candles:
+
+1. **Candle streak** — 3 consecutive green/red candles
+2. **RSI(14) slope** — sign of (rsi_now - rsi_3_back)
+3. **MACD histogram direction** — sign of (hist_now - hist_prev)
+4. **Price vs VWAP** — above or below session VWAP
+5. **Volume confirmation** — current vol > 20-MA, sided by candle color
+6. **Bollinger position** — upper or lower half of BB(20, 2)
+
+Confidence = winning_side / decided * 100. If confidence is within 5
+points of 50% (i.e. < 55%), `predict_direction` returns `None` — the
+engine **does not guess** when signals are mixed. Skipping is honest;
+guessing poisons the accuracy stats.
+
+Each fired prediction is tagged with the current regime and VIX at
+creation time, so later you can break accuracy down by macro context
+(`report predictions --by-regime` / `--by-vix`).
+
+### Off-switch architecture
+
+Three independent gates, all checked at the top of each prediction sweep:
+
+1. **Master switch** — `settings['predictions.enabled']`. Default
+   `"false"`. Must be flipped on explicitly via the CLI.
+2. **Active window** — `settings['predictions.window_start']` /
+   `window_end`. Both `HH:MM` in ET. Default 08:00 - 22:00 ET. You
+   don't get pinged at 3am.
+3. **Pause** — `settings['predictions.pause_until']`. Convenience for
+   "going to dinner, mute for 2 hours" — set via
+   `predictions pause --minutes N`. Auto-cleared once expired.
+
+A single skipped tick is silent; the scanner logs the skip reason
+(`disabled` / `outside_window` / `paused`) so you can verify the
+gate is doing what you think.
+
+### Resolution
+
+Every 5 minutes, `resolve_due_predictions()` walks unresolved
+predictions whose `target_window_end` has passed and fetches the
+15-min candle that closed at that timestamp. Outcomes:
+
+- `exit > entry` AND direction HIGHER → `correct`
+- `exit < entry` AND direction LOWER → `correct`
+- `exit == entry` → `push` (rare on crypto but possible)
+- otherwise → `incorrect`
+
+If the candle isn't published yet (yfinance lag, recent prediction),
+the row stays `resolved_at IS NULL` and the next sweep retries.
+
+### Notifications
+
+Reuses the existing Pushover + Discord path. Plain ASCII (cp1252
+safe). Resolution notifications are off by default — set
+`predictions.notify_resolution` to `"true"` if you want them.
+
+### Why this is the cleanest accuracy surface in the bot
+
+Swing trades have ambiguous exits — TP, SL, hold-window expiry, gaps.
+Predictions have a fixed 15-min window with a deterministic close
+price. No ambiguity, no same-candle-TP+SL conservatism. The
+`report predictions --by-time` view will eventually answer: *at what
+hour of the day is the engine actually reliable?* That's a much
+sharper question than the swing-trade win-rate can answer.
 
 ## Railway deployment notes
 

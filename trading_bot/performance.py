@@ -28,6 +28,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from trading_bot import db
 from trading_bot.models import DailyPerf
@@ -526,6 +527,166 @@ def stats_by_ticker_with_vix(
         extra_where="signals.asset_class = ?",
         extra_params=(asset_class,),
     )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Prediction aggregations (Phase 2.2b)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class PredictionStats:
+    """Aggregated prediction performance. Pushes are excluded from the
+    accuracy denominator (same rule as expired trades for win_rate)."""
+    label: str
+    total: int
+    correct: int
+    incorrect: int
+    push: int
+    unresolved: int
+    accuracy: float | None  # None when correct+incorrect == 0
+
+
+def _pred_stats_from_row(label: str, row: sqlite3.Row | None) -> PredictionStats:
+    if row is None or row["total"] in (None, 0):
+        return PredictionStats(
+            label=label, total=0,
+            correct=0, incorrect=0, push=0, unresolved=0,
+            accuracy=None,
+        )
+    correct = int(row["correct"] or 0)
+    incorrect = int(row["incorrect"] or 0)
+    push = int(row["push"] or 0)
+    unresolved = int(row["unresolved"] or 0)
+    decided = correct + incorrect
+    accuracy = (correct / decided * 100.0) if decided > 0 else None
+    return PredictionStats(
+        label=label, total=int(row["total"]),
+        correct=correct, incorrect=incorrect, push=push, unresolved=unresolved,
+        accuracy=accuracy,
+    )
+
+
+_PRED_AGG = (
+    "COUNT(*) AS total, "
+    "SUM(CASE WHEN outcome = 'correct'   THEN 1 ELSE 0 END) AS correct, "
+    "SUM(CASE WHEN outcome = 'incorrect' THEN 1 ELSE 0 END) AS incorrect, "
+    "SUM(CASE WHEN outcome = 'push'      THEN 1 ELSE 0 END) AS push, "
+    "SUM(CASE WHEN outcome IS NULL       THEN 1 ELSE 0 END) AS unresolved"
+)
+
+
+def stats_predictions_overall() -> PredictionStats:
+    sql = f"SELECT {_PRED_AGG} FROM predictions"  # noqa: S608 - whitelist
+    conn = db.get_connection()
+    try:
+        row = conn.execute(sql).fetchone()
+    finally:
+        conn.close()
+    return _pred_stats_from_row("TOTAL", row)
+
+
+def stats_predictions_by_ticker() -> list[PredictionStats]:
+    sql = (
+        f"SELECT ticker AS slice, {_PRED_AGG} "
+        "FROM predictions GROUP BY ticker ORDER BY ticker"
+    )
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+    return [_pred_stats_from_row(str(r["slice"]), r) for r in rows]
+
+
+def stats_predictions_by_regime() -> list[PredictionStats]:
+    """One row per regime present in predictions. Ordered bull/sideways/bear/unknown."""
+    sql = (
+        f"SELECT COALESCE(market_regime, 'unknown') AS slice, {_PRED_AGG} "
+        "FROM predictions GROUP BY COALESCE(market_regime, 'unknown')"
+    )
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+    result = [_pred_stats_from_row(str(r["slice"]), r) for r in rows]
+    order = {r: i for i, r in enumerate(_REGIME_ORDER)}
+    result.sort(key=lambda s: order.get(s.label, len(_REGIME_ORDER)))
+    return result
+
+
+def stats_predictions_by_vix() -> list[PredictionStats]:
+    """One row per VIX band present in predictions. Ordered low→unknown."""
+    sql = (
+        f"SELECT COALESCE(vix_band, 'unknown') AS slice, {_PRED_AGG} "
+        "FROM predictions GROUP BY COALESCE(vix_band, 'unknown')"
+    )
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+    result = [_pred_stats_from_row(str(r["slice"]), r) for r in rows]
+    order = {b: i for i, b in enumerate(_VIX_ORDER)}
+    result.sort(key=lambda s: order.get(s.label, len(_VIX_ORDER)))
+    return result
+
+
+def stats_predictions_by_hour() -> list[PredictionStats]:
+    """One row per hour-of-day (in ET) that has at least one prediction.
+
+    The hour bucket is derived from ``created_at`` converted to ET. We do the
+    conversion in Python (SQLite TZ functions are limited) — pull rows,
+    group in-memory, sort by hour ascending.
+    """
+    sql = "SELECT * FROM predictions"
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+
+    et = ZoneInfo("America/New_York")
+    buckets: dict[int, dict[str, int]] = {}
+    for row in rows:
+        try:
+            created = datetime.fromisoformat(str(row["created_at"]))
+        except ValueError:
+            continue
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=UTC)
+        hour = created.astimezone(et).hour
+        b = buckets.setdefault(
+            hour,
+            {"total": 0, "correct": 0, "incorrect": 0, "push": 0, "unresolved": 0},
+        )
+        b["total"] += 1
+        outcome = row["outcome"]
+        if outcome == "correct":
+            b["correct"] += 1
+        elif outcome == "incorrect":
+            b["incorrect"] += 1
+        elif outcome == "push":
+            b["push"] += 1
+        else:
+            b["unresolved"] += 1
+
+    out: list[PredictionStats] = []
+    for hour in sorted(buckets):
+        d = buckets[hour]
+        decided = d["correct"] + d["incorrect"]
+        accuracy = (d["correct"] / decided * 100.0) if decided > 0 else None
+        out.append(PredictionStats(
+            label=f"{hour:02d}",
+            total=d["total"],
+            correct=d["correct"],
+            incorrect=d["incorrect"],
+            push=d["push"],
+            unresolved=d["unresolved"],
+            accuracy=accuracy,
+        ))
+    return out
 
 
 def stats_by_regime_x_vix() -> list[PerfStats]:

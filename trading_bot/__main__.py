@@ -5,9 +5,23 @@ import getpass
 import sys
 from datetime import date
 
-from trading_bot import db, outcomes, performance, regime, secrets, vix
+from trading_bot import (
+    db,
+    outcomes,
+    performance,
+    predictions,
+    regime,
+    secrets,
+    settings,
+    vix,
+)
 from trading_bot.migrate_csv import migrate_csv
-from trading_bot.performance import PerfStats, RegimeBreakdown, VixBreakdown
+from trading_bot.performance import (
+    PerfStats,
+    PredictionStats,
+    RegimeBreakdown,
+    VixBreakdown,
+)
 
 # ---- secrets ----
 
@@ -532,6 +546,222 @@ def cmd_report_by_regime_vix() -> None:
         )
 
 
+# ---- predictions CLI (Phase 2.2b) ----
+
+# Seeded defaults — duplicated from scanner._PRED_DEFAULTS so the CLI can
+# query the canonical view of "what should this setting be?" without
+# importing scanner (scanner imports half the universe at module load).
+_PRED_DEFAULT_VALUES: dict[str, str] = {
+    "predictions.enabled":           "false",
+    "predictions.window_start":      "08:00",
+    "predictions.window_end":        "22:00",
+    "predictions.tickers":           "BTC-USD,ETH-USD",
+    "predictions.notify_resolution": "false",
+}
+
+
+def _validate_hhmm(s: str) -> tuple[int, int]:
+    parts = s.strip().split(":")
+    if len(parts) != 2:
+        raise ValueError(f"expected HH:MM, got {s!r}")
+    try:
+        hh, mm = int(parts[0]), int(parts[1])
+    except ValueError as exc:
+        raise ValueError(f"invalid time {s!r}: {exc}") from exc
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        raise ValueError(f"out-of-range time {s!r}")
+    return (hh, mm)
+
+
+def cmd_predictions_enable() -> None:
+    settings.set_bool("predictions.enabled", True)
+    print("Predictions: ENABLED")
+
+
+def cmd_predictions_disable() -> None:
+    settings.set_bool("predictions.enabled", False)
+    print("Predictions: DISABLED")
+
+
+def cmd_predictions_status() -> None:
+    enabled = settings.get_bool("predictions.enabled", default=False)
+    win_start = settings.get(
+        "predictions.window_start", _PRED_DEFAULT_VALUES["predictions.window_start"],
+    )
+    win_end = settings.get(
+        "predictions.window_end", _PRED_DEFAULT_VALUES["predictions.window_end"],
+    )
+    tickers = settings.get(
+        "predictions.tickers", _PRED_DEFAULT_VALUES["predictions.tickers"],
+    )
+    notify_res = settings.get_bool(
+        "predictions.notify_resolution", default=False,
+    )
+    pause_until_raw = settings.get("predictions.pause_until")
+
+    label = "ENABLED" if enabled else "DISABLED"
+    print(f"Predictions: {label}")
+    print("-" * 38)
+    print(f"Active window:    {win_start} - {win_end} ET")
+    print(f"Tickers:          {tickers}")
+    print(f"Resolve notify:   {'on' if notify_res else 'off'}")
+    if pause_until_raw:
+        print(f"Paused until:     {pause_until_raw}")
+    print()
+
+    # Recent activity (last 24h)
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
+
+    since = _dt.now(_UTC) - _td(hours=24)
+    recent = db.get_predictions(since=since, limit=10_000)
+    made = len(recent)
+    resolved = sum(1 for p in recent if p.outcome is not None)
+    correct = sum(1 for p in recent if p.outcome == "correct")
+    incorrect = sum(1 for p in recent if p.outcome == "incorrect")
+    decided = correct + incorrect
+    acc = f"{correct / decided * 100:.1f}%" if decided > 0 else "N/A"
+
+    print("Recent activity (last 24h):")
+    print(f"  Predictions made:     {made}")
+    print(f"  Resolved:             {resolved}")
+    print(f"  Accuracy:             {acc}")
+
+    if recent:
+        last = max(recent, key=lambda p: p.created_at)
+        print(f"  Most recent:          {last.created_at.isoformat()}  "
+              f"{last.ticker} {last.direction}")
+
+
+def cmd_predictions_window(start: str, end: str) -> None:
+    try:
+        s = _validate_hhmm(start)
+        e = _validate_hhmm(end)
+    except ValueError as exc:
+        print(f"Invalid window: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if e <= s:
+        print(
+            f"Invalid window: end {end} must be after start {start}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    settings.set("predictions.window_start", start)
+    settings.set("predictions.window_end", end)
+    print(f"Active window updated: {start} - {end} ET")
+
+
+def cmd_predictions_tickers(raw: str) -> None:
+    """Validate each ticker resolves on yfinance before persisting."""
+    tickers = [t.strip() for t in raw.split(",") if t.strip()]
+    if not tickers:
+        print("Error: at least one ticker required", file=sys.stderr)
+        sys.exit(1)
+    bad: list[str] = []
+    for t in tickers:
+        try:
+            df = predictions._fetch_15m_candles(t)  # noqa: SLF001 - intentional reuse
+        except Exception as exc:  # noqa: BLE001 - yfinance can raise anything
+            print(f"  {t}: error checking — {exc}", file=sys.stderr)
+            bad.append(t)
+            continue
+        if df is None:
+            bad.append(t)
+    if bad:
+        print(
+            f"Error: tickers failed yfinance validation: {bad}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    settings.set("predictions.tickers", ",".join(tickers))
+    print(f"Tickers updated: {', '.join(tickers)}")
+
+
+def cmd_predictions_pause(minutes: int) -> None:
+    if minutes <= 0:
+        print("Error: --minutes must be positive", file=sys.stderr)
+        sys.exit(1)
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
+
+    until = _dt.now(_UTC) + _td(minutes=minutes)
+    settings.set("predictions.pause_until", until.isoformat())
+    print(f"Predictions paused until {until.isoformat()}")
+
+
+# ---- prediction reports ----
+
+
+def _fmt_accuracy(stats: PredictionStats) -> str:
+    return "    -" if stats.accuracy is None else f"{stats.accuracy:.1f}%"
+
+
+def cmd_report_predictions() -> None:
+    by_ticker = performance.stats_predictions_by_ticker()
+    overall = performance.stats_predictions_overall()
+    if overall.total == 0:
+        print("Prediction accuracy\n  (no predictions yet)")
+        return
+    label_w = max(8, max((len(s.label) for s in by_ticker), default=8))
+    print("Prediction accuracy")
+    print(
+        f"  {'Ticker':<{label_w}}  {'Total':>5}  {'Correct':>7}  "
+        f"{'Incorrect':>9}  {'Push':>4}  {'Accuracy':>8}"
+    )
+    for s in by_ticker:
+        print(
+            f"  {s.label:<{label_w}}  {s.total:>5}  {s.correct:>7}  "
+            f"{s.incorrect:>9}  {s.push:>4}  {_fmt_accuracy(s):>8}"
+        )
+    print(
+        f"  {'TOTAL':<{label_w}}  {overall.total:>5}  {overall.correct:>7}  "
+        f"{overall.incorrect:>9}  {overall.push:>4}  "
+        f"{_fmt_accuracy(overall):>8}"
+    )
+
+
+def _print_pred_axis_table(
+    rows: list[PredictionStats], title: str, label_header: str,
+) -> None:
+    if not rows or all(r.total == 0 for r in rows):
+        print(f"{title}\n  (no predictions yet)")
+        return
+    label_w = max(10, max(len(r.label) for r in rows))
+    print(title)
+    print(
+        f"  {label_header:<{label_w}}  {'Total':>5}  {'Correct':>7}  "
+        f"{'Incorrect':>9}  {'Push':>4}  {'Accuracy':>8}"
+    )
+    for s in rows:
+        print(
+            f"  {s.label:<{label_w}}  {s.total:>5}  {s.correct:>7}  "
+            f"{s.incorrect:>9}  {s.push:>4}  {_fmt_accuracy(s):>8}"
+        )
+
+
+def cmd_report_predictions_by_regime() -> None:
+    _print_pred_axis_table(
+        performance.stats_predictions_by_regime(),
+        title="Prediction accuracy by regime", label_header="Regime",
+    )
+
+
+def cmd_report_predictions_by_vix() -> None:
+    _print_pred_axis_table(
+        performance.stats_predictions_by_vix(),
+        title="Prediction accuracy by VIX band", label_header="VIX Band",
+    )
+
+
+def cmd_report_predictions_by_time() -> None:
+    _print_pred_axis_table(
+        performance.stats_predictions_by_hour(),
+        title="Prediction accuracy by hour (ET)", label_header="Hour (ET)",
+    )
+
+
 def cmd_report_daily(target_date: date | None) -> None:
     perf = performance.update_daily_performance(target_date)
     print(f"DAILY PERFORMANCE — {perf.date}")
@@ -608,6 +838,14 @@ def main() -> None:
     report_sub.add_parser("by-regime")
     report_sub.add_parser("by-vix")
     report_sub.add_parser("by-regime-vix")
+    pred_report_p = report_sub.add_parser("predictions")
+    pred_report_axis = pred_report_p.add_mutually_exclusive_group()
+    pred_report_axis.add_argument("--by-regime", action="store_true",
+                                  help="Break accuracy out by macro regime")
+    pred_report_axis.add_argument("--by-vix", action="store_true",
+                                  help="Break accuracy out by VIX band")
+    pred_report_axis.add_argument("--by-time", action="store_true",
+                                  help="Break accuracy out by hour-of-day ET")
     report_sub.add_parser("daily-backfill")
     daily_p = report_sub.add_parser("daily")
     daily_p.add_argument("--date", type=str, default=None,
@@ -630,6 +868,24 @@ def main() -> None:
     vhist_p.add_argument("--days", type=int, default=30,
                          help="How many recent snapshots to show (default 30)")
     vix_sub.add_parser("backfill")
+
+    # predictions (Phase 2.2b)
+    pred_parser = sub.add_parser("predictions")
+    pred_sub = pred_parser.add_subparsers(dest="predictions_cmd", required=True)
+    pred_sub.add_parser("enable")
+    pred_sub.add_parser("disable")
+    pred_sub.add_parser("status")
+    win_p = pred_sub.add_parser("window")
+    win_p.add_argument("--start", type=str, required=True,
+                       help="HH:MM in 24h ET (e.g. 08:00)")
+    win_p.add_argument("--end", type=str, required=True,
+                       help="HH:MM in 24h ET (e.g. 22:00)")
+    tick_p = pred_sub.add_parser("tickers")
+    tick_p.add_argument("--set", dest="ticker_list", type=str, required=True,
+                        help="Comma-separated, e.g. BTC-USD,ETH-USD")
+    pause_p = pred_sub.add_parser("pause")
+    pause_p.add_argument("--minutes", type=int, required=True,
+                         help="How long to pause predictions for")
 
     args = parser.parse_args()
 
@@ -686,6 +942,15 @@ def main() -> None:
             cmd_report_by_vix()
         elif args.report_cmd == "by-regime-vix":
             cmd_report_by_regime_vix()
+        elif args.report_cmd == "predictions":
+            if getattr(args, "by_regime", False):
+                cmd_report_predictions_by_regime()
+            elif getattr(args, "by_vix", False):
+                cmd_report_predictions_by_vix()
+            elif getattr(args, "by_time", False):
+                cmd_report_predictions_by_time()
+            else:
+                cmd_report_predictions()
         elif args.report_cmd == "daily-backfill":
             cmd_report_daily_backfill()
         elif args.report_cmd == "daily":
@@ -705,6 +970,19 @@ def main() -> None:
             cmd_vix_history(args.days)
         elif args.vix_cmd == "backfill":
             cmd_vix_backfill()
+    elif args.command == "predictions":
+        if args.predictions_cmd == "enable":
+            cmd_predictions_enable()
+        elif args.predictions_cmd == "disable":
+            cmd_predictions_disable()
+        elif args.predictions_cmd == "status":
+            cmd_predictions_status()
+        elif args.predictions_cmd == "window":
+            cmd_predictions_window(args.start, args.end)
+        elif args.predictions_cmd == "tickers":
+            cmd_predictions_tickers(args.ticker_list)
+        elif args.predictions_cmd == "pause":
+            cmd_predictions_pause(args.minutes)
 
 
 if __name__ == "__main__":

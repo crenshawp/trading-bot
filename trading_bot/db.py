@@ -8,7 +8,7 @@ relying on sqlite3's deprecated defaults).
 from __future__ import annotations
 
 import sqlite3
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,15 +18,19 @@ from trading_bot.models import (
     VALID_DIRECTIONS,
     VALID_MARKET_REGIMES,
     VALID_OUTCOMES,
+    VALID_PREDICTION_DIRECTIONS,
+    VALID_PREDICTION_OUTCOMES,
     VALID_VIX_BANDS,
     DailyPerf,
+    Prediction,
     Signal,
     Trade,
 )
 
+# Version 4 (Phase 2.2b) — adds predictions + settings tables.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -107,6 +111,40 @@ CREATE TABLE IF NOT EXISTS vix_snapshots (
     vix_band TEXT NOT NULL,
     captured_at TEXT NOT NULL
 );
+
+-- Phase 2.2b: 15-min direction predictions for crypto event markets.
+-- Tracked separately from trades — different lifecycle (15-min window
+-- vs days/weeks), different outcome shape (correct/incorrect/push vs
+-- win/loss/expired). Resolved by comparing the close of the candle
+-- that ends at target_window_end against entry_price.
+CREATE TABLE IF NOT EXISTS predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK (direction IN ('HIGHER','LOWER')),
+    confidence REAL NOT NULL,
+    entry_price REAL NOT NULL,
+    target_window_end TEXT NOT NULL,
+    signals_used TEXT NOT NULL,
+    market_regime TEXT,
+    vix_band TEXT,
+    vix_level REAL,
+    resolved_at TEXT,
+    exit_price REAL,
+    outcome TEXT CHECK (outcome IN ('correct','incorrect','push')),
+    notified INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_predictions_unresolved
+    ON predictions(target_window_end) WHERE resolved_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_predictions_ticker ON predictions(ticker);
+
+-- Phase 2.2b: generic key/value settings.
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 # Whitelist for update_trade — never interpolate user input into SQL column names.
@@ -121,7 +159,14 @@ _TRADE_UPDATABLE_FIELDS: frozenset[str] = frozenset(
 )
 
 _TABLE_NAMES: tuple[str, ...] = (
-    "signals", "trades", "daily_performance", "regime_snapshots", "vix_snapshots",
+    "signals", "trades", "daily_performance",
+    "regime_snapshots", "vix_snapshots",
+    "predictions", "settings",
+)
+
+# Whitelist for update_prediction — resolution flow updates these only.
+_PREDICTION_UPDATABLE_FIELDS: frozenset[str] = frozenset(
+    {"resolved_at", "exit_price", "outcome", "notified"}
 )
 
 
@@ -170,6 +215,17 @@ def _migrate_to_v3(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE trades ADD COLUMN vix_band TEXT")
 
 
+def _migrate_to_v4(_conn: sqlite3.Connection) -> None:
+    """Phase 2.2b migration step.
+
+    Nothing to ALTER — both new tables (``predictions``, ``settings``) are
+    created by the ``CREATE TABLE IF NOT EXISTS`` block above. This step
+    exists as the documented hook for future column adds without
+    re-numbering the existing migration sequence.
+    """
+    return None
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -177,6 +233,7 @@ def init_db() -> None:
         conn.executescript(_SCHEMA_SQL)
         _migrate_to_v2(conn)
         _migrate_to_v3(conn)
+        _migrate_to_v4(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -779,6 +836,178 @@ def get_closed_trades_missing_regime() -> list[Trade]:
     finally:
         conn.close()
     return [_row_to_trade(r) for r in rows]
+
+
+# ---- predictions (Phase 2.2b) ----
+
+
+def insert_prediction(prediction: Prediction) -> int:
+    """Insert a new Prediction and return its id."""
+    if prediction.direction not in VALID_PREDICTION_DIRECTIONS:
+        raise ValueError(
+            f"Invalid direction '{prediction.direction}' "
+            f"(expected one of {sorted(VALID_PREDICTION_DIRECTIONS)})"
+        )
+    if (
+        prediction.outcome is not None
+        and prediction.outcome not in VALID_PREDICTION_OUTCOMES
+    ):
+        raise ValueError(
+            f"Invalid outcome '{prediction.outcome}' "
+            f"(expected one of {sorted(VALID_PREDICTION_OUTCOMES)})"
+        )
+    sql = """
+        INSERT INTO predictions (
+            created_at, ticker, direction, confidence, entry_price,
+            target_window_end, signals_used, market_regime, vix_band,
+            vix_level, resolved_at, exit_price, outcome, notified
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    params = (
+        prediction.created_at.isoformat(),
+        prediction.ticker,
+        prediction.direction,
+        prediction.confidence,
+        prediction.entry_price,
+        prediction.target_window_end.isoformat(),
+        prediction.signals_used,
+        prediction.market_regime,
+        prediction.vix_band,
+        prediction.vix_level,
+        prediction.resolved_at.isoformat() if prediction.resolved_at else None,
+        prediction.exit_price,
+        prediction.outcome,
+        int(prediction.notified),
+    )
+    conn = get_connection()
+    try:
+        cur = conn.execute(sql, params)
+        conn.commit()
+        new_id = cur.lastrowid
+        if new_id is None:
+            raise RuntimeError("INSERT did not return a row id")
+        return new_id
+    finally:
+        conn.close()
+
+
+def update_prediction(prediction_id: int, **fields: Any) -> None:
+    """Whitelisted partial update — used by the resolution flow."""
+    unknown = set(fields) - _PREDICTION_UPDATABLE_FIELDS
+    if unknown:
+        raise ValueError(
+            f"Unknown prediction field(s): {sorted(unknown)} "
+            f"(allowed: {sorted(_PREDICTION_UPDATABLE_FIELDS)})"
+        )
+    if not fields:
+        return
+
+    normalized: dict[str, Any] = {}
+    for key, value in fields.items():
+        if isinstance(value, datetime):
+            normalized[key] = value.isoformat()
+        elif key == "notified" and isinstance(value, bool):
+            normalized[key] = int(value)
+        else:
+            normalized[key] = value
+
+    if (
+        "outcome" in normalized
+        and normalized["outcome"] is not None
+        and normalized["outcome"] not in VALID_PREDICTION_OUTCOMES
+    ):
+        raise ValueError(
+            f"Invalid outcome '{normalized['outcome']}' "
+            f"(expected one of {sorted(VALID_PREDICTION_OUTCOMES)})"
+        )
+
+    set_clause = ", ".join(f"{k} = ?" for k in normalized)
+    sql = f"UPDATE predictions SET {set_clause} WHERE id = ?"  # noqa: S608 - whitelist
+    params = [*normalized.values(), prediction_id]
+    conn = get_connection()
+    try:
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _row_to_prediction(row: sqlite3.Row) -> Prediction:
+    return Prediction(
+        ticker=str(row["ticker"]),
+        direction=str(row["direction"]),
+        confidence=float(row["confidence"]),
+        entry_price=float(row["entry_price"]),
+        target_window_end=datetime.fromisoformat(row["target_window_end"]),
+        signals_used=str(row["signals_used"]),
+        created_at=datetime.fromisoformat(row["created_at"]),
+        market_regime=row["market_regime"],
+        vix_band=row["vix_band"],
+        vix_level=row["vix_level"],
+        resolved_at=(
+            datetime.fromisoformat(row["resolved_at"])
+            if row["resolved_at"] else None
+        ),
+        exit_price=row["exit_price"],
+        outcome=row["outcome"],
+        notified=bool(row["notified"]),
+        id=int(row["id"]),
+    )
+
+
+def get_prediction(prediction_id: int) -> Prediction | None:
+    sql = "SELECT * FROM predictions WHERE id = ?"
+    conn = get_connection()
+    try:
+        row = conn.execute(sql, (prediction_id,)).fetchone()
+    finally:
+        conn.close()
+    return _row_to_prediction(row) if row is not None else None
+
+
+def get_unresolved_predictions(now: datetime | None = None) -> list[Prediction]:
+    """Predictions where the 15-min target window has passed but no
+    resolution row has been written yet. Sorted oldest first so the
+    resolver tackles them in order."""
+    cutoff = (now if now is not None else datetime.now(UTC)).isoformat()
+    sql = (
+        "SELECT * FROM predictions "
+        "WHERE resolved_at IS NULL AND target_window_end <= ? "
+        "ORDER BY target_window_end ASC"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, (cutoff,)).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_prediction(r) for r in rows]
+
+
+def get_predictions(
+    ticker: str | None = None,
+    since: datetime | None = None,
+    limit: int = 100,
+) -> list[Prediction]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if ticker is not None:
+        clauses.append("ticker = ?")
+        params.append(ticker)
+    if since is not None:
+        clauses.append("created_at >= ?")
+        params.append(since.isoformat())
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    sql = (
+        f"SELECT * FROM predictions {where} "  # noqa: S608 - whitelisted fragments
+        f"ORDER BY created_at DESC LIMIT ?"
+    )
+    params.append(limit)
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_prediction(r) for r in rows]
 
 
 # ---- diagnostics ----
