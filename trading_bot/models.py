@@ -41,6 +41,7 @@ class Trade:
     market_regime: str | None = None  # "bull" | "bear" | "sideways" | "unknown" (Phase 2.1)
     vix_level: float | None = None    # close-of-day VIX at fire time (Phase 2.2)
     vix_band: str | None = None       # "low" | "elevated" | "high" | "extreme" | "unknown"
+    context_score: int | None = None  # 0-5 composite (Phase 2.3); NULL = un-backfilled
     id: int | None = None
 
 
@@ -104,4 +105,5 @@ class Prediction:
     exit_price: float | None = None
     outcome: str | None = None    # 'correct' | 'incorrect' | 'push' | None
     notified: bool = False
+    context_score: int | None = None  # 0-5 composite (Phase 2.3); NULL = un-backfilled
     id: int | None = None

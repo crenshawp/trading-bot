@@ -780,3 +780,130 @@ def test_predictions_by_hour_uses_et(tmp_db: Path) -> None:
 
 def test_predictions_by_hour_empty(tmp_db: Path) -> None:
     assert performance.stats_predictions_by_hour() == []
+
+
+# ────────────────────── context score slices (Phase 2.3) ──────────────────────
+
+
+def _seed_trade_with_score(*, score: int | None, outcome: str = "win",
+                           ts_offset: int = 0) -> int:
+    ts = datetime(2026, 5, 26, tzinfo=UTC) + timedelta(seconds=ts_offset)
+    sid = db.insert_signal(Signal(
+        timestamp=ts, ticker="GOOGL", asset_class="stock",
+        signal_type="ema21_pullback", direction="call",
+        entry_price=100.0, take_profit=110.0, stop_loss=95.0,
+    ))
+    return db.insert_trade(Trade(
+        signal_id=sid, opened_at=ts,
+        closed_at=ts + timedelta(days=2),
+        outcome=outcome, exit_price=105.0, pnl_pct=5.0,
+        market_regime="bull", vix_band="low", vix_level=18.0,
+        context_score=score,
+    ))
+
+
+def test_stats_by_context_emits_all_six_buckets(tmp_db: Path) -> None:
+    _seed_trade_with_score(score=5, ts_offset=1)
+    _seed_trade_with_score(score=5, ts_offset=2)
+    _seed_trade_with_score(score=3, ts_offset=3, outcome="loss")
+    rows = performance.stats_by_context()
+    assert [r.label for r in rows] == ["5", "4", "3", "2", "1", "0"]
+    by_label = {r.label: r for r in rows}
+    assert by_label["5"].total == 2
+    assert by_label["3"].total == 1
+    assert by_label["4"].total == 0
+    assert by_label["4"].win_rate is None
+
+
+def test_stats_by_context_empty_db_returns_six_empty(tmp_db: Path) -> None:
+    rows = performance.stats_by_context()
+    assert len(rows) == 6
+    assert all(r.total == 0 for r in rows)
+
+
+def test_min_context_filters_out_low_score_trades(tmp_db: Path) -> None:
+    _seed_trade_with_score(score=5, ts_offset=1)
+    _seed_trade_with_score(score=4, ts_offset=2)
+    _seed_trade_with_score(score=2, ts_offset=3, outcome="loss")
+    _seed_trade_with_score(score=None, ts_offset=4, outcome="loss")
+    # min_context=4 → only 5 and 4 pass
+    stats = performance.stats_by_signal_type(min_context=4)
+    assert len(stats) == 1
+    assert stats[0].total == 2
+    assert stats[0].wins == 2
+
+
+def test_min_context_zero_includes_everything(tmp_db: Path) -> None:
+    _seed_trade_with_score(score=5, ts_offset=1)
+    _seed_trade_with_score(score=None, ts_offset=2, outcome="loss")
+    stats = performance.stats_by_signal_type(min_context=0)
+    assert stats[0].total == 2
+
+
+def test_min_context_too_high_returns_empty(tmp_db: Path) -> None:
+    _seed_trade_with_score(score=5, ts_offset=1)
+    stats = performance.stats_by_signal_type(min_context=6)
+    assert stats == []
+
+
+def test_min_context_excludes_null_score_trades(tmp_db: Path) -> None:
+    """A trade with NULL context_score is excluded once any filter is active —
+    NULL is not >= 1."""
+    _seed_trade_with_score(score=None, ts_offset=1)
+    stats = performance.stats_by_signal_type(min_context=1)
+    assert stats == []
+
+
+def test_min_context_filters_by_ticker(tmp_db: Path) -> None:
+    _seed_trade_with_score(score=5, ts_offset=1)
+    _seed_trade_with_score(score=2, ts_offset=2, outcome="loss")
+    stats = performance.stats_by_ticker(min_context=4)
+    assert len(stats) == 1
+    assert stats[0].total == 1
+
+
+def test_min_context_filters_by_regime(tmp_db: Path) -> None:
+    _seed_trade_with_score(score=5, ts_offset=1)
+    _seed_trade_with_score(score=2, ts_offset=2, outcome="loss")
+    stats = performance.stats_by_regime(min_context=3)
+    # only the score=5 trade survives → one regime bucket
+    assert len(stats) == 1
+    assert stats[0].label == "bull"
+    assert stats[0].total == 1
+
+
+def test_min_context_filters_by_vix_band(tmp_db: Path) -> None:
+    _seed_trade_with_score(score=5, ts_offset=1)
+    _seed_trade_with_score(score=1, ts_offset=2, outcome="loss")
+    stats = performance.stats_by_vix_band(min_context=3)
+    assert len(stats) == 1
+    assert stats[0].label == "low"
+    assert stats[0].total == 1
+
+
+def test_min_context_filters_by_regime_x_vix(tmp_db: Path) -> None:
+    _seed_trade_with_score(score=5, ts_offset=1)
+    _seed_trade_with_score(score=2, ts_offset=2, outcome="loss")
+    stats = performance.stats_by_regime_x_vix(min_context=4)
+    assert len(stats) == 1
+    assert stats[0].label == "bull / low"
+
+
+def test_min_context_filters_predictions(tmp_db: Path) -> None:
+    from trading_bot.models import Prediction as P
+    base = datetime(2026, 5, 26, 14, 0, tzinfo=UTC)
+    for i, score in enumerate([5, 2, None]):
+        db.insert_prediction(P(
+            ticker="BTC-USD", direction="HIGHER", confidence=70.0,
+            entry_price=100.0,
+            target_window_end=base + timedelta(minutes=15 + i),
+            signals_used="{}",
+            created_at=base + timedelta(seconds=i),
+            market_regime="bull", vix_band="low", vix_level=18.0,
+            outcome="correct", exit_price=105.0,
+            resolved_at=base + timedelta(minutes=16 + i),
+            context_score=score,
+        ))
+    stats = performance.stats_predictions_overall(min_context=4)
+    assert stats.total == 1
+    assert stats.correct == 1

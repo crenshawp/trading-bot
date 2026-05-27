@@ -27,10 +27,11 @@ from trading_bot.models import (
     Trade,
 )
 
+# Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -148,13 +149,14 @@ CREATE TABLE IF NOT EXISTS settings (
 """
 
 # Whitelist for update_trade — never interpolate user input into SQL column names.
-# market_regime was added in Phase 2.1 + vix_level/vix_band in Phase 2.2 so the
-# backfills can set them on historical rows.
+# market_regime was added in Phase 2.1 + vix_level/vix_band in Phase 2.2 + the
+# Phase 2.3 composite context_score, all so their respective backfills can
+# patch historical rows.
 _TRADE_UPDATABLE_FIELDS: frozenset[str] = frozenset(
     {
         "opened_at", "closed_at", "exit_price", "outcome",
         "pnl_pct", "pnl_dollars", "notes", "market_regime",
-        "vix_level", "vix_band",
+        "vix_level", "vix_band", "context_score",
     }
 )
 
@@ -164,9 +166,9 @@ _TABLE_NAMES: tuple[str, ...] = (
     "predictions", "settings",
 )
 
-# Whitelist for update_prediction — resolution flow updates these only.
+# Whitelist for update_prediction — resolution flow + Phase 2.3 context backfill.
 _PREDICTION_UPDATABLE_FIELDS: frozenset[str] = frozenset(
-    {"resolved_at", "exit_price", "outcome", "notified"}
+    {"resolved_at", "exit_price", "outcome", "notified", "context_score"}
 )
 
 
@@ -226,6 +228,24 @@ def _migrate_to_v4(_conn: sqlite3.Connection) -> None:
     return None
 
 
+def _migrate_to_v5(conn: sqlite3.Connection) -> None:
+    """Phase 2.3 migration step: add ``context_score`` to trades + predictions.
+
+    Composite (regime x VIX) score in 0-5, NULL until backfilled. Cheap
+    integer column on both tables — no indexes needed (filtering is by
+    range, low cardinality).
+    """
+    cur = conn.execute("PRAGMA table_info(trades)")
+    cols = {str(row[1]) for row in cur.fetchall()}
+    if "context_score" not in cols:
+        conn.execute("ALTER TABLE trades ADD COLUMN context_score INTEGER")
+
+    cur = conn.execute("PRAGMA table_info(predictions)")
+    pred_cols = {str(row[1]) for row in cur.fetchall()}
+    if "context_score" not in pred_cols:
+        conn.execute("ALTER TABLE predictions ADD COLUMN context_score INTEGER")
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -234,6 +254,7 @@ def init_db() -> None:
         _migrate_to_v2(conn)
         _migrate_to_v3(conn)
         _migrate_to_v4(conn)
+        _migrate_to_v5(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -444,8 +465,8 @@ def insert_trade(trade: Trade) -> int:
         INSERT INTO trades (
             signal_id, opened_at, closed_at, exit_price,
             outcome, pnl_pct, pnl_dollars, notes, market_regime,
-            vix_level, vix_band
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            vix_level, vix_band, context_score
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = (
         trade.signal_id,
@@ -459,6 +480,7 @@ def insert_trade(trade: Trade) -> int:
         trade.market_regime,
         trade.vix_level,
         trade.vix_band,
+        trade.context_score,
     )
     conn = get_connection()
     try:
@@ -548,6 +570,7 @@ def _row_to_trade(row: sqlite3.Row) -> Trade:
         market_regime=row["market_regime"] if "market_regime" in keys else None,
         vix_level=row["vix_level"] if "vix_level" in keys else None,
         vix_band=row["vix_band"] if "vix_band" in keys else None,
+        context_score=row["context_score"] if "context_score" in keys else None,
         id=int(row["id"]),
     )
 
@@ -818,6 +841,77 @@ def get_closed_trades_missing_vix() -> list[Trade]:
     return [_row_to_trade(r) for r in rows]
 
 
+def get_trades_missing_context_score() -> list[Trade]:
+    """Closed trades where market_regime and vix_band are populated but
+    context_score is NULL. Phase 2.3 backfill target — pure derivation
+    from already-stored columns, no yfinance involvement."""
+    sql = (
+        "SELECT * FROM trades "
+        "WHERE outcome IN ('win','loss','expired') "
+        "  AND context_score IS NULL "
+        "  AND market_regime IS NOT NULL "
+        "  AND vix_band IS NOT NULL "
+        "ORDER BY opened_at ASC"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_trade(r) for r in rows]
+
+
+def get_predictions_missing_context_score() -> list[Prediction]:
+    """Predictions where market_regime + vix_band are populated but
+    context_score is NULL. Phase 2.3 backfill target."""
+    sql = (
+        "SELECT * FROM predictions "
+        "WHERE context_score IS NULL "
+        "  AND market_regime IS NOT NULL "
+        "  AND vix_band IS NOT NULL "
+        "ORDER BY created_at ASC"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_prediction(r) for r in rows]
+
+
+def get_combined_context_history(limit: int = 30) -> list[dict[str, Any]]:
+    """Join regime_snapshots + vix_snapshots by date, newest first.
+
+    Returns one dict per date that has BOTH a regime and a VIX snapshot.
+    Dates with only one axis present are omitted — that's the spec for
+    ``context history``. Score is computed in Python rather than baked
+    into SQL so the matrix table remains the single source of truth.
+    """
+    sql = (
+        "SELECT r.date AS date, "
+        "       r.regime AS regime, "
+        "       v.vix_band AS vix_band, "
+        "       v.vix_level AS vix_level "
+        "FROM regime_snapshots r "
+        "INNER JOIN vix_snapshots v ON v.date = r.date "
+        "ORDER BY r.date DESC LIMIT ?"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, (limit,)).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "date": str(r["date"]),
+            "regime": str(r["regime"]),
+            "vix_band": str(r["vix_band"]),
+            "vix_level": float(r["vix_level"]),
+        }
+        for r in rows
+    ]
+
+
 def get_closed_trades_missing_regime() -> list[Trade]:
     """Return every closed trade (win/loss/expired) where market_regime IS NULL.
 
@@ -860,8 +954,9 @@ def insert_prediction(prediction: Prediction) -> int:
         INSERT INTO predictions (
             created_at, ticker, direction, confidence, entry_price,
             target_window_end, signals_used, market_regime, vix_band,
-            vix_level, resolved_at, exit_price, outcome, notified
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            vix_level, resolved_at, exit_price, outcome, notified,
+            context_score
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = (
         prediction.created_at.isoformat(),
@@ -878,6 +973,7 @@ def insert_prediction(prediction: Prediction) -> int:
         prediction.exit_price,
         prediction.outcome,
         int(prediction.notified),
+        prediction.context_score,
     )
     conn = get_connection()
     try:
@@ -933,6 +1029,7 @@ def update_prediction(prediction_id: int, **fields: Any) -> None:
 
 
 def _row_to_prediction(row: sqlite3.Row) -> Prediction:
+    keys = set(row.keys())
     return Prediction(
         ticker=str(row["ticker"]),
         direction=str(row["direction"]),
@@ -951,6 +1048,7 @@ def _row_to_prediction(row: sqlite3.Row) -> Prediction:
         exit_price=row["exit_price"],
         outcome=row["outcome"],
         notified=bool(row["notified"]),
+        context_score=row["context_score"] if "context_score" in keys else None,
         id=int(row["id"]),
     )
 

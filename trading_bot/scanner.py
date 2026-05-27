@@ -25,7 +25,16 @@ import requests
 import schedule
 import yfinance as yf
 
-from trading_bot import db, outcomes, performance, predictions, regime, settings, vix
+from trading_bot import (
+    context,
+    db,
+    outcomes,
+    performance,
+    predictions,
+    regime,
+    settings,
+    vix,
+)
 from trading_bot.models import Signal, Trade
 from trading_bot.secrets import get_required
 
@@ -467,6 +476,10 @@ def log_signal(signal: dict) -> int | None:
             vix_level = None
             vix_band = "unknown"
 
+        # Phase 2.3: composite (regime x VIX) context score. Pure derivation
+        # from the two axes we just tagged — zero new I/O.
+        context_score = context.score(market_regime, vix_band)
+
         db.insert_trade(
             Trade(
                 signal_id=signal_id,
@@ -475,6 +488,7 @@ def log_signal(signal: dict) -> int | None:
                 market_regime=market_regime,
                 vix_level=vix_level,
                 vix_band=vix_band,
+                context_score=context_score,
             )
         )
 
@@ -728,6 +742,16 @@ def _run_prediction_sweep() -> None:
         if pred is None:
             print(f"  {ticker}: signals mixed or data unavailable")
             continue
+        # Phase 2.3: tag composite context_score from the regime + VIX
+        # already populated by predict_direction(). dataclasses.replace
+        # keeps Prediction immutable; the score is derived not fetched.
+        import dataclasses
+        pred = dataclasses.replace(
+            pred,
+            context_score=context.score(
+                pred.market_regime or "unknown", pred.vix_band or "unknown",
+            ),
+        )
         try:
             pid = db.insert_prediction(pred)
             _send_prediction_notification(pred)

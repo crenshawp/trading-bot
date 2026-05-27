@@ -22,13 +22,13 @@ def _run(argv: list[str]) -> None:
 def test_cli_db_init_prints_version(tmp_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _run(["db", "init"])
     out = capsys.readouterr().out
-    assert "Schema version: 4" in out
+    assert "Schema version: 5" in out
 
 
 def test_cli_db_status_shows_counts(tmp_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _run(["db", "status"])
     out = capsys.readouterr().out
-    assert "Schema version: 4" in out
+    assert "Schema version: 5" in out
     assert "signals" in out
     assert "trades" in out
     assert "daily_performance" in out
@@ -169,7 +169,7 @@ def test_report_by_signal_subcommand(
     from trading_bot.performance import PerfStats
     monkeypatch.setattr(
         "trading_bot.performance.stats_by_signal_type",
-        lambda: [
+        lambda **_: [
             PerfStats(label="ema21_pullback", total=24, wins=16, losses=7, expired=1,
                       win_rate=69.6, avg_pnl_pct=2.41, best_pnl_pct=8.21, worst_pnl_pct=-3.18),
             PerfStats(label="oversold_reversal", total=15, wins=9, losses=5, expired=1,
@@ -192,7 +192,7 @@ def test_report_by_ticker_with_stocks_filter(
 ) -> None:
     received_kwargs: dict[str, object] = {}
 
-    def spy(*, asset_class: str | None = None) -> list:  # type: ignore[type-arg]
+    def spy(*, asset_class: str | None = None, **_: object) -> list:  # type: ignore[type-arg]
         received_kwargs["asset_class"] = asset_class
         return []
 
@@ -209,7 +209,7 @@ def test_report_by_ticker_with_crypto_filter(
 ) -> None:
     received_kwargs: dict[str, object] = {}
 
-    def spy(*, asset_class: str | None = None) -> list:  # type: ignore[type-arg]
+    def spy(*, asset_class: str | None = None, **_: object) -> list:  # type: ignore[type-arg]
         received_kwargs["asset_class"] = asset_class
         return []
 
@@ -409,7 +409,7 @@ def test_cli_report_by_regime(
 
     monkeypatch.setattr(
         "trading_bot.performance.stats_by_regime",
-        lambda: [
+        lambda **_: [
             PerfStats(label="bull", total=12, wins=8, losses=4, expired=0,
                       win_rate=66.7, avg_pnl_pct=2.10, best_pnl_pct=8.0, worst_pnl_pct=-3.0),
             PerfStats(label="sideways", total=6, wins=3, losses=3, expired=0,
@@ -453,7 +453,7 @@ def test_cli_report_by_signal_with_regime(
                         best_pnl_pct=8.0, worst_pnl_pct=-1.0)
     monkeypatch.setattr(
         "trading_bot.performance.stats_by_signal_type_with_regime",
-        lambda: [RegimeBreakdown(
+        lambda **_: [RegimeBreakdown(
             label="ema21_pullback",
             by_regime={"bull": bull_stats, "sideways": side_stats},
             overall=overall,
@@ -478,7 +478,7 @@ def test_cli_report_by_ticker_with_regime_and_stocks_filter(
 
     received: dict[str, object] = {}
 
-    def spy(*, asset_class: str | None = None) -> list[RegimeBreakdown]:
+    def spy(*, asset_class: str | None = None, **_: object) -> list[RegimeBreakdown]:
         received["asset_class"] = asset_class
         return []
 
@@ -497,7 +497,7 @@ def test_cli_report_by_signal_without_regime_flag_uses_old_view(
 ) -> None:
     # Without --by-regime, the Phase 1.4 by-signal output is unchanged.
     monkeypatch.setattr(
-        "trading_bot.performance.stats_by_signal_type", lambda: [],
+        "trading_bot.performance.stats_by_signal_type", lambda **_: [],
     )
     _run(["report", "by-signal"])
     assert "BY SIGNAL TYPE" in capsys.readouterr().out
@@ -640,7 +640,7 @@ def test_cli_report_by_vix(
 
     monkeypatch.setattr(
         "trading_bot.performance.stats_by_vix_band",
-        lambda: [
+        lambda **_: [
             PerfStats(label="low", total=14, wins=9, losses=5, expired=0,
                       win_rate=64.3, avg_pnl_pct=1.5, best_pnl_pct=7.0, worst_pnl_pct=-3.0),
             PerfStats(label="elevated", total=5, wins=2, losses=3, expired=0,
@@ -681,7 +681,7 @@ def test_cli_report_by_signal_with_vix(
                         best_pnl_pct=6.0, worst_pnl_pct=-2.0)
     monkeypatch.setattr(
         "trading_bot.performance.stats_by_signal_type_with_vix",
-        lambda: [VixBreakdown(
+        lambda **_: [VixBreakdown(
             label="ema21_pullback",
             by_vix={"low": low, "elevated": elev},
             overall=overall,
@@ -706,7 +706,7 @@ def test_cli_report_by_ticker_with_vix(
 
     received: dict[str, object] = {}
 
-    def spy(*, asset_class: str | None = None) -> list[VixBreakdown]:
+    def spy(*, asset_class: str | None = None, **_: object) -> list[VixBreakdown]:
         received["asset_class"] = asset_class
         return []
 
@@ -728,7 +728,7 @@ def test_cli_report_by_regime_vix_happy(
 
     monkeypatch.setattr(
         "trading_bot.performance.stats_by_regime_x_vix",
-        lambda: [
+        lambda **_: [
             PerfStats(label="bull / low", total=9, wins=7, losses=2, expired=0,
                       win_rate=77.8, avg_pnl_pct=2.5, best_pnl_pct=7.0, worst_pnl_pct=-2.0),
             PerfStats(label="sideways / low", total=4, wins=2, losses=2, expired=0,
@@ -763,7 +763,7 @@ def test_cli_report_by_regime_vix_sparse_one_bucket(
 
     monkeypatch.setattr(
         "trading_bot.performance.stats_by_regime_x_vix",
-        lambda: [PerfStats(
+        lambda **_: [PerfStats(
             label="bull / low", total=1, wins=1, losses=0, expired=0,
             win_rate=100.0, avg_pnl_pct=5.0, best_pnl_pct=5.0, worst_pnl_pct=5.0,
         )],
@@ -937,7 +937,7 @@ def test_cli_report_predictions_happy(
 
     monkeypatch.setattr(
         "trading_bot.performance.stats_predictions_by_ticker",
-        lambda: [
+        lambda **_: [
             PredictionStats("BTC-USD", total=48, correct=31, incorrect=16,
                             push=1, unresolved=0, accuracy=66.0),
             PredictionStats("ETH-USD", total=52, correct=29, incorrect=22,
@@ -946,7 +946,7 @@ def test_cli_report_predictions_happy(
     )
     monkeypatch.setattr(
         "trading_bot.performance.stats_predictions_overall",
-        lambda: PredictionStats(
+        lambda **_: PredictionStats(
             "TOTAL", total=100, correct=60, incorrect=38, push=2,
             unresolved=0, accuracy=61.2,
         ),
@@ -969,7 +969,7 @@ def test_cli_report_predictions_by_regime(
 
     monkeypatch.setattr(
         "trading_bot.performance.stats_predictions_by_regime",
-        lambda: [PredictionStats(
+        lambda **_: [PredictionStats(
             "bull", total=20, correct=15, incorrect=4, push=1,
             unresolved=0, accuracy=78.9,
         )],
@@ -990,7 +990,7 @@ def test_cli_report_predictions_by_vix(
 
     monkeypatch.setattr(
         "trading_bot.performance.stats_predictions_by_vix",
-        lambda: [PredictionStats(
+        lambda **_: [PredictionStats(
             "low", total=12, correct=8, incorrect=4, push=0,
             unresolved=0, accuracy=66.7,
         )],
@@ -1010,7 +1010,7 @@ def test_cli_report_predictions_by_time(
 
     monkeypatch.setattr(
         "trading_bot.performance.stats_predictions_by_hour",
-        lambda: [
+        lambda **_: [
             PredictionStats("09", total=12, correct=9, incorrect=3, push=0,
                             unresolved=0, accuracy=75.0),
             PredictionStats("14", total=18, correct=10, incorrect=8, push=0,
@@ -1022,6 +1022,371 @@ def test_cli_report_predictions_by_time(
     assert "by hour" in out
     assert "75.0%" in out
     assert "55.5%" in out
+
+
+# ───────────────────── Phase 2.3 context CLI + --min-context + matrix ─────────────────────
+
+
+def test_cli_context_current_happy_path(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import context as ctx_mod
+
+    monkeypatch.setattr(
+        "trading_bot.__main__.context.get_current_context",
+        lambda: ctx_mod.ContextSnapshot(
+            regime="bull", vix_band="low", vix_level=18.4,
+            score=5, label="ideal", captured_at="2026-05-26T14:30:00+00:00",
+        ),
+    )
+    monkeypatch.setattr("trading_bot.regime.last_cached_at", lambda: None)
+    monkeypatch.setattr("trading_bot.vix.last_cached_at", lambda: None)
+    _run(["context", "current"])
+    out = capsys.readouterr().out
+    assert "Market Context: IDEAL (5/5)" in out
+    assert "Regime:      bull" in out
+    assert "18.4" in out
+    assert "low" in out
+    assert "Score:       5 / 5" in out
+
+
+def test_cli_context_current_unknown_state(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import context as ctx_mod
+
+    monkeypatch.setattr(
+        "trading_bot.__main__.context.get_current_context",
+        lambda: ctx_mod.ContextSnapshot(
+            regime="unknown", vix_band="unknown", vix_level=None,
+            score=0, label="unknown", captured_at="2026-05-26T14:30:00+00:00",
+        ),
+    )
+    monkeypatch.setattr("trading_bot.regime.last_cached_at", lambda: None)
+    monkeypatch.setattr("trading_bot.vix.last_cached_at", lambda: None)
+    _run(["context", "current"])
+    out = capsys.readouterr().out
+    assert "UNKNOWN (0/5)" in out
+    assert "unknown" in out
+
+
+def test_cli_context_history_happy(
+    tmp_db: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    from trading_bot import db
+
+    db.upsert_regime_snapshot(
+        snapshot_date="2026-05-26", regime="bull", spy_close=612.45,
+        ema50=598.21, ema200=571.88, ema50_slope=1.23,
+        captured_at=_dt.now(_UTC),
+    )
+    db.upsert_vix_snapshot(
+        snapshot_date="2026-05-26", vix_level=18.4, vix_band="low",
+        captured_at=_dt.now(_UTC),
+    )
+    db.upsert_regime_snapshot(
+        snapshot_date="2026-05-25", regime="sideways", spy_close=608.0,
+        ema50=597.0, ema200=571.0, ema50_slope=0.5,
+        captured_at=_dt.now(_UTC),
+    )
+    db.upsert_vix_snapshot(
+        snapshot_date="2026-05-25", vix_level=22.0, vix_band="elevated",
+        captured_at=_dt.now(_UTC),
+    )
+    _run(["context", "history", "--days", "10"])
+    out = capsys.readouterr().out
+    assert "2026-05-25" in out
+    assert "2026-05-26" in out
+    assert "bull" in out
+    assert "sideways" in out
+    assert "ideal" in out
+    assert "neutral" in out
+
+
+def test_cli_context_history_empty(
+    tmp_db: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _run(["context", "history"])
+    out = capsys.readouterr().out
+    assert "no overlapping snapshots" in out
+
+
+def test_cli_context_history_sparse_one_axis_missing(
+    tmp_db: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A date with only a regime snapshot but no VIX snapshot is skipped."""
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    from trading_bot import db
+
+    db.upsert_regime_snapshot(
+        snapshot_date="2026-05-26", regime="bull", spy_close=612.0,
+        ema50=598.0, ema200=571.0, ema50_slope=1.0,
+        captured_at=_dt.now(_UTC),
+    )
+    _run(["context", "history"])
+    out = capsys.readouterr().out
+    assert "no overlapping snapshots" in out
+
+
+def test_cli_context_backfill_happy(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "trading_bot.context.backfill_context_scores",
+        lambda: {"trades_updated": 20, "predictions_updated": 5},
+    )
+    _run(["context", "backfill"])
+    out = capsys.readouterr().out
+    assert "Backfilled context_score on 20 trades and 5 predictions." in out
+
+
+def test_cli_context_backfill_no_op(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "trading_bot.context.backfill_context_scores",
+        lambda: {"trades_updated": 0, "predictions_updated": 0},
+    )
+    _run(["context", "backfill"])
+    assert "0 trades and 0 predictions" in capsys.readouterr().out
+
+
+def test_cli_report_by_context_happy(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot.performance import PerfStats
+
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_by_context",
+        lambda: [
+            PerfStats(label="5", total=8, wins=7, losses=1, expired=0,
+                      win_rate=87.5, avg_pnl_pct=3.0, best_pnl_pct=6.0, worst_pnl_pct=-1.0),
+            PerfStats(label="4", total=6, wins=4, losses=2, expired=0,
+                      win_rate=66.7, avg_pnl_pct=1.5, best_pnl_pct=5.0, worst_pnl_pct=-2.0),
+            PerfStats(label="3", total=3, wins=1, losses=2, expired=0,
+                      win_rate=33.3, avg_pnl_pct=-0.5, best_pnl_pct=2.0, worst_pnl_pct=-3.0),
+            PerfStats(label="2", total=0, wins=0, losses=0, expired=0,
+                      win_rate=None, avg_pnl_pct=None, best_pnl_pct=None, worst_pnl_pct=None),
+            PerfStats(label="1", total=0, wins=0, losses=0, expired=0,
+                      win_rate=None, avg_pnl_pct=None, best_pnl_pct=None, worst_pnl_pct=None),
+            PerfStats(label="0", total=0, wins=0, losses=0, expired=0,
+                      win_rate=None, avg_pnl_pct=None, best_pnl_pct=None, worst_pnl_pct=None),
+        ],
+    )
+    _run(["report", "by-context"])
+    out = capsys.readouterr().out
+    assert "BY CONTEXT SCORE" in out
+    assert "ideal" in out
+    assert "favorable" in out
+    assert "87.5%" in out
+
+
+def test_cli_report_context_matrix_happy(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot.performance import PerfStats
+
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_by_regime_x_vix",
+        lambda **_: [
+            PerfStats(label="bull / low", total=6, wins=5, losses=1, expired=0,
+                      win_rate=83.3, avg_pnl_pct=2.0, best_pnl_pct=5.0, worst_pnl_pct=-1.0),
+            PerfStats(label="bull / elevated", total=4, wins=3, losses=1, expired=0,
+                      win_rate=75.0, avg_pnl_pct=1.5, best_pnl_pct=4.0, worst_pnl_pct=-1.0),
+            PerfStats(label="sideways / low", total=3, wins=2, losses=1, expired=0,
+                      win_rate=66.7, avg_pnl_pct=1.0, best_pnl_pct=3.0, worst_pnl_pct=-1.0),
+            PerfStats(label="bear / elevated", total=1, wins=0, losses=1, expired=0,
+                      win_rate=0.0, avg_pnl_pct=-2.0, best_pnl_pct=-2.0, worst_pnl_pct=-2.0),
+        ],
+    )
+    _run(["report", "context-matrix"])
+    out = capsys.readouterr().out
+    assert "Win rates: regime x VIX" in out
+    assert "Bull" in out
+    assert "Sideways" in out
+    assert "Bear" in out
+    assert "Low" in out
+    assert "Elevated" in out
+    assert "5/6 83%" in out
+
+
+def test_cli_report_context_matrix_empty(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_by_regime_x_vix", lambda **_: [],
+    )
+    _run(["report", "context-matrix"])
+    assert "(no closed trades)" in capsys.readouterr().out
+
+
+def test_cli_report_context_matrix_sparse(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot.performance import PerfStats
+
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_by_regime_x_vix",
+        lambda **_: [PerfStats(
+            label="bull / low", total=1, wins=1, losses=0, expired=0,
+            win_rate=100.0, avg_pnl_pct=5.0, best_pnl_pct=5.0, worst_pnl_pct=5.0,
+        )],
+    )
+    _run(["report", "context-matrix"])
+    out = capsys.readouterr().out
+    assert "Bull" in out
+    # Missing cells should render '-'
+    assert "-" in out
+
+
+def test_min_context_flag_threads_through_by_signal(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    received: dict[str, object] = {}
+
+    def spy(**kwargs: object) -> list:  # type: ignore[type-arg]
+        received.update(kwargs)
+        return []
+
+    monkeypatch.setattr("trading_bot.performance.stats_by_signal_type", spy)
+    _run(["report", "by-signal", "--min-context", "4"])
+    assert received["min_context"] == 4
+    assert "min context 4" in capsys.readouterr().out
+
+
+def test_min_context_zero_is_no_op(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    received: dict[str, object] = {}
+
+    def spy(**kwargs: object) -> list:  # type: ignore[type-arg]
+        received.update(kwargs)
+        return []
+
+    monkeypatch.setattr("trading_bot.performance.stats_by_signal_type", spy)
+    _run(["report", "by-signal", "--min-context", "0"])
+    assert received["min_context"] == 0
+    out = capsys.readouterr().out
+    assert "min context" not in out  # no suffix shown
+
+
+def test_min_context_threads_through_by_regime(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    received: dict[str, object] = {}
+
+    def spy(**kwargs: object) -> list:  # type: ignore[type-arg]
+        received.update(kwargs)
+        return []
+
+    monkeypatch.setattr("trading_bot.performance.stats_by_regime", spy)
+    _run(["report", "by-regime", "--min-context", "3"])
+    assert received["min_context"] == 3
+
+
+def test_min_context_threads_through_by_vix(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: dict[str, object] = {}
+
+    def spy(**kwargs: object) -> list:  # type: ignore[type-arg]
+        received.update(kwargs)
+        return []
+
+    monkeypatch.setattr("trading_bot.performance.stats_by_vix_band", spy)
+    _run(["report", "by-vix", "--min-context", "2"])
+    assert received["min_context"] == 2
+
+
+def test_min_context_threads_through_by_regime_vix(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: dict[str, object] = {}
+
+    def spy(**kwargs: object) -> list:  # type: ignore[type-arg]
+        received.update(kwargs)
+        return []
+
+    monkeypatch.setattr("trading_bot.performance.stats_by_regime_x_vix", spy)
+    _run(["report", "by-regime-vix", "--min-context", "5"])
+    assert received["min_context"] == 5
+
+
+def test_min_context_threads_through_predictions(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trading_bot.performance import PredictionStats
+
+    received: dict[str, object] = {}
+
+    def overall_spy(**kwargs: object) -> PredictionStats:
+        received["overall_min"] = kwargs.get("min_context")
+        return PredictionStats(
+            "TOTAL", total=0, correct=0, incorrect=0, push=0,
+            unresolved=0, accuracy=None,
+        )
+
+    def ticker_spy(**kwargs: object) -> list[PredictionStats]:
+        received["ticker_min"] = kwargs.get("min_context")
+        return []
+
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_predictions_overall", overall_spy,
+    )
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_predictions_by_ticker", ticker_spy,
+    )
+    _run(["report", "predictions", "--min-context", "4"])
+    assert received["overall_min"] == 4
+    assert received["ticker_min"] == 4
+
+
+def test_min_context_with_by_regime_matrix(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: dict[str, object] = {}
+
+    def spy(**kwargs: object) -> list:  # type: ignore[type-arg]
+        received.update(kwargs)
+        return []
+
+    monkeypatch.setattr(
+        "trading_bot.performance.stats_by_signal_type_with_regime", spy,
+    )
+    _run(["report", "by-signal", "--by-regime", "--min-context", "4"])
+    assert received["min_context"] == 4
 
 
 def test_report_recent_with_custom_days(

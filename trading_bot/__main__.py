@@ -6,6 +6,7 @@ import sys
 from datetime import date
 
 from trading_bot import (
+    context,
     db,
     outcomes,
     performance,
@@ -184,20 +185,28 @@ def cmd_report_recent(days: int) -> None:
     print(_format_perf_summary(stats, f"RECENT PERFORMANCE — last {days} days"))
 
 
-def cmd_report_by_signal() -> None:
+def _min_ctx_suffix(min_context: int) -> str:
+    """Title suffix shown when a context filter is active. Empty otherwise."""
+    return f"  [min context {min_context}]" if min_context > 0 else ""
+
+
+def cmd_report_by_signal(min_context: int = 0) -> None:
     print(_format_perf_table(
-        performance.stats_by_signal_type(),
-        "BY SIGNAL TYPE",
+        performance.stats_by_signal_type(min_context=min_context),
+        f"BY SIGNAL TYPE{_min_ctx_suffix(min_context)}",
         label_header="Signal type",
     ))
 
 
-def cmd_report_by_ticker(asset_class: str | None) -> None:
+def cmd_report_by_ticker(asset_class: str | None, min_context: int = 0) -> None:
     title = "BY TICKER"
     if asset_class is not None:
         title = f"BY TICKER ({asset_class})"
+    title += _min_ctx_suffix(min_context)
     print(_format_perf_table(
-        performance.stats_by_ticker(asset_class=asset_class),
+        performance.stats_by_ticker(
+            asset_class=asset_class, min_context=min_context,
+        ),
         title,
         label_header="Ticker",
     ))
@@ -387,12 +396,12 @@ def _format_vix_matrix(
     )
 
 
-def cmd_report_by_regime() -> None:
-    stats = performance.stats_by_regime()
+def cmd_report_by_regime(min_context: int = 0) -> None:
+    stats = performance.stats_by_regime(min_context=min_context)
     if not stats:
-        print("BY MARKET REGIME\n  (no closed trades)")
+        print(f"BY MARKET REGIME{_min_ctx_suffix(min_context)}\n  (no closed trades)")
         return
-    print("BY MARKET REGIME")
+    print(f"BY MARKET REGIME{_min_ctx_suffix(min_context)}")
     print(
         f"  {'Regime':<12} {'Trades':>6}  {'Wins':>4}  {'Losses':>6}  "
         f"{'Expired':>7}  {'Win rate':>8}  {'Avg PnL':>8}"
@@ -409,20 +418,25 @@ def cmd_report_by_regime() -> None:
         )
 
 
-def cmd_report_by_signal_regime() -> None:
-    rows = performance.stats_by_signal_type_with_regime()
+def cmd_report_by_signal_regime(min_context: int = 0) -> None:
+    rows = performance.stats_by_signal_type_with_regime(min_context=min_context)
     print(_format_regime_matrix(
         rows,
-        title="BY SIGNAL TYPE x REGIME",
+        title=f"BY SIGNAL TYPE x REGIME{_min_ctx_suffix(min_context)}",
         label_header="Signal",
     ))
 
 
-def cmd_report_by_ticker_regime(asset_class: str | None) -> None:
-    rows = performance.stats_by_ticker_with_regime(asset_class=asset_class)
+def cmd_report_by_ticker_regime(
+    asset_class: str | None, min_context: int = 0,
+) -> None:
+    rows = performance.stats_by_ticker_with_regime(
+        asset_class=asset_class, min_context=min_context,
+    )
     title = "BY TICKER x REGIME"
     if asset_class is not None:
         title = f"BY TICKER x REGIME ({asset_class})"
+    title += _min_ctx_suffix(min_context)
     print(_format_regime_matrix(rows, title=title, label_header="Ticker"))
 
 
@@ -479,12 +493,12 @@ def cmd_vix_backfill() -> None:
         )
 
 
-def cmd_report_by_vix() -> None:
-    stats = performance.stats_by_vix_band()
+def cmd_report_by_vix(min_context: int = 0) -> None:
+    stats = performance.stats_by_vix_band(min_context=min_context)
     if not stats:
-        print("BY VIX BAND\n  (no closed trades)")
+        print(f"BY VIX BAND{_min_ctx_suffix(min_context)}\n  (no closed trades)")
         return
-    print("BY VIX BAND")
+    print(f"BY VIX BAND{_min_ctx_suffix(min_context)}")
     print(
         f"  {'Band':<12} {'Trades':>6}  {'Wins':>4}  {'Losses':>6}  "
         f"{'Expired':>7}  {'Win rate':>8}  {'Avg PnL':>8}"
@@ -501,30 +515,37 @@ def cmd_report_by_vix() -> None:
         )
 
 
-def cmd_report_by_signal_vix() -> None:
-    rows = performance.stats_by_signal_type_with_vix()
+def cmd_report_by_signal_vix(min_context: int = 0) -> None:
+    rows = performance.stats_by_signal_type_with_vix(min_context=min_context)
     print(_format_vix_matrix(
-        rows, title="BY SIGNAL TYPE x VIX", label_header="Signal",
+        rows,
+        title=f"BY SIGNAL TYPE x VIX{_min_ctx_suffix(min_context)}",
+        label_header="Signal",
     ))
 
 
-def cmd_report_by_ticker_vix(asset_class: str | None) -> None:
-    rows = performance.stats_by_ticker_with_vix(asset_class=asset_class)
+def cmd_report_by_ticker_vix(
+    asset_class: str | None, min_context: int = 0,
+) -> None:
+    rows = performance.stats_by_ticker_with_vix(
+        asset_class=asset_class, min_context=min_context,
+    )
     title = "BY TICKER x VIX"
     if asset_class is not None:
         title = f"BY TICKER x VIX ({asset_class})"
+    title += _min_ctx_suffix(min_context)
     print(_format_vix_matrix(rows, title=title, label_header="Ticker"))
 
 
-def cmd_report_by_regime_vix() -> None:
+def cmd_report_by_regime_vix(min_context: int = 0) -> None:
     """The headline Phase 2.2 view: every regime x VIX bucket with data,
     sorted by trade count desc. See ``stats_by_regime_x_vix`` for the
     aggregation rules."""
-    stats = performance.stats_by_regime_x_vix()
+    stats = performance.stats_by_regime_x_vix(min_context=min_context)
     if not stats:
-        print("BY REGIME x VIX\n  (no closed trades)")
+        print(f"BY REGIME x VIX{_min_ctx_suffix(min_context)}\n  (no closed trades)")
         return
-    print("BY REGIME x VIX")
+    print(f"BY REGIME x VIX{_min_ctx_suffix(min_context)}")
     print(
         f"  {'Regime':<10} {'VIX Band':<10} {'Trades':>6}  {'Wins':>4}  "
         f"{'Losses':>6}  {'Expired':>7}  {'Win rate':>8}  {'Avg PnL':>8}"
@@ -544,6 +565,123 @@ def cmd_report_by_regime_vix() -> None:
             f"  {regime_part:<10} {vix_part:<10} {s.total:>6}  {s.wins:>4}  "
             f"{s.losses:>6}  {s.expired:>7}  {wr:>8}  {ap:>8}"
         )
+
+
+# ---- context CLI (Phase 2.3) ----
+
+
+def cmd_context_current() -> None:
+    snap = context.get_current_context()
+    label_upper = snap.label.upper()
+    vix_str = (
+        f"{snap.vix_level:.1f}" if snap.vix_level is not None else "unknown"
+    )
+    # Per-axis cache age strings, for the bottom line.
+    reg_age = _format_cache_age(regime.last_cached_at())
+    vix_age = _format_cache_age(vix.last_cached_at())
+
+    print(f"Market Context: {label_upper} ({snap.score}/5)")
+    print("-" * 38)
+    print(f"Regime:      {snap.regime}")
+    print(f"VIX:         {vix_str:<10} {snap.vix_band}")
+    print(f"Score:       {snap.score} / 5    {snap.label}")
+    print(f"Caches:      regime {reg_age}, VIX {vix_age}")
+
+
+def cmd_context_history(days: int) -> None:
+    rows = db.get_combined_context_history(limit=days)
+    if not rows:
+        print("Context history")
+        print("  (no overlapping snapshots — backfill regime + vix first)")
+        return
+    print("Context history")
+    print(
+        f"  {'Date':<12} {'Regime':<10} {'VIX Band':<10} "
+        f"{'Score':>5}   {'Label':<12}"
+    )
+    # rows come newest-first from db; flip for chronological display.
+    for row in reversed(rows):
+        s = context.score(row["regime"], row["vix_band"])
+        lab = context.label(s)
+        print(
+            f"  {row['date']:<12} {row['regime']:<10} {row['vix_band']:<10} "
+            f"{s:>5}   {lab:<12}"
+        )
+
+
+def cmd_context_backfill() -> None:
+    summary = context.backfill_context_scores()
+    print(
+        f"Backfilled context_score on {summary['trades_updated']} trades "
+        f"and {summary['predictions_updated']} predictions."
+    )
+
+
+# ---- by-context + context-matrix reports ----
+
+
+def cmd_report_by_context() -> None:
+    rows = performance.stats_by_context()
+    # rows always emits all 6 (5→0); show them even when empty so the user
+    # sees the full ladder.
+    print("BY CONTEXT SCORE")
+    print(
+        f"  {'Score':<5} {'Label':<12} {'Trades':>6}  {'Wins':>4}  "
+        f"{'Losses':>6}  {'Win rate':>8}  {'Avg PnL':>8}"
+    )
+    for s in rows:
+        score_val = int(s.label)
+        lab = context.label(score_val)
+        wr = "    -" if s.win_rate is None else f"{s.win_rate:.1f}%"
+        ap = (
+            "    -" if s.avg_pnl_pct is None
+            else f"{'+' if s.avg_pnl_pct >= 0 else ''}{s.avg_pnl_pct:.2f}%"
+        )
+        print(
+            f"  {score_val:<5} {lab:<12} {s.total:>6}  {s.wins:>4}  "
+            f"{s.losses:>6}  {wr:>8}  {ap:>8}"
+        )
+
+
+def cmd_report_context_matrix() -> None:
+    """The 3x4 regime x VIX matrix view with per-cell win rates.
+
+    Same data as ``report by-regime-vix`` but rendered as a matrix with
+    fixed row/col order so the user can read it geometrically. Sparse
+    cells show ``-``.
+    """
+    raw = performance.stats_by_regime_x_vix()
+    by_cell: dict[tuple[str, str], PerfStats] = {}
+    for s in raw:
+        if " / " not in s.label:
+            continue
+        reg, vix_part = s.label.split(" / ", 1)
+        by_cell[(reg, vix_part)] = s
+
+    regime_order = ("bull", "sideways", "bear")
+    vix_order = ("low", "elevated", "high", "extreme")
+
+    if not raw:
+        print("Win rates: regime x VIX\n  (no closed trades)")
+        return
+
+    print("Win rates: regime x VIX")
+    cell_w = 11
+    header = f"  {'Regime':<10}" + "".join(
+        h.capitalize().ljust(cell_w) for h in vix_order
+    )
+    print(header)
+    for reg in regime_order:
+        cells = ""
+        for v in vix_order:
+            cell_stats = by_cell.get((reg, v))
+            cells += _fmt_cell(cell_stats).ljust(cell_w)
+        print(f"  {reg.capitalize():<10}{cells}")
+
+
+def _maybe_min_context(args: object) -> int:
+    """Pull the --min-context value off argparse Namespace; 0 = no filter."""
+    return int(getattr(args, "min_context", 0) or 0)
 
 
 # ---- predictions CLI (Phase 2.2b) ----
@@ -698,14 +836,14 @@ def _fmt_accuracy(stats: PredictionStats) -> str:
     return "    -" if stats.accuracy is None else f"{stats.accuracy:.1f}%"
 
 
-def cmd_report_predictions() -> None:
-    by_ticker = performance.stats_predictions_by_ticker()
-    overall = performance.stats_predictions_overall()
+def cmd_report_predictions(min_context: int = 0) -> None:
+    by_ticker = performance.stats_predictions_by_ticker(min_context=min_context)
+    overall = performance.stats_predictions_overall(min_context=min_context)
     if overall.total == 0:
-        print("Prediction accuracy\n  (no predictions yet)")
+        print(f"Prediction accuracy{_min_ctx_suffix(min_context)}\n  (no predictions yet)")
         return
     label_w = max(8, max((len(s.label) for s in by_ticker), default=8))
-    print("Prediction accuracy")
+    print(f"Prediction accuracy{_min_ctx_suffix(min_context)}")
     print(
         f"  {'Ticker':<{label_w}}  {'Total':>5}  {'Correct':>7}  "
         f"{'Incorrect':>9}  {'Push':>4}  {'Accuracy':>8}"
@@ -741,24 +879,27 @@ def _print_pred_axis_table(
         )
 
 
-def cmd_report_predictions_by_regime() -> None:
+def cmd_report_predictions_by_regime(min_context: int = 0) -> None:
     _print_pred_axis_table(
-        performance.stats_predictions_by_regime(),
-        title="Prediction accuracy by regime", label_header="Regime",
+        performance.stats_predictions_by_regime(min_context=min_context),
+        title=f"Prediction accuracy by regime{_min_ctx_suffix(min_context)}",
+        label_header="Regime",
     )
 
 
-def cmd_report_predictions_by_vix() -> None:
+def cmd_report_predictions_by_vix(min_context: int = 0) -> None:
     _print_pred_axis_table(
-        performance.stats_predictions_by_vix(),
-        title="Prediction accuracy by VIX band", label_header="VIX Band",
+        performance.stats_predictions_by_vix(min_context=min_context),
+        title=f"Prediction accuracy by VIX band{_min_ctx_suffix(min_context)}",
+        label_header="VIX Band",
     )
 
 
-def cmd_report_predictions_by_time() -> None:
+def cmd_report_predictions_by_time(min_context: int = 0) -> None:
     _print_pred_axis_table(
-        performance.stats_predictions_by_hour(),
-        title="Prediction accuracy by hour (ET)", label_header="Hour (ET)",
+        performance.stats_predictions_by_hour(min_context=min_context),
+        title=f"Prediction accuracy by hour (ET){_min_ctx_suffix(min_context)}",
+        label_header="Hour (ET)",
     )
 
 
@@ -816,12 +957,20 @@ def main() -> None:
     report_sub.add_parser("overall")
     recent_p = report_sub.add_parser("recent")
     recent_p.add_argument("--days", type=int, default=30)
+    def _add_min_context(parser_: argparse.ArgumentParser) -> None:
+        """Attach --min-context N to a subparser. Phase 2.3."""
+        parser_.add_argument(
+            "--min-context", type=int, default=0,
+            help="Filter trades to context_score >= N (0 = no filter)",
+        )
+
     bs_p = report_sub.add_parser("by-signal")
     bs_axis = bs_p.add_mutually_exclusive_group()
     bs_axis.add_argument("--by-regime", action="store_true",
                          help="Break out win rates by macro regime (Phase 2.1)")
     bs_axis.add_argument("--by-vix", action="store_true",
                          help="Break out win rates by VIX band (Phase 2.2)")
+    _add_min_context(bs_p)
     bt_p = report_sub.add_parser("by-ticker")
     bt_group = bt_p.add_mutually_exclusive_group()
     bt_group.add_argument("--stocks", action="store_true",
@@ -833,11 +982,17 @@ def main() -> None:
                          help="Break out win rates by macro regime (Phase 2.1)")
     bt_axis.add_argument("--by-vix", action="store_true",
                          help="Break out win rates by VIX band (Phase 2.2)")
+    _add_min_context(bt_p)
     report_sub.add_parser("by-asset")
     report_sub.add_parser("cross")
-    report_sub.add_parser("by-regime")
-    report_sub.add_parser("by-vix")
-    report_sub.add_parser("by-regime-vix")
+    by_regime_p = report_sub.add_parser("by-regime")
+    _add_min_context(by_regime_p)
+    by_vix_p = report_sub.add_parser("by-vix")
+    _add_min_context(by_vix_p)
+    by_rv_p = report_sub.add_parser("by-regime-vix")
+    _add_min_context(by_rv_p)
+    report_sub.add_parser("by-context")          # Phase 2.3
+    report_sub.add_parser("context-matrix")      # Phase 2.3
     pred_report_p = report_sub.add_parser("predictions")
     pred_report_axis = pred_report_p.add_mutually_exclusive_group()
     pred_report_axis.add_argument("--by-regime", action="store_true",
@@ -846,6 +1001,7 @@ def main() -> None:
                                   help="Break accuracy out by VIX band")
     pred_report_axis.add_argument("--by-time", action="store_true",
                                   help="Break accuracy out by hour-of-day ET")
+    _add_min_context(pred_report_p)
     report_sub.add_parser("daily-backfill")
     daily_p = report_sub.add_parser("daily")
     daily_p.add_argument("--date", type=str, default=None,
@@ -868,6 +1024,15 @@ def main() -> None:
     vhist_p.add_argument("--days", type=int, default=30,
                          help="How many recent snapshots to show (default 30)")
     vix_sub.add_parser("backfill")
+
+    # context (Phase 2.3)
+    context_parser = sub.add_parser("context")
+    context_sub = context_parser.add_subparsers(dest="context_cmd", required=True)
+    context_sub.add_parser("current")
+    chist_p = context_sub.add_parser("history")
+    chist_p.add_argument("--days", type=int, default=30,
+                         help="How many recent overlapping snapshots (default 30)")
+    context_sub.add_parser("backfill")
 
     # predictions (Phase 2.2b)
     pred_parser = sub.add_parser("predictions")
@@ -918,39 +1083,46 @@ def main() -> None:
         elif args.report_cmd == "recent":
             cmd_report_recent(args.days)
         elif args.report_cmd == "by-signal":
+            mc = _maybe_min_context(args)
             if getattr(args, "by_regime", False):
-                cmd_report_by_signal_regime()
+                cmd_report_by_signal_regime(min_context=mc)
             elif getattr(args, "by_vix", False):
-                cmd_report_by_signal_vix()
+                cmd_report_by_signal_vix(min_context=mc)
             else:
-                cmd_report_by_signal()
+                cmd_report_by_signal(min_context=mc)
         elif args.report_cmd == "by-ticker":
             asset = "stock" if args.stocks else "crypto" if args.crypto else None
+            mc = _maybe_min_context(args)
             if getattr(args, "by_regime", False):
-                cmd_report_by_ticker_regime(asset)
+                cmd_report_by_ticker_regime(asset, min_context=mc)
             elif getattr(args, "by_vix", False):
-                cmd_report_by_ticker_vix(asset)
+                cmd_report_by_ticker_vix(asset, min_context=mc)
             else:
-                cmd_report_by_ticker(asset)
+                cmd_report_by_ticker(asset, min_context=mc)
         elif args.report_cmd == "by-asset":
             cmd_report_by_asset()
         elif args.report_cmd == "cross":
             cmd_report_cross()
         elif args.report_cmd == "by-regime":
-            cmd_report_by_regime()
+            cmd_report_by_regime(min_context=_maybe_min_context(args))
         elif args.report_cmd == "by-vix":
-            cmd_report_by_vix()
+            cmd_report_by_vix(min_context=_maybe_min_context(args))
         elif args.report_cmd == "by-regime-vix":
-            cmd_report_by_regime_vix()
+            cmd_report_by_regime_vix(min_context=_maybe_min_context(args))
+        elif args.report_cmd == "by-context":
+            cmd_report_by_context()
+        elif args.report_cmd == "context-matrix":
+            cmd_report_context_matrix()
         elif args.report_cmd == "predictions":
+            mc = _maybe_min_context(args)
             if getattr(args, "by_regime", False):
-                cmd_report_predictions_by_regime()
+                cmd_report_predictions_by_regime(min_context=mc)
             elif getattr(args, "by_vix", False):
-                cmd_report_predictions_by_vix()
+                cmd_report_predictions_by_vix(min_context=mc)
             elif getattr(args, "by_time", False):
-                cmd_report_predictions_by_time()
+                cmd_report_predictions_by_time(min_context=mc)
             else:
-                cmd_report_predictions()
+                cmd_report_predictions(min_context=mc)
         elif args.report_cmd == "daily-backfill":
             cmd_report_daily_backfill()
         elif args.report_cmd == "daily":
@@ -970,6 +1142,13 @@ def main() -> None:
             cmd_vix_history(args.days)
         elif args.vix_cmd == "backfill":
             cmd_vix_backfill()
+    elif args.command == "context":
+        if args.context_cmd == "current":
+            cmd_context_current()
+        elif args.context_cmd == "history":
+            cmd_context_history(args.days)
+        elif args.context_cmd == "backfill":
+            cmd_context_backfill()
     elif args.command == "predictions":
         if args.predictions_cmd == "enable":
             cmd_predictions_enable()

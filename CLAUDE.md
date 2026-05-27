@@ -41,15 +41,19 @@ comment on the suppression.
 - [x] Phase 2.1 — Macro regime detection (bull/bear/sideways)
 - [x] Phase 2.2 — VIX context (low/elevated/high/extreme + regime x vix matrix)
 - [x] Phase 2.2b — 15-min direction prediction engine for crypto event markets
+- [x] Phase 2.3 — Market context score (composite regime x VIX + --min-context filter)
 
-### Phase 2 sub-phases queued:
+### Phase 2 is complete. Phase 3 queued:
 
-- [ ] Phase 2.3 — Regime+VIX consolidation: weighted scoring,
-      regime+vix filters, confidence flags emitted at signal fire,
-      News-aware weighting layered in. The prediction engine benefits
-      from the same consolidation — high-confidence regime/VIX combos
-      may warrant higher-conviction predictions.
-- [ ] Phase 2.4 — Watchlist auto-discovery
+- [ ] Phase 3 — Watchlist auto-discovery. New tickers should be
+      validated against the current context_score before being promoted
+      to the live watchlist; a ticker discovered in a hostile context
+      (1-2) should be held for re-evaluation in a better window before
+      we trade it live.
+- [ ] Phase 4 — Strategy evolution: filter signals at fire time using
+      the context score (suppress when context_score < threshold,
+      possibly per-signal). Phase 2.3 deliberately makes context pure
+      metadata; Phase 4 turns it into a gate.
 
 ## Outcome resolution
 
@@ -87,6 +91,10 @@ python -m trading_bot report by-asset             # stock vs crypto
 python -m trading_bot report by-regime            # per macro regime (Phase 2.1)
 python -m trading_bot report by-vix               # per VIX band (Phase 2.2)
 python -m trading_bot report by-regime-vix        # regime x vix matrix (Phase 2.2 headline view)
+python -m trading_bot report by-context           # per context score 0-5 (Phase 2.3)
+python -m trading_bot report context-matrix       # regime x vix as a geometric matrix (Phase 2.3)
+# --min-context N filter on any of: by-signal, by-ticker, by-regime, by-vix,
+# by-regime-vix, predictions. 0 = no filter; >0 excludes trades below N.
 python -m trading_bot report predictions          # prediction accuracy (Phase 2.2b)
 python -m trading_bot report predictions --by-regime
 python -m trading_bot report predictions --by-vix
@@ -123,6 +131,18 @@ python -m trading_bot predictions status          # show settings + last-24h act
 python -m trading_bot predictions window --start HH:MM --end HH:MM
 python -m trading_bot predictions tickers --set BTC-USD,ETH-USD
 python -m trading_bot predictions pause --minutes 60   # temporarily mute
+```
+
+### Context CLI (Phase 2.3)
+
+The single unified dashboard. Replaces the two-step "regime current + vix
+current" workflow with one composite view. Use this by default; drop down
+to the per-axis CLIs only when you need to diagnose one specific layer.
+
+```
+python -m trading_bot context current             # composite snapshot + score 0-5
+python -m trading_bot context history --days 30   # joined regime+vix history with score per day
+python -m trading_bot context backfill            # tag context_score on legacy trades + predictions
 ```
 
 ### Aggregation rules (the only ones that matter)
@@ -306,6 +326,62 @@ the row stays `resolved_at IS NULL` and the next sweep retries.
 Reuses the existing Pushover + Discord path. Plain ASCII (cp1252
 safe). Resolution notifications are off by default — set
 `predictions.notify_resolution` to `"true"` if you want them.
+
+## Market Context (Phase 2.3)
+
+Composite score 0-5 derived from regime x VIX. Replaces the awkward
+"run regime current then run vix current" workflow with a single
+unified dashboard via `context current`. Tagged on every trade and
+every prediction at fire time alongside the underlying axes.
+
+### Score matrix
+
+```
+              Low VIX    Elevated    High    Extreme
+Bull            5           4          3        2
+Sideways        4           3          2        1
+Bear            2           2          1        1
+```
+
+Any `unknown` on either axis collapses the score to `0`. The matrix
+is intentionally asymmetric:
+
+- A bear market never scores above 2 regardless of volatility
+- Extreme VIX docks every regime by at least one point
+- Bull + low is the only `5`
+
+### Label mapping
+
+| Score | Label        |
+|-------|--------------|
+| 5     | ideal        |
+| 4     | favorable    |
+| 3     | neutral      |
+| 2     | unfavorable  |
+| 1     | hostile      |
+| 0     | unknown      |
+
+### Long-bias caveat
+
+The score is LONG-BIAS. PUT/SHORT signals fired in a low-score
+environment are technically benefiting from that context (a bear is
+great for puts), but we do NOT invert the score at this layer. Phase 4
+will handle signal-direction × context interaction. For Phase 2.3 the
+score is pure metadata — something to filter on, sort by, threshold
+against.
+
+### `--min-context N` — the killer feature
+
+Every analytical subcommand accepts `--min-context N`. Pass `4` and
+the report only counts trades fired in `favorable` or `ideal`
+conditions. This is the single most useful lens in the reporting CLI
+and should become your default analytical view once enough data
+accumulates. The filter is strict: trades with `context_score IS NULL`
+are EXCLUDED when the filter is active (NULL is not "at least 1").
+
+Supported on: `by-signal`, `by-ticker`, `by-regime`, `by-vix`,
+`by-regime-vix`, `predictions` — including their matrix variants
+(`by-signal --by-regime --min-context 4` etc.).
 
 ### Why this is the cleanest accuracy surface in the bot
 

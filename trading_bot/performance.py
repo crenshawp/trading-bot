@@ -110,6 +110,21 @@ _AGGREGATE_COLS = (
 )
 
 
+def _min_context_filter(
+    min_context: int, table_alias: str = "trades",
+) -> tuple[str, tuple[object, ...]]:
+    """Build the SQL fragment that filters by ``context_score >= N``.
+
+    Returns ``("", ())`` for ``min_context <= 0`` so callers can splat the
+    result without conditional logic. Strictly greater-or-equal — rows
+    where ``context_score IS NULL`` are EXCLUDED when the filter is active
+    (a NULL score is not "at least 1").
+    """
+    if min_context <= 0:
+        return ("", ())
+    return (f"AND {table_alias}.context_score >= ?", (min_context,))
+
+
 def _row_to_stats(label: str, row: sqlite3.Row | None) -> PerfStats:
     """Convert an aggregate row to a ``PerfStats``. Handles all-None edge cases."""
     if row is None or row["total"] in (None, 0):
@@ -183,35 +198,39 @@ def stats_recent(days: int = 30) -> PerfStats:
     )
 
 
-def stats_by_signal_type() -> list[PerfStats]:
+def stats_by_signal_type(min_context: int = 0) -> list[PerfStats]:
     """One ``PerfStats`` per distinct signal_type, sorted by win_rate desc.
 
     Slices with all-expired (no wins, no losses) sort to the end because
-    their ``win_rate`` is ``None``.
+    their ``win_rate`` is ``None``. ``min_context`` (Phase 2.3) filters
+    out trades whose context_score is below ``N``.
     """
+    ctx_clause, ctx_params = _min_context_filter(min_context)
     sql = (
         f"SELECT signals.signal_type AS slice, {_AGGREGATE_COLS} "
         "FROM trades "
         "JOIN signals ON signals.id = trades.signal_id "
-        "WHERE trades.outcome IN ('win','loss','expired') "
+        f"WHERE trades.outcome IN ('win','loss','expired') {ctx_clause} "
         "GROUP BY signals.signal_type"
     )
     conn = db.get_connection()
     try:
-        rows = conn.execute(sql).fetchall()
+        rows = conn.execute(sql, ctx_params).fetchall()
     finally:
         conn.close()
     result = [_row_to_stats(str(r["slice"]), r) for r in rows]
-    # None win_rate sorts to the back; otherwise descending.
     result.sort(key=lambda s: (s.win_rate is None, -(s.win_rate or 0.0)))
     return result
 
 
-def stats_by_ticker(asset_class: str | None = None) -> list[PerfStats]:
+def stats_by_ticker(
+    asset_class: str | None = None, min_context: int = 0,
+) -> list[PerfStats]:
     """One ``PerfStats`` per distinct ticker, sorted by avg_pnl_pct desc.
 
     If ``asset_class`` is provided ("stock" or "crypto"), only that class
-    is included.
+    is included. ``min_context`` (Phase 2.3) excludes trades whose
+    context_score is below ``N``.
     """
     where = "WHERE trades.outcome IN ('win','loss','expired')"
     params: list[object] = []
@@ -220,6 +239,10 @@ def stats_by_ticker(asset_class: str | None = None) -> list[PerfStats]:
             raise ValueError(f"asset_class must be 'stock' or 'crypto', got {asset_class!r}")
         where += " AND signals.asset_class = ?"
         params.append(asset_class)
+    ctx_clause, ctx_params = _min_context_filter(min_context)
+    if ctx_clause:
+        where += f" {ctx_clause}"
+        params.extend(ctx_params)
 
     sql = (
         f"SELECT signals.ticker AS slice, {_AGGREGATE_COLS} "
@@ -288,24 +311,25 @@ def stats_by_signal_type_and_ticker(min_trades: int = 3) -> list[PerfStats]:
 # ────────────────────────────────────────────────────────────────────────────
 
 
-def stats_by_regime() -> list[PerfStats]:
+def stats_by_regime(min_context: int = 0) -> list[PerfStats]:
     """One :class:`PerfStats` per macro regime present in closed trades.
 
-    Ordered bull → sideways → bear → unknown (any extra regime, if a
-    historical row ever held a non-canonical value, sorts to the end).
-    NULL ``market_regime`` is folded into the ``unknown`` bucket.
+    Ordered bull → sideways → bear → unknown. NULL ``market_regime`` is
+    folded into the ``unknown`` bucket. ``min_context`` excludes trades
+    whose context_score is below ``N``.
     """
+    ctx_clause, ctx_params = _min_context_filter(min_context)
     sql = (
         f"SELECT COALESCE(trades.market_regime, 'unknown') AS slice, "
         f"{_AGGREGATE_COLS} "
         "FROM trades "
         "JOIN signals ON signals.id = trades.signal_id "
-        "WHERE trades.outcome IN ('win','loss','expired') "
+        f"WHERE trades.outcome IN ('win','loss','expired') {ctx_clause} "
         "GROUP BY COALESCE(trades.market_regime, 'unknown')"
     )
     conn = db.get_connection()
     try:
-        rows = conn.execute(sql).fetchall()
+        rows = conn.execute(sql, ctx_params).fetchall()
     finally:
         conn.close()
     result = [_row_to_stats(str(r["slice"]), r) for r in rows]
@@ -388,25 +412,35 @@ def _stats_grouped_by_regime(
     return breakdowns
 
 
-def stats_by_signal_type_with_regime() -> list[RegimeBreakdown]:
+def stats_by_signal_type_with_regime(min_context: int = 0) -> list[RegimeBreakdown]:
     """``stats_by_signal_type`` cross-tabbed by macro regime."""
-    return _stats_grouped_by_regime("signal_type")
+    ctx_clause, ctx_params = _min_context_filter(min_context)
+    return _stats_grouped_by_regime(
+        "signal_type", extra_where=ctx_clause.removeprefix("AND ").strip(),
+        extra_params=ctx_params,
+    ) if ctx_clause else _stats_grouped_by_regime("signal_type")
 
 
 def stats_by_ticker_with_regime(
-    asset_class: str | None = None,
+    asset_class: str | None = None, min_context: int = 0,
 ) -> list[RegimeBreakdown]:
     """``stats_by_ticker`` cross-tabbed by macro regime."""
     if asset_class is not None and asset_class not in ("stock", "crypto"):
         raise ValueError(
             f"asset_class must be 'stock' or 'crypto', got {asset_class!r}"
         )
-    if asset_class is None:
-        return _stats_grouped_by_regime("ticker")
+    where_parts: list[str] = []
+    params: list[object] = []
+    if asset_class is not None:
+        where_parts.append("signals.asset_class = ?")
+        params.append(asset_class)
+    ctx_clause, ctx_params = _min_context_filter(min_context)
+    if ctx_clause:
+        where_parts.append(ctx_clause.removeprefix("AND ").strip())
+        params.extend(ctx_params)
+    extra_where = " AND ".join(where_parts)
     return _stats_grouped_by_regime(
-        "ticker",
-        extra_where="signals.asset_class = ?",
-        extra_params=(asset_class,),
+        "ticker", extra_where=extra_where, extra_params=tuple(params),
     )
 
 
@@ -415,23 +449,24 @@ def stats_by_ticker_with_regime(
 # ────────────────────────────────────────────────────────────────────────────
 
 
-def stats_by_vix_band() -> list[PerfStats]:
+def stats_by_vix_band(min_context: int = 0) -> list[PerfStats]:
     """One :class:`PerfStats` per VIX band present in closed trades.
 
-    Ordered low → elevated → high → extreme → unknown. NULL ``vix_band`` is
-    folded into the ``unknown`` bucket.
+    Ordered low → elevated → high → extreme → unknown. ``min_context``
+    excludes trades whose context_score is below ``N``.
     """
+    ctx_clause, ctx_params = _min_context_filter(min_context)
     sql = (
         f"SELECT COALESCE(trades.vix_band, 'unknown') AS slice, "
         f"{_AGGREGATE_COLS} "
         "FROM trades "
         "JOIN signals ON signals.id = trades.signal_id "
-        "WHERE trades.outcome IN ('win','loss','expired') "
+        f"WHERE trades.outcome IN ('win','loss','expired') {ctx_clause} "
         "GROUP BY COALESCE(trades.vix_band, 'unknown')"
     )
     conn = db.get_connection()
     try:
-        rows = conn.execute(sql).fetchall()
+        rows = conn.execute(sql, ctx_params).fetchall()
     finally:
         conn.close()
     result = [_row_to_stats(str(r["slice"]), r) for r in rows]
@@ -507,25 +542,35 @@ def _stats_grouped_by_vix(
     return breakdowns
 
 
-def stats_by_signal_type_with_vix() -> list[VixBreakdown]:
+def stats_by_signal_type_with_vix(min_context: int = 0) -> list[VixBreakdown]:
     """``stats_by_signal_type`` cross-tabbed by VIX band."""
-    return _stats_grouped_by_vix("signal_type")
+    ctx_clause, ctx_params = _min_context_filter(min_context)
+    extra_where = ctx_clause.removeprefix("AND ").strip() if ctx_clause else ""
+    return _stats_grouped_by_vix(
+        "signal_type", extra_where=extra_where, extra_params=ctx_params,
+    )
 
 
 def stats_by_ticker_with_vix(
-    asset_class: str | None = None,
+    asset_class: str | None = None, min_context: int = 0,
 ) -> list[VixBreakdown]:
     """``stats_by_ticker`` cross-tabbed by VIX band."""
     if asset_class is not None and asset_class not in ("stock", "crypto"):
         raise ValueError(
             f"asset_class must be 'stock' or 'crypto', got {asset_class!r}"
         )
-    if asset_class is None:
-        return _stats_grouped_by_vix("ticker")
+    where_parts: list[str] = []
+    params: list[object] = []
+    if asset_class is not None:
+        where_parts.append("signals.asset_class = ?")
+        params.append(asset_class)
+    ctx_clause, ctx_params = _min_context_filter(min_context)
+    if ctx_clause:
+        where_parts.append(ctx_clause.removeprefix("AND ").strip())
+        params.extend(ctx_params)
     return _stats_grouped_by_vix(
-        "ticker",
-        extra_where="signals.asset_class = ?",
-        extra_params=(asset_class,),
+        "ticker", extra_where=" AND ".join(where_parts),
+        extra_params=tuple(params),
     )
 
 
@@ -576,38 +621,48 @@ _PRED_AGG = (
 )
 
 
-def stats_predictions_overall() -> PredictionStats:
-    sql = f"SELECT {_PRED_AGG} FROM predictions"  # noqa: S608 - whitelist
+def _pred_where(min_context: int) -> tuple[str, tuple[object, ...]]:
+    """Build the prediction WHERE/AND fragment for the min_context filter."""
+    if min_context <= 0:
+        return ("", ())
+    return ("WHERE context_score >= ?", (min_context,))
+
+
+def stats_predictions_overall(min_context: int = 0) -> PredictionStats:
+    where, params = _pred_where(min_context)
+    sql = f"SELECT {_PRED_AGG} FROM predictions {where}"  # noqa: S608 - whitelist
     conn = db.get_connection()
     try:
-        row = conn.execute(sql).fetchone()
+        row = conn.execute(sql, params).fetchone()
     finally:
         conn.close()
     return _pred_stats_from_row("TOTAL", row)
 
 
-def stats_predictions_by_ticker() -> list[PredictionStats]:
+def stats_predictions_by_ticker(min_context: int = 0) -> list[PredictionStats]:
+    where, params = _pred_where(min_context)
     sql = (
         f"SELECT ticker AS slice, {_PRED_AGG} "
-        "FROM predictions GROUP BY ticker ORDER BY ticker"
+        f"FROM predictions {where} GROUP BY ticker ORDER BY ticker"
     )
     conn = db.get_connection()
     try:
-        rows = conn.execute(sql).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     finally:
         conn.close()
     return [_pred_stats_from_row(str(r["slice"]), r) for r in rows]
 
 
-def stats_predictions_by_regime() -> list[PredictionStats]:
+def stats_predictions_by_regime(min_context: int = 0) -> list[PredictionStats]:
     """One row per regime present in predictions. Ordered bull/sideways/bear/unknown."""
+    where, params = _pred_where(min_context)
     sql = (
         f"SELECT COALESCE(market_regime, 'unknown') AS slice, {_PRED_AGG} "
-        "FROM predictions GROUP BY COALESCE(market_regime, 'unknown')"
+        f"FROM predictions {where} GROUP BY COALESCE(market_regime, 'unknown')"
     )
     conn = db.get_connection()
     try:
-        rows = conn.execute(sql).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     finally:
         conn.close()
     result = [_pred_stats_from_row(str(r["slice"]), r) for r in rows]
@@ -616,15 +671,16 @@ def stats_predictions_by_regime() -> list[PredictionStats]:
     return result
 
 
-def stats_predictions_by_vix() -> list[PredictionStats]:
+def stats_predictions_by_vix(min_context: int = 0) -> list[PredictionStats]:
     """One row per VIX band present in predictions. Ordered low→unknown."""
+    where, params = _pred_where(min_context)
     sql = (
         f"SELECT COALESCE(vix_band, 'unknown') AS slice, {_PRED_AGG} "
-        "FROM predictions GROUP BY COALESCE(vix_band, 'unknown')"
+        f"FROM predictions {where} GROUP BY COALESCE(vix_band, 'unknown')"
     )
     conn = db.get_connection()
     try:
-        rows = conn.execute(sql).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     finally:
         conn.close()
     result = [_pred_stats_from_row(str(r["slice"]), r) for r in rows]
@@ -633,17 +689,18 @@ def stats_predictions_by_vix() -> list[PredictionStats]:
     return result
 
 
-def stats_predictions_by_hour() -> list[PredictionStats]:
+def stats_predictions_by_hour(min_context: int = 0) -> list[PredictionStats]:
     """One row per hour-of-day (in ET) that has at least one prediction.
 
     The hour bucket is derived from ``created_at`` converted to ET. We do the
     conversion in Python (SQLite TZ functions are limited) — pull rows,
-    group in-memory, sort by hour ascending.
+    group in-memory, sort by hour ascending. ``min_context`` filters in SQL.
     """
-    sql = "SELECT * FROM predictions"
+    where, params = _pred_where(min_context)
+    sql = f"SELECT * FROM predictions {where}"  # noqa: S608 - whitelisted fragment
     conn = db.get_connection()
     try:
-        rows = conn.execute(sql).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     finally:
         conn.close()
 
@@ -689,42 +746,78 @@ def stats_predictions_by_hour() -> list[PredictionStats]:
     return out
 
 
-def stats_by_regime_x_vix() -> list[PerfStats]:
+def stats_by_regime_x_vix(min_context: int = 0) -> list[PerfStats]:
     """The full regime x VIX cross-tab — one row per non-empty bucket.
 
     Sorted by trade count descending so the most-populated buckets surface
-    first (which is the most useful read for "where do I have enough data
-    to make a call?"). Empty buckets are omitted entirely, never returned
-    as 0/0 rows.
-
-    Labels look like ``"bull / low"`` — joining macro direction (regime)
-    with volatility band (vix). This is the foundation for Phase 4 strategy
-    evolution: once enough live data accumulates, this view tells us
-    exactly which regime x VIX combos are profitable for any given signal
-    or ticker.
+    first. Empty buckets are omitted entirely, never returned as 0/0 rows.
+    ``min_context`` excludes trades below the given score.
     """
+    ctx_clause, ctx_params = _min_context_filter(min_context)
     sql = (
         f"SELECT COALESCE(trades.market_regime, 'unknown') AS regime, "
         f"COALESCE(trades.vix_band, 'unknown') AS vix_band, "
         f"{_AGGREGATE_COLS} "
         "FROM trades "
         "JOIN signals ON signals.id = trades.signal_id "
-        "WHERE trades.outcome IN ('win','loss','expired') "
+        f"WHERE trades.outcome IN ('win','loss','expired') {ctx_clause} "
         "GROUP BY COALESCE(trades.market_regime, 'unknown'), "
         "COALESCE(trades.vix_band, 'unknown')"
+    )
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(sql, ctx_params).fetchall()
+    finally:
+        conn.close()
+    result = [
+        _row_to_stats(f"{r['regime']} / {r['vix_band']}", r) for r in rows
+    ]
+    result.sort(key=lambda s: (-s.total, s.label))
+    return result
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Context score slices (Phase 2.3)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def stats_by_context() -> list[PerfStats]:
+    """One :class:`PerfStats` per context score (0-5), descending.
+
+    Always emits all six rows (5 → 0). Buckets with no trades show
+    ``total=0`` and ``win_rate=None`` — caller is responsible for
+    rendering ``-`` if desired. The all-six emit is intentional so the
+    report header always lines up the same way.
+    """
+    sql = (
+        f"SELECT COALESCE(trades.context_score, 0) AS slice, "
+        f"{_AGGREGATE_COLS} "
+        "FROM trades "
+        "JOIN signals ON signals.id = trades.signal_id "
+        "WHERE trades.outcome IN ('win','loss','expired') "
+        "GROUP BY COALESCE(trades.context_score, 0)"
     )
     conn = db.get_connection()
     try:
         rows = conn.execute(sql).fetchall()
     finally:
         conn.close()
-    result = [
-        _row_to_stats(f"{r['regime']} / {r['vix_band']}", r) for r in rows
-    ]
-    # Trade-count descending (most data first). Stable secondary key on
-    # label keeps ordering deterministic when counts tie.
-    result.sort(key=lambda s: (-s.total, s.label))
-    return result
+    bucket: dict[int, PerfStats] = {}
+    for r in rows:
+        score = int(r["slice"])
+        bucket[score] = _row_to_stats(str(score), r)
+    # Emit all six 5 → 0; missing scores get zero-filled placeholders.
+    out: list[PerfStats] = []
+    for score in (5, 4, 3, 2, 1, 0):
+        out.append(bucket.get(
+            score,
+            PerfStats(
+                label=str(score), total=0, wins=0, losses=0, expired=0,
+                win_rate=None, avg_pnl_pct=None,
+                best_pnl_pct=None, worst_pnl_pct=None,
+            ),
+        ))
+    return out
 
 
 # ────────────────────────────────────────────────────────────────────────────
