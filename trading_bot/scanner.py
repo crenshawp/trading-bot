@@ -823,7 +823,7 @@ def _run_daily_perf_update() -> None:
 def detect_stock_signals(ticker, df):
     signals = []
 
-    latest = df.iloc[-1]
+    latest = df.iloc[-2]
 
     price       = float(latest["Close"])
     rsi         = float(latest["RSI"])
