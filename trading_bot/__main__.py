@@ -919,6 +919,7 @@ def cmd_report_daily(target_date: date | None) -> None:
 
 
 def main() -> None:
+    db.init_db() 
     parser = argparse.ArgumentParser(prog="trading_bot")
     sub = parser.add_subparsers(dest="command", required=True)
 
