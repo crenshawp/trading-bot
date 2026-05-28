@@ -710,6 +710,16 @@ def stats_predictions_by_hour(min_context: int = 0) -> list[PredictionStats]:
         try:
             created = datetime.fromisoformat(str(row["created_at"]))
         except ValueError:
+            # created_at is always written as ISO by us, so this is defensive
+            # against corrupt data — but skipping a row from the histogram
+            # silently would understate counts. Log which row was dropped.
+            import sys
+            print(
+                f"  stats_predictions_by_hour: skipping prediction "
+                f"id={row['id']} with unparseable created_at "
+                f"{row['created_at']!r}",
+                file=sys.stderr,
+            )
             continue
         if created.tzinfo is None:
             created = created.replace(tzinfo=UTC)

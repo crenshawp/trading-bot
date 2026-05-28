@@ -65,18 +65,38 @@ def _build_candles(
     )
 
 
-def _strong_uptrend(n: int = 35) -> pd.DataFrame:
-    """All indicators should vote HIGHER."""
-    closes = [100.0 + i * 0.5 for i in range(n)]
-    opens = [closes[i] - 0.3 for i in range(n)]  # green candles
-    # Last 3 candles get a clean uptrend close; volume spikes on last
-    volumes = [1_000_000] * (n - 1) + [3_000_000]
+def _strong_uptrend(n: int = 40) -> pd.DataFrame:
+    """Accelerating uptrend that yields >= 5 of 6 HIGHER votes.
+
+    A perfectly linear ramp saturates RSI (slope 0) and inverts the MACD
+    histogram, so it only scores 4/6. A choppy base followed by an
+    acceleration keeps RSI unsaturated and the MACD histogram rising, which
+    clears the 5-of-6 agreement gate.
+    """
+    closes: list[float] = []
+    price = 100.0
+    for i in range(n):
+        if i < 30:
+            price += 0.2 + (0.15 if i % 2 == 0 else -0.1)  # choppy mild rise
+        else:
+            price += 1.0 + (i - 29) * 0.3                  # accelerate
+        closes.append(round(price, 2))
+    opens = [closes[i] - 0.2 for i in range(n)]            # green candles
+    volumes = [1_000_000] * (n - 1) + [3_000_000]          # volume spike last
     return _build_candles(closes=closes, opens=opens, volumes=volumes)
 
 
-def _strong_downtrend(n: int = 35) -> pd.DataFrame:
-    closes = [200.0 - i * 0.5 for i in range(n)]
-    opens = [closes[i] + 0.3 for i in range(n)]  # red candles
+def _strong_downtrend(n: int = 40) -> pd.DataFrame:
+    """Accelerating downtrend that yields >= 5 of 6 LOWER votes."""
+    closes: list[float] = []
+    price = 300.0
+    for i in range(n):
+        if i < 30:
+            price += -0.2 + (0.1 if i % 2 == 0 else -0.15)
+        else:
+            price -= 1.0 + (i - 29) * 0.3
+        closes.append(round(price, 2))
+    opens = [closes[i] + 0.2 for i in range(n)]            # red candles
     volumes = [1_000_000] * (n - 1) + [3_000_000]
     return _build_candles(closes=closes, opens=opens, volumes=volumes)
 
@@ -138,12 +158,30 @@ def test_tally_all_neutral_returns_none() -> None:
     assert confidence == 0.0
 
 
-def test_tally_decisive_higher() -> None:
-    # 4 HIGHER, 1 LOWER, 1 NEUTRAL → 4/5 = 80%
+def test_tally_four_of_six_returns_none() -> None:
+    # 4 HIGHER, 1 LOWER, 1 NEUTRAL → 4/5 = 80% confidence, but only 4
+    # indicators agree. Hardening requires >= 5 of 6 → None.
     votes = {"a": 1, "b": 1, "c": 1, "d": 1, "e": -1, "f": 0}
     direction, confidence = predictions.tally_votes(votes)
-    assert direction == "HIGHER"
+    assert direction is None
+    # confidence is still computed/reported even when the gate rejects it
     assert confidence == pytest.approx(80.0)
+
+
+def test_tally_five_of_six_agreement_fires() -> None:
+    # 5 HIGHER, 1 LOWER → 5/6 = 83.3% confidence, 5 agree → fires
+    votes = {"a": 1, "b": 1, "c": 1, "d": 1, "e": 1, "f": -1}
+    direction, confidence = predictions.tally_votes(votes)
+    assert direction == "HIGHER"
+    assert confidence == pytest.approx(83.33, rel=1e-3)
+
+
+def test_tally_five_with_one_neutral_fires() -> None:
+    # 5 HIGHER, 1 NEUTRAL → 5/5 = 100% confidence, 5 agree → fires
+    votes = {"a": 1, "b": 1, "c": 1, "d": 1, "e": 1, "f": 0}
+    direction, confidence = predictions.tally_votes(votes)
+    assert direction == "HIGHER"
+    assert confidence == pytest.approx(100.0)
 
 
 # ────────────────────── predict_direction (with full stack) ──────────────────────
@@ -156,7 +194,7 @@ def test_predict_strong_uptrend_returns_higher(
     pred = predictions.predict_direction("BTC-USD")
     assert pred is not None
     assert pred.direction == "HIGHER"
-    assert pred.confidence >= 55.0
+    assert pred.confidence >= predictions.MIN_CONFIDENCE
 
 
 def test_predict_strong_downtrend_returns_lower(
@@ -174,6 +212,47 @@ def test_predict_flat_candles_returns_none(
     """All indicators NEUTRAL → no prediction."""
     _patch_fetch(monkeypatch, _flat_candles())
     assert predictions.predict_direction("BTC-USD") is None
+
+
+def test_predict_four_of_six_agreement_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only 4 of 6 indicators agree → None, even though 4/4 = high confidence.
+    The 5-of-6 agreement gate (in tally_votes) rejects it."""
+    _patch_fetch(monkeypatch, _strong_uptrend())
+    monkeypatch.setattr(
+        predictions, "_gather_votes",
+        lambda _df: {
+            "candle_streak": 1, "rsi_slope": 1, "macd_hist": 1, "vwap": 1,
+            "volume_conf": -1, "bb_position": 0,
+        },
+    )
+    assert predictions.predict_direction("BTC-USD") is None
+
+
+def test_predict_confidence_below_floor_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even with agreement, confidence below MIN_CONFIDENCE (70) → None.
+    Exercised by mocking tally_votes to report a low confidence."""
+    _patch_fetch(monkeypatch, _strong_uptrend())
+    monkeypatch.setattr(
+        predictions, "tally_votes", lambda _v: ("HIGHER", 65.0),
+    )
+    assert predictions.predict_direction("BTC-USD") is None
+
+
+def test_predict_at_confidence_floor_fires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confidence exactly at the floor (70) with agreement → fires."""
+    _patch_fetch(monkeypatch, _strong_uptrend())
+    monkeypatch.setattr(
+        predictions, "tally_votes", lambda _v: ("HIGHER", 70.0),
+    )
+    pred = predictions.predict_direction("BTC-USD")
+    assert pred is not None
+    assert pred.confidence == pytest.approx(70.0)
 
 
 def test_predict_no_data_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -597,6 +676,54 @@ def test_scanner_runs_when_enabled_inside_window(
     assert {r.ticker for r in rows} == {"BTC-USD", "ETH-USD"}
 
 
+# ────────────────────── PREDICTIONS_ENABLED env override (FIX 1) ──────────────────────
+
+
+def test_env_override_true_forces_enabled(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trading_bot import scanner, settings
+
+    settings.set_bool("predictions.enabled", False)  # DB says off
+    monkeypatch.setenv("PREDICTIONS_ENABLED", "true")
+    scanner._seed_prediction_defaults()
+    assert settings.get_bool("predictions.enabled") is True
+
+
+def test_env_override_false_forces_disabled(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trading_bot import scanner, settings
+
+    settings.set_bool("predictions.enabled", True)  # DB says on
+    monkeypatch.setenv("PREDICTIONS_ENABLED", "FALSE")  # case-insensitive
+    scanner._seed_prediction_defaults()
+    assert settings.get_bool("predictions.enabled") is False
+
+
+def test_env_override_unset_preserves_db(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trading_bot import scanner, settings
+
+    settings.set_bool("predictions.enabled", True)
+    monkeypatch.delenv("PREDICTIONS_ENABLED", raising=False)
+    scanner._seed_prediction_defaults()
+    assert settings.get_bool("predictions.enabled") is True
+
+
+def test_env_override_garbage_preserves_db(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trading_bot import scanner, settings
+
+    settings.set_bool("predictions.enabled", True)
+    monkeypatch.setenv("PREDICTIONS_ENABLED", "maybe")
+    scanner._seed_prediction_defaults()
+    # unrecognized value → DB value preserved
+    assert settings.get_bool("predictions.enabled") is True
+
+
 # ────────────────────── notification format ──────────────────────
 
 
@@ -619,6 +746,94 @@ def test_prediction_notification_is_plain_ascii(
     out = capsys.readouterr().out
     out.encode("cp1252")  # raises if any non-ASCII slipped in
     assert "[PREDICTION] BTC-USD -> HIGHER" in out
+
+
+class _FakeResp:
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+
+
+def test_prediction_notification_warns_on_non_2xx(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A 429/401 from Pushover/Discord must surface — requests doesn't raise
+    on 4xx, so without the status check the alert would silently vanish."""
+    from trading_bot import scanner
+
+    monkeypatch.setattr(scanner, "DRY_RUN", False)
+    monkeypatch.setattr(scanner, "DISCORD_WEBHOOK_URL", "http://x")
+    monkeypatch.setattr(scanner, "PUSHOVER_APP_TOKEN", "t")
+    monkeypatch.setattr(scanner, "PUSHOVER_USER_KEY", "u")
+    monkeypatch.setattr(
+        scanner.requests, "post", lambda *_a, **_k: _FakeResp(429),
+    )
+
+    pred = Prediction(
+        ticker="BTC-USD", direction="HIGHER", confidence=72.0,
+        entry_price=94000.0,
+        target_window_end=datetime(2026, 5, 26, 14, 45, tzinfo=UTC),
+        signals_used=json.dumps({"x": 1}),
+        created_at=datetime(2026, 5, 26, 14, 30, tzinfo=UTC),
+        market_regime="bull", vix_band="low", vix_level=18.0,
+    )
+    scanner._send_prediction_notification(pred)
+    err = capsys.readouterr().err
+    assert "HTTP 429" in err
+    assert "Discord" in err
+    assert "Pushover" in err
+
+
+def test_swing_notification_warns_on_non_2xx(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import scanner
+
+    monkeypatch.setattr(scanner, "DRY_RUN", False)
+    monkeypatch.setattr(scanner, "DISCORD_WEBHOOK_URL", "http://x")
+    monkeypatch.setattr(scanner, "PUSHOVER_APP_TOKEN", "t")
+    monkeypatch.setattr(scanner, "PUSHOVER_USER_KEY", "u")
+    monkeypatch.setattr(
+        scanner.requests, "post", lambda *_a, **_k: _FakeResp(401),
+    )
+    # Avoid a real DB write path complicating the test.
+    monkeypatch.setattr(scanner, "log_signal", lambda _s: 1)
+
+    scanner.send_notification({
+        "ticker": "BTC-USD", "asset_type": "crypto",
+        "trade_type": "CRYPTO", "direction": "LONG", "setup": "Oversold",
+        "detail": "x", "price": 50000.0, "take_profit": 51000.0,
+        "stop_loss": 49500.0, "confidence": "High", "hold_days": "2-8h",
+    })
+    err = capsys.readouterr().err
+    assert "HTTP 401" in err
+
+
+def test_notification_2xx_does_not_warn(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import scanner
+
+    monkeypatch.setattr(scanner, "DRY_RUN", False)
+    monkeypatch.setattr(scanner, "DISCORD_WEBHOOK_URL", "http://x")
+    monkeypatch.setattr(scanner, "PUSHOVER_APP_TOKEN", "t")
+    monkeypatch.setattr(scanner, "PUSHOVER_USER_KEY", "u")
+    monkeypatch.setattr(
+        scanner.requests, "post", lambda *_a, **_k: _FakeResp(200),
+    )
+    pred = Prediction(
+        ticker="ETH-USD", direction="LOWER", confidence=80.0,
+        entry_price=3000.0,
+        target_window_end=datetime(2026, 5, 26, 14, 45, tzinfo=UTC),
+        signals_used=json.dumps({"x": -1}),
+        created_at=datetime(2026, 5, 26, 14, 30, tzinfo=UTC),
+        market_regime="bear", vix_band="high", vix_level=32.0,
+    )
+    scanner._send_prediction_notification(pred)
+    err = capsys.readouterr().err
+    assert "HTTP" not in err
 
 
 def test_resolution_notification_format(

@@ -14,6 +14,7 @@ is annotated regardless.
 """
 
 import argparse
+import os
 import sys
 import time
 from datetime import UTC, datetime
@@ -207,7 +208,11 @@ def get_yahoo_news(ticker, max_articles=5):
             })
 
         return articles
-    except Exception:
+    except Exception as e:
+        # Network/parse failure on the Yahoo news feed. Returns [] (no news)
+        # but log loudly so a persistently-failing feed is visible rather
+        # than looking like a quiet news day.
+        print(f"  Yahoo news error for {ticker}: {e}", file=sys.stderr)
         return []
 
 
@@ -309,7 +314,11 @@ def check_earnings_risk(ticker):
         elif days_away <= 14:
             return f"MEDIUM — Earnings in {days_away} days"
         return "LOW"
-    except Exception:
+    except Exception as e:
+        # yfinance calendar fetch/parse failure. "UNKNOWN" is also a valid
+        # non-error result (no calendar / no earnings date), so log the
+        # exception path explicitly — otherwise a broken feed is invisible.
+        print(f"  earnings risk check error for {ticker}: {e}", file=sys.stderr)
         return "UNKNOWN"
 
 
@@ -350,7 +359,11 @@ def check_news_risk(ticker):
         elif medium_hits:
             return f"MEDIUM — Cautionary news detected: {', '.join(set(medium_hits))}"
         return "LOW"
-    except Exception:
+    except Exception as e:
+        # NewsAPI request/parse failure (bad key, rate limit, network).
+        # "UNKNOWN" is returned either way, but a silently-failing NewsAPI
+        # key would otherwise never surface. Log it.
+        print(f"  news risk check error for {ticker}: {e}", file=sys.stderr)
         return "UNKNOWN"
 
 
@@ -558,10 +571,32 @@ _PRED_DEFAULTS = {
 
 
 def _seed_prediction_defaults() -> None:
-    """Write any missing prediction settings to their defaults. Idempotent."""
+    """Write any missing prediction settings to their defaults. Idempotent.
+
+    After seeding, an optional ``PREDICTIONS_ENABLED`` environment variable
+    overrides the master switch. This exists because the Railway DB and the
+    local DB are SEPARATE — there is no shell access to flip the setting on
+    Railway, so the env var is the only way to control the deployed
+    instance. Local development still uses the CLI toggle.
+
+    * ``PREDICTIONS_ENABLED=true``  -> force enabled (regardless of DB state)
+    * ``PREDICTIONS_ENABLED=false`` -> force disabled
+    * unset / any other value       -> leave whatever the DB already holds
+    """
     for key, value in _PRED_DEFAULTS.items():
         if settings.get(key) is None:
             settings.set(key, value)
+
+    env_override = os.environ.get("PREDICTIONS_ENABLED")
+    if env_override is not None:
+        normalized = env_override.strip().lower()
+        if normalized == "true":
+            settings.set_bool("predictions.enabled", True)
+            print("[predictions] enabled via PREDICTIONS_ENABLED env var")
+        elif normalized == "false":
+            settings.set_bool("predictions.enabled", False)
+            print("[predictions] disabled via PREDICTIONS_ENABLED env var")
+        # Any other value: leave the DB value untouched.
 
 
 def _parse_hhmm(s: str) -> tuple[int, int] | None:
@@ -610,6 +645,24 @@ def _check_pause_until(now: datetime) -> bool:
     return False
 
 
+def _warn_if_bad_status(resp: object, channel: str) -> None:
+    """Log a warning when an HTTP notification returned a non-2xx status.
+
+    ``requests.post`` does NOT raise on 4xx/5xx — only on connection errors.
+    A Pushover 429 (rate limit) or 401 (bad token), or a Discord 401/404 on a
+    stale webhook, would otherwise look like a successful send and silently
+    drop the alert. This surfaces that case to stderr. This is the likely
+    root cause of intermittent missing phone alerts.
+    """
+    status = getattr(resp, "status_code", None)
+    if status is not None and not (200 <= status < 300):
+        print(
+            f"  {channel} notification HTTP {status} "
+            f"(alert may not have been delivered)",
+            file=sys.stderr,
+        )
+
+
 def _send_prediction_notification(pred: object) -> None:
     """Send the prediction alert via Discord + Pushover. Plain ASCII."""
     # ``pred`` typed as object to keep this function importable without the
@@ -641,16 +694,18 @@ def _send_prediction_notification(pred: object) -> None:
         return
 
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+        resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+        _warn_if_bad_status(resp, "prediction Discord")
     except Exception as exc:
         print(f"  prediction Discord error: {exc}", file=sys.stderr)
     try:
-        requests.post("https://api.pushover.net/1/messages.json", data={
+        resp = requests.post("https://api.pushover.net/1/messages.json", data={
             "token": PUSHOVER_APP_TOKEN,
             "user":  PUSHOVER_USER_KEY,
             "title": f"Prediction: {ticker} {direction}",
             "message": msg,
         })
+        _warn_if_bad_status(resp, "prediction Pushover")
     except Exception as exc:
         print(f"  prediction Pushover error: {exc}", file=sys.stderr)
 
@@ -693,16 +748,18 @@ def _send_resolution_notification(
         return
 
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+        resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+        _warn_if_bad_status(resp, "resolution Discord")
     except Exception as exc:
         print(f"  resolution Discord error: {exc}", file=sys.stderr)
     try:
-        requests.post("https://api.pushover.net/1/messages.json", data={
+        resp = requests.post("https://api.pushover.net/1/messages.json", data={
             "token": PUSHOVER_APP_TOKEN,
             "user":  PUSHOVER_USER_KEY,
             "title": f"Resolved: {ticker} {outcome_label}",
             "message": msg,
         })
+        _warn_if_bad_status(resp, "resolution Pushover")
     except Exception as exc:
         print(f"  resolution Pushover error: {exc}", file=sys.stderr)
 
@@ -1119,7 +1176,10 @@ def send_notification(signal):
     try:
         log_signal(signal)
     except Exception as e:
-        print(f"  Log error: {e}")
+        # DB write failure for the signal/trade row. Route to stderr so a
+        # silently-failing log doesn't hide that a fired alert was never
+        # persisted (it would vanish from all the reporting downstream).
+        print(f"  Log error: {e}", file=sys.stderr)
 
     msg = (
         f"🚨 TRADE ALERT — {signal['ticker']}\n"
@@ -1142,7 +1202,7 @@ def send_notification(signal):
         return
 
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json={
+        resp = requests.post(DISCORD_WEBHOOK_URL, json={
             "content": "@everyone 🚨 TRADE ALERT",
             "embeds": [{
                 "title": f"🚨 TRADE ALERT — {signal['ticker']}",
@@ -1162,20 +1222,22 @@ def send_notification(signal):
                 ],
             }],
         })
+        _warn_if_bad_status(resp, "Discord")
         print("  Discord notification sent")
     except Exception as e:
-        print(f"  Discord error: {e}")
+        print(f"  Discord error: {e}", file=sys.stderr)
 
     try:
-        requests.post("https://api.pushover.net/1/messages.json", data={
+        resp = requests.post("https://api.pushover.net/1/messages.json", data={
             "token":   PUSHOVER_APP_TOKEN,
             "user":    PUSHOVER_USER_KEY,
             "title":   f"Alert: {signal['ticker']} {signal['direction']}",
             "message": msg,
         })
+        _warn_if_bad_status(resp, "Pushover")
         print("  Pushover notification sent")
     except Exception as e:
-        print(f"  Pushover error: {e}")
+        print(f"  Pushover error: {e}", file=sys.stderr)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

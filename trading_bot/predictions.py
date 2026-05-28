@@ -49,7 +49,14 @@ _FETCH_PERIOD = "5d"
 _WINDOW_MINUTES = 15
 _MIN_CANDLES = 30                # need at least 30 closed 15-min candles
 _TIE_TOLERANCE_PCT = 5.0         # confidence must beat 50% by > 5 points
-_MIN_CONFIDENCE = 50.0 + _TIE_TOLERANCE_PCT
+_TIE_FLOOR = 50.0 + _TIE_TOLERANCE_PCT  # the original mixed-signal guard (55)
+
+# Calibration gates (hardening pass). The 6 indicators are all momentum-based
+# and correlated, so high "agreement" overstates real edge on noisy 15-min
+# crypto. We require BOTH a strong supermajority of indicators AND a high
+# confidence floor before firing. These tighten WHEN we fire, not HOW we score.
+_MIN_AGREEMENT = 5               # at least 5 of 6 indicators must agree
+MIN_CONFIDENCE = 70              # winning-side confidence floor (percent)
 
 _INDICATOR_NAMES = (
     "candle_streak", "rsi_slope", "macd_hist", "vwap", "volume_conf", "bb_position",
@@ -204,11 +211,19 @@ def tally_votes(votes: dict[str, int]) -> tuple[str | None, float]:
         return (None, 0.0)
     if higher >= lower:
         direction = "HIGHER"
+        winning = higher
         confidence = higher / decided * 100.0
     else:
         direction = "LOWER"
+        winning = lower
         confidence = lower / decided * 100.0
-    if confidence < _MIN_CONFIDENCE:
+    # Original mixed-signal guard (confidence within 5 points of 50/50).
+    if confidence < _TIE_FLOOR:
+        return (None, confidence)
+    # Hardening: require a strong supermajority — at least 5 of the 6
+    # indicators must vote the winning direction. A simple majority (e.g.
+    # 4-2) is not enough; correlated momentum indicators agree too easily.
+    if winning < _MIN_AGREEMENT:
         return (None, confidence)
     return (direction, confidence)
 
@@ -253,6 +268,8 @@ def predict_direction(
     * yfinance data is unavailable or insufficient
     * all six indicators voted neutral
     * the winning side's confidence is within the tie tolerance of 50%
+    * fewer than 5 of 6 indicators agree (set in ``tally_votes``)
+    * the winning side's confidence is below ``MIN_CONFIDENCE`` (70)
 
     Otherwise returns a fully-tagged :class:`Prediction` ready to insert.
     Regime + VIX are tagged at call time; their fetch errors fall back to
@@ -265,6 +282,11 @@ def predict_direction(
     votes = _gather_votes(df)
     direction, confidence = tally_votes(votes)
     if direction is None:
+        return None
+    # Confidence floor — a second, independent gate on top of the 5-of-6
+    # agreement check. Skipping is honest; a low-confidence guess on noisy
+    # 15-min crypto just poisons the accuracy stats.
+    if confidence < MIN_CONFIDENCE:
         return None
 
     entry_price = float(df["Close"].iloc[-1])

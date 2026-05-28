@@ -286,6 +286,15 @@ points of 50% (i.e. < 55%), `predict_direction` returns `None` — the
 engine **does not guess** when signals are mixed. Skipping is honest;
 guessing poisons the accuracy stats.
 
+**Calibration gates (hardening pass).** A prediction now fires only
+when **at least 5 of the 6 indicators agree** AND the winning-side
+confidence is **>= 70%** (`MIN_CONFIDENCE`). The 6 indicators are all
+momentum-based and correlated, so a simple majority overstates real
+edge. 15-minute crypto direction is inherently low-accuracy/noisy —
+these gates favor *fewer, higher-conviction* predictions over volume.
+The gates tighten WHEN it fires, not HOW it scores; the indicators and
+their math are unchanged.
+
 Each fired prediction is tagged with the current regime and VIX at
 creation time, so later you can break accuracy down by macro context
 (`report predictions --by-regime` / `--by-vix`).
@@ -306,6 +315,15 @@ Three independent gates, all checked at the top of each prediction sweep:
 A single skipped tick is silent; the scanner logs the skip reason
 (`disabled` / `outside_window` / `paused`) so you can verify the
 gate is doing what you think.
+
+**Railway vs local control.** Settings live in SQLite, and the Railway
+DB is separate from your local DB — so `predictions enable` on your
+laptop does nothing to the deployed instance. Railway is controlled
+via the **`PREDICTIONS_ENABLED` env var** (set in the Railway UI):
+`true` forces the master switch on at startup, `false` forces it off,
+and unset/any-other-value leaves whatever is in the DB. Local stays
+CLI-controlled. The override is applied in `_seed_prediction_defaults`
+on every boot.
 
 ### Resolution
 
@@ -400,6 +418,11 @@ sharper question than the swing-trade win-rate can answer.
   remain set in Railway UI; the secrets layer in 1.1b will read them
   transparently
 - TZ=America/New_York is set in Railway for market hours detection
+- `PREDICTIONS_ENABLED` (optional) toggles the prediction engine on the
+  deployed instance: `true` / `false` overrides the DB setting at boot.
+  Unset leaves the DB value. This is the ONLY way to control predictions
+  on Railway since its DB is separate from local. See "Prediction
+  Engine -> Off-switch architecture".
 
 ## Deferred cleanup
 
