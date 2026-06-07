@@ -44,8 +44,8 @@ from trading_bot.secrets import get_required
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Stock watchlist — backtested, Tier 1 only
-STOCK_WATCHLIST = ["BLK", "GOOGL", "META", "GS", "NOW", "AMZN", "LLY", "TSLA"]
-TREND_CONT_TICKERS = ["JPM", "GS", "GOOGL", "NOW", "SPY", "BLK", "AMZN"]
+STOCK_WATCHLIST = ["BLK", "GOOGL", "META", "GS", "NOW", "AMZN", "LLY", "TSLA","APPL", "MSFT", "NVDA", "TJX", "LRCX", "AMAT", "KLAC", "V", "XOM", "NFLX", "MA", "JNJ", "BRK.B", "GOOG", "ROST", "ANET", "MRK", "COST", "LIN", "FTNT", "WMT", "MU", "AMD", "AVGO", "CSCO", "ABBV", "PG", "HD", "PANW", "QCOM", "GE", "CAT", "KO", "WDC", "GEV", "GILD", "ETN", "TXN", "STX", "UTHR", "CRS", "MEDP", "CSL", "HEI", "TMO", "FFIV", "WMB", "MO", "VZ", "TMUS"]
+TREND_CONT_TICKERS = ["JPM", "GS", "GOOGL", "NOW", "SPY", "BLK", "AMZN","APPL", "MSFT", "NVDA", "TJX", "LRCX", "AMAT", "KLAC", "V", "XOM", "NFLX", "MA", "JNJ", "BRK.B", "GOOG", "ROST", "ANET", "MRK", "COST", "LIN", "FTNT", "WMT", "MU", "AMD", "AVGO", "CSCO", "ABBV", "PG", "HD", "PANW", "QCOM", "GE", "CAT", "KO", "WDC", "GEV", "GILD", "ETN", "TXN", "STX", "UTHR", "CRS", "MEDP", "CSL", "HEI", "TMO", "FFIV", "WMB", "MO", "VZ", "TMUS"]
 NEWS_WATCHLIST = ["BLK", "GOOGL", "META", "GS", "NOW", "AMZN", "LLY", "TSLA", "PLTR", "NVDA", "AAPL"]
 
 # Crypto watchlist — backtested on hourly candles
