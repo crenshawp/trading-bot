@@ -22,11 +22,13 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import cast
 
 import pandas as pd
 
 import backtest
+from trading_bot import db
 from trading_bot.discovery_universe import effective_universe
 
 # Small sleep between yfinance-backed backtests to avoid rate limiting.
@@ -252,3 +254,88 @@ def rank_qualifiers(scores: Sequence[TickerScore]) -> list[TickerScore]:
     """Return the qualifying scores ranked by expectancy, descending."""
     quals = [s for s in scores if s.qualified]
     return sorted(quals, key=lambda s: s.expectancy or 0.0, reverse=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Auto-promotion + persistence (Section 5)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class DiscoveryRun:
+    """The full result of one on-demand discovery sweep.
+
+    ``scores`` is every successfully-backtested ticker; ``failures`` every one
+    that could not be scored; ``promoted`` the tickers newly inserted into the
+    live watchlist this run (empty when ``promote=False`` or all qualifiers
+    were already present).
+    """
+
+    run_timestamp: datetime
+    scores: list[TickerScore]
+    failures: list[DiscoveryFailure]
+    promoted: list[str]
+
+    @property
+    def scanned(self) -> int:
+        return len(self.scores) + len(self.failures)
+
+    @property
+    def succeeded(self) -> int:
+        return len(self.scores)
+
+    @property
+    def failed(self) -> int:
+        return len(self.failures)
+
+    @property
+    def qualifiers(self) -> list[TickerScore]:
+        return rank_qualifiers(self.scores)
+
+
+def _score_to_row(score: TickerScore) -> dict[str, object]:
+    """Flatten a TickerScore into the dict shape db.insert_discovery_results
+    expects. Kept here so db.py stays decoupled from the discovery dataclass."""
+    return {
+        "ticker": score.ticker,
+        "win_rate": score.win_rate,
+        "trade_count": score.trade_count,
+        "avg_return_pct": score.avg_return_pct,
+        "expectancy": score.expectancy,
+        "qualified": score.qualified,
+    }
+
+
+def run_discovery(
+    *,
+    promote: bool = True,
+    tickers: Sequence[str] | None = None,
+    throttle_seconds: float = _THROTTLE_SECONDS,
+) -> DiscoveryRun:
+    """Full sweep: backtest -> score -> persist -> (optionally) auto-promote.
+
+    Persists every scored ticker to ``discovery_results`` regardless of
+    outcome (full audit trail). When ``promote`` is True, inserts qualifiers
+    not already on the watchlist into ``active_watchlist`` (source='discovery'),
+    skipping duplicates. Returns the full run for the caller to report on.
+    """
+    run_ts = datetime.now(UTC)
+    result = run_backtests(tickers=tickers, throttle_seconds=throttle_seconds)
+    scores = score_run(result)
+
+    db.insert_discovery_results(
+        run_ts.isoformat(), [_score_to_row(s) for s in scores]
+    )
+
+    promoted: list[str] = []
+    if promote:
+        for score in rank_qualifiers(scores):
+            if db.add_to_active_watchlist(score.ticker, "discovery"):
+                promoted.append(score.ticker)
+
+    return DiscoveryRun(
+        run_timestamp=run_ts,
+        scores=scores,
+        failures=result.failures,
+        promoted=promoted,
+    )

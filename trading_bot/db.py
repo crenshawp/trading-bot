@@ -8,7 +8,7 @@ relying on sqlite3's deprecated defaults).
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -28,12 +28,13 @@ from trading_bot.models import (
     Trade,
 )
 
+# Version 7 (Phase 3.1) — adds the discovery_results table (per-run scores).
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -158,6 +159,24 @@ CREATE TABLE IF NOT EXISTS active_watchlist (
     source TEXT NOT NULL,
     added_at TEXT NOT NULL
 );
+
+-- Phase 3.1: full audit trail of every discovery sweep. One row per scored
+-- ticker per run, qualified or not, so we can see what discovery found and
+-- why. win_rate/avg_return_pct/expectancy are NULL when a ticker had no
+-- decided backtest trades.
+CREATE TABLE IF NOT EXISTS discovery_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_timestamp TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    win_rate REAL,
+    trade_count INTEGER NOT NULL,
+    avg_return_pct REAL,
+    expectancy REAL,
+    qualified INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_discovery_results_run
+    ON discovery_results (run_timestamp);
 """
 
 # Whitelist for update_trade — never interpolate user input into SQL column names.
@@ -175,7 +194,7 @@ _TRADE_UPDATABLE_FIELDS: frozenset[str] = frozenset(
 _TABLE_NAMES: tuple[str, ...] = (
     "signals", "trades", "daily_performance",
     "regime_snapshots", "vix_snapshots",
-    "predictions", "settings", "active_watchlist",
+    "predictions", "settings", "active_watchlist", "discovery_results",
 )
 
 # Whitelist for update_prediction — resolution flow + Phase 2.3 context backfill.
@@ -268,6 +287,15 @@ def _migrate_to_v6(_conn: sqlite3.Connection) -> None:
     return None
 
 
+def _migrate_to_v7(_conn: sqlite3.Connection) -> None:
+    """Phase 3.1 migration step.
+
+    Nothing to ALTER — the new ``discovery_results`` table is created by the
+    ``CREATE TABLE IF NOT EXISTS`` block above. Documented hook only.
+    """
+    return None
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -278,6 +306,7 @@ def init_db() -> None:
         _migrate_to_v4(conn)
         _migrate_to_v5(conn)
         _migrate_to_v6(conn)
+        _migrate_to_v7(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -1201,3 +1230,94 @@ def get_active_watchlist() -> list[str]:
     finally:
         conn.close()
     return [str(r["ticker"]) for r in rows]
+
+
+def add_to_active_watchlist(ticker: str, source: str) -> bool:
+    """Insert ``ticker`` tagged with ``source`` if not already present.
+
+    Returns ``True`` if newly added, ``False`` if it was already on the
+    watchlist (no duplicate inserted). Used by discovery auto-promotion with
+    ``source='discovery'``.
+    """
+    conn = get_connection()
+    try:
+        existing = conn.execute(
+            "SELECT 1 FROM active_watchlist WHERE ticker = ?", (ticker,)
+        ).fetchone()
+        if existing is not None:
+            return False
+        conn.execute(
+            "INSERT INTO active_watchlist (ticker, source, added_at) "
+            "VALUES (?, ?, ?)",
+            (ticker, source, datetime.now(UTC).isoformat()),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+# ---- discovery results (Phase 3.1) ----
+
+
+def insert_discovery_results(
+    run_timestamp: str, rows: Sequence[Mapping[str, Any]]
+) -> int:
+    """Persist one discovery sweep's per-ticker scores. Returns rows inserted.
+
+    Each row mapping must carry ``ticker``, ``trade_count``, ``win_rate``,
+    ``avg_return_pct``, ``expectancy``, and ``qualified``. The nullable score
+    fields may be ``None`` (a ticker with no decided trades).
+    """
+    sql = """
+        INSERT INTO discovery_results (
+            run_timestamp, ticker, win_rate, trade_count,
+            avg_return_pct, expectancy, qualified
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    """
+    conn = get_connection()
+    try:
+        count = 0
+        for row in rows:
+            conn.execute(
+                sql,
+                (
+                    run_timestamp,
+                    str(row["ticker"]),
+                    row["win_rate"],
+                    int(row["trade_count"]),
+                    row["avg_return_pct"],
+                    row["expectancy"],
+                    1 if row["qualified"] else 0,
+                ),
+            )
+            count += 1
+        conn.commit()
+        return count
+    finally:
+        conn.close()
+
+
+def get_discovery_results(limit: int = 100) -> list[dict[str, Any]]:
+    """Return recent discovery_results rows, newest run first."""
+    sql = (
+        "SELECT * FROM discovery_results "
+        "ORDER BY run_timestamp DESC, expectancy DESC LIMIT ?"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, (limit,)).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "run_timestamp": str(r["run_timestamp"]),
+            "ticker": str(r["ticker"]),
+            "win_rate": r["win_rate"],
+            "trade_count": int(r["trade_count"]),
+            "avg_return_pct": r["avg_return_pct"],
+            "expectancy": r["expectancy"],
+            "qualified": bool(r["qualified"]),
+        }
+        for r in rows
+    ]
