@@ -32,6 +32,13 @@ from trading_bot.discovery_universe import effective_universe
 # Small sleep between yfinance-backed backtests to avoid rate limiting.
 _THROTTLE_SECONDS = 1.0
 
+# Permissive promotion gate (Phase 3.1). A ticker qualifies if it has at least
+# this many decided backtest trades AND positive expectancy. No win-rate floor:
+# the watchlist is intentionally permissive at this stage — this filters only
+# money-losers and tiny-sample noise. Phase 3.3 (kickout) prunes marginal names
+# later on live data.
+_MIN_TRADE_COUNT = 10
+
 # backtest.run_backtest is untyped (backtest.py is exempt from strict mypy).
 # Cast to a typed callable so this strict module can call it without a
 # no-untyped-call error. Behaviour is unchanged — we reuse it verbatim.
@@ -128,3 +135,120 @@ def run_backtests(
         successes[ticker] = df
 
     return BacktestRunResult(successes=successes, failures=failures)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Scoring + permissive promotion gate (Section 4)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class TickerScore:
+    """Per-ticker backtest score.
+
+    ``win_rate`` is 0-100. ``avg_return_pct`` and ``expectancy`` are in
+    percentage points per trade. All three are ``None`` when a ticker had no
+    *decided* trades (every signal expired without hitting TP/SL). ``qualified``
+    is the permissive gate: ``trade_count >= 10 AND expectancy > 0``.
+    """
+
+    ticker: str
+    win_rate: float | None
+    trade_count: int
+    avg_return_pct: float | None
+    expectancy: float | None
+    qualified: bool
+
+
+def _per_trade_return(
+    direction: str,
+    price: float,
+    take_profit: float,
+    stop_loss: float,
+    outcome: str,
+) -> float | None:
+    """Signed % return for one decided trade; ``None`` for UNKNOWN (no exit).
+
+    Reconstructs the exit from the backtest's TP/SL levels: a WIN exits at
+    ``take_profit``, a LOSS at ``stop_loss``. Positive for wins, negative for
+    losses, for both CALL and PUT.
+    """
+    if outcome == "WIN":
+        exit_price = take_profit
+    elif outcome == "LOSS":
+        exit_price = stop_loss
+    else:
+        return None
+    if price == 0:
+        return None
+    if direction.upper() == "CALL":
+        return float((exit_price - price) / price * 100.0)
+    return float((price - exit_price) / price * 100.0)
+
+
+def score_backtest(ticker: str, df: pd.DataFrame) -> TickerScore:
+    """Compute win rate, trade count, avg return, and expectancy for a ticker.
+
+    Only *decided* trades (outcome WIN/LOSS) count — UNKNOWN (no TP/SL hit in
+    the forward window) are excluded, matching the backtest's own summary.
+    expectancy = (win_frac * avg_win) - (loss_frac * avg_loss), where avg_win
+    and avg_loss are average magnitudes in percentage points.
+    """
+    win_returns: list[float] = []
+    loss_returns: list[float] = []
+    for row in df.itertuples(index=False):
+        ret = _per_trade_return(
+            str(row.direction),
+            float(row.price),
+            float(row.take_profit),
+            float(row.stop_loss),
+            str(row.outcome),
+        )
+        if ret is None:
+            continue
+        if str(row.outcome) == "WIN":
+            win_returns.append(ret)
+        else:
+            loss_returns.append(ret)
+
+    wins = len(win_returns)
+    losses = len(loss_returns)
+    trade_count = wins + losses
+    if trade_count == 0:
+        return TickerScore(
+            ticker=ticker,
+            win_rate=None,
+            trade_count=0,
+            avg_return_pct=None,
+            expectancy=None,
+            qualified=False,
+        )
+
+    win_frac = wins / trade_count
+    loss_frac = losses / trade_count
+    avg_win = sum(win_returns) / wins if wins else 0.0
+    avg_loss = sum(-r for r in loss_returns) / losses if losses else 0.0
+    expectancy = win_frac * avg_win - loss_frac * avg_loss
+    avg_return_pct = sum(win_returns + loss_returns) / trade_count
+    win_rate = win_frac * 100.0
+    qualified = trade_count >= _MIN_TRADE_COUNT and expectancy > 0
+
+    return TickerScore(
+        ticker=ticker,
+        win_rate=win_rate,
+        trade_count=trade_count,
+        avg_return_pct=avg_return_pct,
+        expectancy=expectancy,
+        qualified=qualified,
+    )
+
+
+def score_run(result: BacktestRunResult) -> list[TickerScore]:
+    """Score every successfully-backtested ticker from a sweep."""
+    return [score_backtest(ticker, df) for ticker, df in result.successes.items()]
+
+
+def rank_qualifiers(scores: Sequence[TickerScore]) -> list[TickerScore]:
+    """Return the qualifying scores ranked by expectancy, descending."""
+    quals = [s for s in scores if s.qualified]
+    return sorted(quals, key=lambda s: s.expectancy or 0.0, reverse=True)
