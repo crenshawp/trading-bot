@@ -8,6 +8,7 @@ forward testing — testing it now would be brittle and out of scope
 (spec §6: "Do not test the signal detection logic itself in this phase").
 """
 
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -272,3 +273,36 @@ def test_dry_run_send_notification_skips_network(
     assert "BTC-USD" in out
     # Should still have written to the DB
     assert len(db.get_signals()) == 1
+
+
+# ─────────────────── _active_stock_watchlist (Phase 3.1) ───────────────────
+
+
+def test_active_watchlist_empty_falls_back_to_seed(
+    tmp_db: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An empty active_watchlist must fall back to the hardcoded seed list
+    with a logged warning — never silently scan an empty watchlist."""
+    assert db.get_active_watchlist() == []  # fresh DB, nothing seeded
+    result = scanner._active_stock_watchlist()
+    assert result == list(scanner.STOCK_WATCHLIST)
+    assert "empty" in capsys.readouterr().err
+
+
+def test_active_watchlist_seeded_is_used(tmp_db: Path) -> None:
+    db.seed_active_watchlist(["AAA", "BBB"])
+    assert scanner._active_stock_watchlist() == ["AAA", "BBB"]
+
+
+def test_active_watchlist_unreadable_falls_back_to_seed(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def boom() -> list[str]:
+        raise sqlite3.OperationalError("no such table: active_watchlist")
+
+    monkeypatch.setattr(db, "get_active_watchlist", boom)
+    result = scanner._active_stock_watchlist()
+    assert result == list(scanner.STOCK_WATCHLIST)
+    assert "unreadable" in capsys.readouterr().err
