@@ -8,6 +8,7 @@ from datetime import date
 from trading_bot import (
     context,
     db,
+    discovery,
     outcomes,
     performance,
     predictions,
@@ -684,6 +685,69 @@ def _maybe_min_context(args: object) -> int:
     return int(getattr(args, "min_context", 0) or 0)
 
 
+# ---- discovery CLI (Phase 3.1) ----
+
+
+def _fmt_signed(value: float | None, places: int) -> str:
+    """Signed float like '+1.23', or '-' for None. Used by discovery tables."""
+    if value is None:
+        return "-"
+    sign = "+" if value >= 0 else ""
+    return f"{sign}{value:.{places}f}"
+
+
+def cmd_discovery_scan(*, promote: bool, throttle_seconds: float) -> None:
+    run = discovery.run_discovery(
+        promote=promote, throttle_seconds=throttle_seconds
+    )
+
+    print("DISCOVERY SCAN")
+    print("-" * 38)
+    print(f"Scanned:   {run.scanned}")
+    print(f"Succeeded: {run.succeeded}")
+    print(f"Failed:    {run.failed}")
+    print()
+
+    quals = run.qualifiers
+    print(f"Qualifiers ({len(quals)}) — trade_count >= 10 AND expectancy > 0:")
+    if not quals:
+        print("  (none)")
+    else:
+        print(
+            f"  {'Ticker':<8} {'Trades':>6}  {'Win rate':>8}  "
+            f"{'Avg ret':>8}  {'Expectancy':>10}"
+        )
+        for s in quals:
+            wr = "    -" if s.win_rate is None else f"{s.win_rate:.1f}%"
+            print(
+                f"  {s.ticker:<8} {s.trade_count:>6}  {wr:>8}  "
+                f"{_fmt_signed(s.avg_return_pct, 2):>8}  "
+                f"{_fmt_signed(s.expectancy, 3):>10}"
+            )
+    print()
+
+    if not promote:
+        print("Promotion skipped (--no-promote)")
+    elif run.promoted:
+        print(
+            f"Newly promoted to watchlist ({len(run.promoted)}): "
+            f"{', '.join(run.promoted)}"
+        )
+    else:
+        print(
+            "Newly promoted to watchlist: "
+            "(none — all qualifiers already present)"
+        )
+    print()
+
+    print(f"Failures ({run.failed}):")
+    if not run.failures:
+        print("  (none)")
+    else:
+        for f in run.failures:
+            print(f"  {f.ticker:<8} {f.reason}")
+
+
 # ---- predictions CLI (Phase 2.2b) ----
 
 # Seeded defaults — duplicated from scanner._PRED_DEFAULTS so the CLI can
@@ -1035,6 +1099,21 @@ def main() -> None:
                          help="How many recent overlapping snapshots (default 30)")
     context_sub.add_parser("backfill")
 
+    # discovery (Phase 3.1)
+    discovery_parser = sub.add_parser("discovery")
+    discovery_sub = discovery_parser.add_subparsers(
+        dest="discovery_cmd", required=True
+    )
+    scan_p = discovery_sub.add_parser("scan")
+    scan_p.add_argument(
+        "--no-promote", action="store_true",
+        help="Score and persist only; do not modify the live watchlist",
+    )
+    scan_p.add_argument(
+        "--throttle", type=float, default=discovery._THROTTLE_SECONDS,
+        help="Seconds to sleep between yfinance calls (default 1.0)",
+    )
+
     # predictions (Phase 2.2b)
     pred_parser = sub.add_parser("predictions")
     pred_sub = pred_parser.add_subparsers(dest="predictions_cmd", required=True)
@@ -1150,6 +1229,12 @@ def main() -> None:
             cmd_context_history(args.days)
         elif args.context_cmd == "backfill":
             cmd_context_backfill()
+    elif args.command == "discovery":
+        if args.discovery_cmd == "scan":
+            cmd_discovery_scan(
+                promote=not args.no_promote,
+                throttle_seconds=args.throttle,
+            )
     elif args.command == "predictions":
         if args.predictions_cmd == "enable":
             cmd_predictions_enable()
