@@ -66,6 +66,32 @@ NEWSAPI_KEY:         str = ""
 DRY_RUN: bool = False
 
 
+def _active_stock_watchlist() -> list[str]:
+    """Return the live stock watchlist from the database (Phase 3.1).
+
+    The scanner reads its watchlist from the ``active_watchlist`` table so
+    discovery can auto-promote tickers into the running bot. CRITICAL
+    FALLBACK: if the table is empty, missing, or unreadable, fall back to the
+    hardcoded ``STOCK_WATCHLIST`` seed and log a warning — the bot must never
+    silently scan an empty watchlist.
+    """
+    try:
+        active = db.get_active_watchlist()
+    except Exception as exc:  # noqa: BLE001 - any DB failure must fall back, not crash
+        print(
+            f"  active_watchlist unreadable, falling back to seed list: {exc}",
+            file=sys.stderr,
+        )
+        return list(STOCK_WATCHLIST)
+    if not active:
+        print(
+            "  active_watchlist empty, falling back to seed list",
+            file=sys.stderr,
+        )
+        return list(STOCK_WATCHLIST)
+    return active
+
+
 def _load_secrets() -> None:
     """Populate module-level credential constants from the secrets layer.
 
@@ -1251,7 +1277,7 @@ def scan_stocks():
         return
 
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scanning stocks...")
-    for ticker in STOCK_WATCHLIST:
+    for ticker in _active_stock_watchlist():
         try:
             df = get_stock_data(ticker)
             if df is None:
@@ -1305,6 +1331,10 @@ def main() -> None:
     DRY_RUN = bool(args.dry_run)
 
     db.init_db()         # idempotent — creates schema on first deploy
+    # Phase 3.1: seed the DB-driven watchlist from the hardcoded seed list on
+    # first run. Idempotent — a no-op once the table has any rows, so it never
+    # clobbers discovery promotions.
+    db.seed_active_watchlist(STOCK_WATCHLIST)
     _load_secrets()      # fail fast if any required credential is missing
 
     if DRY_RUN:
@@ -1316,7 +1346,7 @@ def main() -> None:
         return
 
     print("Trading Bot Started.")
-    print(f"Stocks:  {STOCK_WATCHLIST}")
+    print(f"Stocks:  {_active_stock_watchlist()}")
     print(f"Crypto:  {CRYPTO_WATCHLIST}")
     print("Stock scan: once daily at market open")
     print("Crypto scan: every hour 24/7")

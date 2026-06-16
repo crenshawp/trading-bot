@@ -8,6 +8,7 @@ relying on sqlite3's deprecated defaults).
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -27,11 +28,12 @@ from trading_bot.models import (
     Trade,
 )
 
+# Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -146,6 +148,16 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- Phase 3.1: the live stock watchlist the scanner reads at runtime. Seeded
+-- on first run from the hardcoded STOCK_WATCHLIST (source='seed'); discovery
+-- auto-promotes qualifiers here (source='discovery'). The hardcoded literal
+-- stays in code as the seed + fallback source.
+CREATE TABLE IF NOT EXISTS active_watchlist (
+    ticker TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    added_at TEXT NOT NULL
+);
 """
 
 # Whitelist for update_trade — never interpolate user input into SQL column names.
@@ -163,7 +175,7 @@ _TRADE_UPDATABLE_FIELDS: frozenset[str] = frozenset(
 _TABLE_NAMES: tuple[str, ...] = (
     "signals", "trades", "daily_performance",
     "regime_snapshots", "vix_snapshots",
-    "predictions", "settings",
+    "predictions", "settings", "active_watchlist",
 )
 
 # Whitelist for update_prediction — resolution flow + Phase 2.3 context backfill.
@@ -246,6 +258,16 @@ def _migrate_to_v5(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE predictions ADD COLUMN context_score INTEGER")
 
 
+def _migrate_to_v6(_conn: sqlite3.Connection) -> None:
+    """Phase 3.1 migration step.
+
+    Nothing to ALTER — the new ``active_watchlist`` table is created by the
+    ``CREATE TABLE IF NOT EXISTS`` block above. This step exists as the
+    documented hook for future column adds without re-numbering the sequence.
+    """
+    return None
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -255,6 +277,7 @@ def init_db() -> None:
         _migrate_to_v3(conn)
         _migrate_to_v4(conn)
         _migrate_to_v5(conn)
+        _migrate_to_v6(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -1123,3 +1146,58 @@ def get_table_counts() -> dict[str, int]:
     finally:
         conn.close()
     return counts
+
+
+# ---- active watchlist (Phase 3.1) ----
+
+
+def seed_active_watchlist(tickers: Sequence[str]) -> int:
+    """Seed ``active_watchlist`` from ``tickers`` IF the table is empty.
+
+    First-run bootstrap: copies the hardcoded seed list into the DB tagged
+    ``source='seed'``. Idempotent — once any row exists (seed or discovery)
+    this is a no-op returning 0, so it never clobbers promotions or a
+    deliberately-pruned watchlist. Returns the number of tickers inserted.
+    """
+    conn = get_connection()
+    try:
+        existing = conn.execute(
+            "SELECT COUNT(*) AS c FROM active_watchlist"
+        ).fetchone()
+        if existing is not None and int(existing["c"]) > 0:
+            return 0
+        now_iso = datetime.now(UTC).isoformat()
+        inserted = 0
+        seen: set[str] = set()
+        for ticker in tickers:
+            if ticker in seen:
+                continue
+            seen.add(ticker)
+            conn.execute(
+                "INSERT OR IGNORE INTO active_watchlist (ticker, source, added_at) "
+                "VALUES (?, ?, ?)",
+                (ticker, "seed", now_iso),
+            )
+            inserted += 1
+        conn.commit()
+        return inserted
+    finally:
+        conn.close()
+
+
+def get_active_watchlist() -> list[str]:
+    """Return the live watchlist tickers, oldest-added first.
+
+    Empty list if the table has no rows. Propagates
+    ``sqlite3.OperationalError`` if the table is missing/unreadable — the
+    scanner catches that and falls back to its hardcoded seed list.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT ticker FROM active_watchlist "
+            "ORDER BY added_at ASC, ticker ASC"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [str(r["ticker"]) for r in rows]
