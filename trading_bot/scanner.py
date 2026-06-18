@@ -36,6 +36,7 @@ from trading_bot import (
     settings,
     vix,
 )
+from trading_bot.discovery_universe import SHADOW_UNIVERSE
 from trading_bot.models import Signal, Trade
 from trading_bot.secrets import get_required
 
@@ -50,6 +51,10 @@ NEWS_WATCHLIST = ["BLK", "GOOGL", "META", "GS", "NOW", "AMZN", "LLY", "TSLA", "P
 
 # Crypto watchlist — backtested on hourly candles
 CRYPTO_WATCHLIST = ["BTC-USD", "BNB-USD", "ETH-USD"]
+
+# Phase 3.1-LIVE: seconds to sleep between shadow-universe yfinance fetches.
+# The shadow scan touches ~100 names; throttling keeps us under rate limits.
+_SHADOW_THROTTLE_SECONDS = 0.5
 
 NOTIFY_METHOD    = "pushover"
 
@@ -1203,14 +1208,30 @@ def detect_crypto_signals(ticker, df):
 # NOTIFICATIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def send_notification(signal):
+def send_notification(signal, *, track_mode="active", alert=True):
+    """Persist the signal/trade and (unless suppressed) fire the alert.
+
+    Phase 3.1-LIVE: ``track_mode`` tags the opened trade ('active' or
+    'shadow') and ``alert=False`` suppresses the Discord/Pushover push for
+    shadow-universe signals. The DB write ALWAYS happens — shadow trades must
+    accumulate so the resolver can settle them — only the notification is
+    gated. Each suppressed alert is logged so the shadow layer is observable.
+    """
     try:
-        log_signal(signal)
+        log_signal(signal, track_mode=track_mode)
     except Exception as e:
         # DB write failure for the signal/trade row. Route to stderr so a
         # silently-failing log doesn't hide that a fired alert was never
         # persisted (it would vanish from all the reporting downstream).
         print(f"  Log error: {e}", file=sys.stderr)
+
+    if not alert:
+        print(
+            f"  [shadow] alert suppressed for {signal['ticker']} "
+            f"({signal['setup']} {signal['direction']}) — trade opened "
+            f"track_mode={track_mode}"
+        )
+        return
 
     msg = (
         f"🚨 TRADE ALERT — {signal['ticker']}\n"
@@ -1298,6 +1319,87 @@ def scan_stocks():
             print(f"  {ticker}: Error — {e}")
 
 
+def scan_shadow():
+    """Shadow-scan the SHADOW_UNIVERSE names that aren't on the active watchlist.
+
+    Runs the IDENTICAL stock signal pipeline (same indicators, same earnings/
+    news/macro/VIX context as the active scan) but opens trades tagged
+    ``track_mode='shadow'`` and SUPPRESSES the Discord/Pushover alert. The
+    resolver settles these like any other open trade; the live-shadow
+    evaluator (Phase 3.1-LIVE) later promotes names whose resolved shadow
+    signals show the EMA21 Pullback working recently.
+
+    BEST-EFFORT ISOLATION: a shadow ticker is on a disjoint set from the
+    active watchlist, every per-ticker failure is caught/logged/skipped, and
+    the whole sweep is gated on market hours just like ``scan_stocks``. This
+    function is invoked through ``_run_shadow_scan`` which additionally
+    guarantees no exception ever escapes to the active scan or scheduler.
+    """
+    if not is_market_open():
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Market closed — skipping shadow scan")
+        return
+
+    # Active watchlist takes precedence: a name already traded live is never
+    # also shadow-tracked. Fall back to scanning the full shadow universe if
+    # the watchlist is somehow unreadable (shadow must not silently no-op).
+    try:
+        active = set(_active_stock_watchlist())
+    except Exception as exc:  # noqa: BLE001 - never let this break anything
+        print(
+            f"  shadow: active watchlist unreadable, shadowing full universe: {exc}",
+            file=sys.stderr,
+        )
+        active = set()
+
+    shadow_tickers = [t for t in SHADOW_UNIVERSE if t not in active]
+    print(
+        f"\n[{datetime.now().strftime('%H:%M:%S')}] Shadow-scanning "
+        f"{len(shadow_tickers)} tickers (alerts suppressed)..."
+    )
+
+    scanned = 0
+    signals_found = 0
+    failed = 0
+    for idx, ticker in enumerate(shadow_tickers):
+        if idx > 0 and _SHADOW_THROTTLE_SECONDS > 0:
+            time.sleep(_SHADOW_THROTTLE_SECONDS)
+        try:
+            df = get_stock_data(ticker)
+            if df is None:
+                print(f"  shadow {ticker}: no data — skipped", file=sys.stderr)
+                failed += 1
+                continue
+            df = add_stock_indicators(df)
+            signals = detect_stock_signals(ticker, df)
+            scanned += 1
+            for s in signals:
+                signals_found += 1
+                send_notification(s, track_mode="shadow", alert=False)
+        except Exception as exc:  # noqa: BLE001 - one ticker must never kill the sweep
+            print(f"  shadow {ticker}: error — {exc}", file=sys.stderr)
+            failed += 1
+
+    print(
+        f"  shadow scan summary: scanned={scanned} signals={signals_found} "
+        f"failed={failed} (of {len(shadow_tickers)} shadow tickers)"
+    )
+
+
+def _run_shadow_scan() -> None:
+    """Scheduler/startup wrapper — never lets a shadow failure escape.
+
+    The active watchlist scan and the resolver are sacred; a broken shadow
+    layer must degrade silently (with a logged reason) rather than take them
+    down. ``scan_shadow`` already isolates per-ticker errors; this is the
+    outer guard for anything systemic (import, watchlist read, scheduler).
+    """
+    try:
+        scan_shadow()
+    except Exception as exc:
+        import sys
+        print(f"  shadow scan error: {exc}", file=sys.stderr)
+
+
 def scan_crypto():
     """Runs every hour, 24/7 — hourly candles, short term trades"""
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scanning crypto...")
@@ -1358,11 +1460,19 @@ def main() -> None:
 
     # Run both immediately on start
     scan_stocks()
+    # Shadow scan AFTER the active scan so active alerting/logging is never
+    # delayed or blocked by the 100-name shadow load. Wrapped so it can never
+    # take down the active pipeline.
+    _run_shadow_scan()
     scan_crypto()
     send_morning_report()
 
     # Stock scan — once per day at 9:31am EST
     schedule.every().day.at("09:31").do(scan_stocks)
+
+    # Shadow scan at 09:33 EST — two minutes after the active stock scan so
+    # active trades/alerts land first. Phase 3.1-LIVE.
+    schedule.every().day.at("09:33").do(_run_shadow_scan)
 
     # Crypto scan — every hour
     schedule.every(1).hours.do(scan_crypto)
