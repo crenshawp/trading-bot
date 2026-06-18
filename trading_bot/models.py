@@ -42,6 +42,7 @@ class Trade:
     vix_level: float | None = None    # close-of-day VIX at fire time (Phase 2.2)
     vix_band: str | None = None       # "low" | "elevated" | "high" | "extreme" | "unknown"
     context_score: int | None = None  # 0-5 composite (Phase 2.3); NULL = un-backfilled
+    track_mode: str = "active"        # "active" | "shadow" (Phase 3.1-LIVE)
     id: int | None = None
 
 
@@ -79,6 +80,10 @@ VALID_PREDICTION_OUTCOMES: frozenset[str] = frozenset(
     {"correct", "incorrect", "push"}
 )
 VALID_PREDICTION_DIRECTIONS: frozenset[str] = frozenset({"HIGHER", "LOWER"})
+# Phase 3.1-LIVE: how a trade is tracked. 'active' trades alert and feed the
+# headline reports; 'shadow' trades are opened silently on the shadow universe
+# (no alert) and drive live-shadow promotion. Existing rows backfill to 'active'.
+VALID_TRACK_MODES: frozenset[str] = frozenset({"active", "shadow"})
 
 
 @dataclass(frozen=True)

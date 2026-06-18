@@ -21,6 +21,7 @@ from trading_bot.models import (
     VALID_OUTCOMES,
     VALID_PREDICTION_DIRECTIONS,
     VALID_PREDICTION_OUTCOMES,
+    VALID_TRACK_MODES,
     VALID_VIX_BANDS,
     DailyPerf,
     Prediction,
@@ -28,13 +29,14 @@ from trading_bot.models import (
     Trade,
 )
 
+# Version 8 (Phase 3.1-LIVE) — adds trades.track_mode (active vs shadow).
 # Version 7 (Phase 3.1) — adds the discovery_results table (per-run scores).
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -296,6 +298,23 @@ def _migrate_to_v7(_conn: sqlite3.Connection) -> None:
     return None
 
 
+def _migrate_to_v8(conn: sqlite3.Connection) -> None:
+    """Phase 3.1-LIVE migration step: add ``trades.track_mode``.
+
+    ``NOT NULL DEFAULT 'active'`` backfills every existing row to 'active'
+    in one shot — there is no pre-3.1-LIVE shadow trade, so 'active' is the
+    correct historical value. The CHECK keeps the column to the two valid
+    modes. Safe on a fresh schema (becomes a no-op once the column exists).
+    """
+    cur = conn.execute("PRAGMA table_info(trades)")
+    cols = {str(row[1]) for row in cur.fetchall()}
+    if "track_mode" not in cols:
+        conn.execute(
+            "ALTER TABLE trades ADD COLUMN track_mode TEXT NOT NULL "
+            "DEFAULT 'active' CHECK (track_mode IN ('active','shadow'))"
+        )
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -307,6 +326,7 @@ def init_db() -> None:
         _migrate_to_v5(conn)
         _migrate_to_v6(conn)
         _migrate_to_v7(conn)
+        _migrate_to_v8(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -513,12 +533,17 @@ def insert_trade(trade: Trade) -> int:
             f"Invalid vix_band '{trade.vix_band}' "
             f"(expected one of {sorted(VALID_VIX_BANDS)})"
         )
+    if trade.track_mode not in VALID_TRACK_MODES:
+        raise ValueError(
+            f"Invalid track_mode '{trade.track_mode}' "
+            f"(expected one of {sorted(VALID_TRACK_MODES)})"
+        )
     sql = """
         INSERT INTO trades (
             signal_id, opened_at, closed_at, exit_price,
             outcome, pnl_pct, pnl_dollars, notes, market_regime,
-            vix_level, vix_band, context_score
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            vix_level, vix_band, context_score, track_mode
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = (
         trade.signal_id,
@@ -533,6 +558,7 @@ def insert_trade(trade: Trade) -> int:
         trade.vix_level,
         trade.vix_band,
         trade.context_score,
+        trade.track_mode,
     )
     conn = get_connection()
     try:
@@ -623,6 +649,7 @@ def _row_to_trade(row: sqlite3.Row) -> Trade:
         vix_level=row["vix_level"] if "vix_level" in keys else None,
         vix_band=row["vix_band"] if "vix_band" in keys else None,
         context_score=row["context_score"] if "context_score" in keys else None,
+        track_mode=row["track_mode"] if "track_mode" in keys else "active",
         id=int(row["id"]),
     )
 
