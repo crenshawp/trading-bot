@@ -125,6 +125,19 @@ def _min_context_filter(
     return (f"AND {table_alias}.context_score >= ?", (min_context,))
 
 
+def _track_mode_filter(
+    track_mode: str | None, table_alias: str = "trades",
+) -> tuple[str, tuple[object, ...]]:
+    """Build the ``AND <alias>.track_mode = ?`` fragment (Phase 3.1-LIVE).
+
+    Returns ``("", ())`` when ``track_mode`` is ``None`` (include both active
+    and shadow). The leading space lets callers append it directly to a WHERE.
+    """
+    if track_mode is None:
+        return ("", ())
+    return (f" AND {table_alias}.track_mode = ?", (track_mode,))
+
+
 def _row_to_stats(label: str, row: sqlite3.Row | None) -> PerfStats:
     """Convert an aggregate row to a ``PerfStats``. Handles all-None edge cases."""
     if row is None or row["total"] in (None, 0):
@@ -160,13 +173,21 @@ def _row_to_stats(label: str, row: sqlite3.Row | None) -> PerfStats:
 # ────────────────────────────────────────────────────────────────────────────
 
 
-def stats_overall(since: datetime | None = None) -> PerfStats:
+def stats_overall(
+    since: datetime | None = None, track_mode: str | None = "active",
+) -> PerfStats:
     """Single aggregated ``PerfStats`` across all closed trades.
 
     If ``since`` is given, only trades with ``closed_at >= since`` count.
+    ``track_mode`` (Phase 3.1-LIVE) defaults to ``'active'`` so shadow trades
+    never pollute the headline win rate; pass ``'shadow'`` for the shadow
+    view or ``None`` to include both. Every other ``stats_*`` slice is
+    active-only by construction — shadow is inspected via this function's
+    shadow mode, ``outcomes status --shadow``, and ``shadow status``.
     """
-    where = "WHERE trades.outcome IN ('win','loss','expired')"
-    params: list[object] = []
+    tm_clause, tm_params = _track_mode_filter(track_mode)
+    where = f"WHERE trades.outcome IN ('win','loss','expired'){tm_clause}"
+    params: list[object] = list(tm_params)
     if since is not None:
         where += " AND trades.closed_at >= ?"
         params.append(since.isoformat())
@@ -210,7 +231,7 @@ def stats_by_signal_type(min_context: int = 0) -> list[PerfStats]:
         f"SELECT signals.signal_type AS slice, {_AGGREGATE_COLS} "
         "FROM trades "
         "JOIN signals ON signals.id = trades.signal_id "
-        f"WHERE trades.outcome IN ('win','loss','expired') {ctx_clause} "
+        f"WHERE trades.track_mode = 'active' AND trades.outcome IN ('win','loss','expired') {ctx_clause} "
         "GROUP BY signals.signal_type"
     )
     conn = db.get_connection()
@@ -232,7 +253,7 @@ def stats_by_ticker(
     is included. ``min_context`` (Phase 2.3) excludes trades whose
     context_score is below ``N``.
     """
-    where = "WHERE trades.outcome IN ('win','loss','expired')"
+    where = "WHERE trades.track_mode = 'active' AND trades.outcome IN ('win','loss','expired')"
     params: list[object] = []
     if asset_class is not None:
         if asset_class not in ("stock", "crypto"):
@@ -267,7 +288,7 @@ def stats_by_asset_class() -> list[PerfStats]:
         f"SELECT signals.asset_class AS slice, {_AGGREGATE_COLS} "
         "FROM trades "
         "JOIN signals ON signals.id = trades.signal_id "
-        "WHERE trades.outcome IN ('win','loss','expired') "
+        "WHERE trades.track_mode = 'active' AND trades.outcome IN ('win','loss','expired') "
         "GROUP BY signals.asset_class "
         "ORDER BY signals.asset_class"
     )
@@ -290,7 +311,7 @@ def stats_by_signal_type_and_ticker(min_trades: int = 3) -> list[PerfStats]:
         f"SELECT signals.signal_type AS sig_type, signals.ticker AS ticker, {_AGGREGATE_COLS} "
         "FROM trades "
         "JOIN signals ON signals.id = trades.signal_id "
-        "WHERE trades.outcome IN ('win','loss','expired') "
+        "WHERE trades.track_mode = 'active' AND trades.outcome IN ('win','loss','expired') "
         "GROUP BY signals.signal_type, signals.ticker "
         "HAVING COUNT(*) >= ?"
     )
@@ -324,7 +345,7 @@ def stats_by_regime(min_context: int = 0) -> list[PerfStats]:
         f"{_AGGREGATE_COLS} "
         "FROM trades "
         "JOIN signals ON signals.id = trades.signal_id "
-        f"WHERE trades.outcome IN ('win','loss','expired') {ctx_clause} "
+        f"WHERE trades.track_mode = 'active' AND trades.outcome IN ('win','loss','expired') {ctx_clause} "
         "GROUP BY COALESCE(trades.market_regime, 'unknown')"
     )
     conn = db.get_connection()
@@ -356,7 +377,7 @@ def _stats_grouped_by_regime(
             f"group_col must be 'signal_type' or 'ticker', got {group_col!r}"
         )
 
-    where = "WHERE trades.outcome IN ('win','loss','expired')"
+    where = "WHERE trades.track_mode = 'active' AND trades.outcome IN ('win','loss','expired')"
     if extra_where:
         where += f" AND {extra_where}"
 
@@ -461,7 +482,7 @@ def stats_by_vix_band(min_context: int = 0) -> list[PerfStats]:
         f"{_AGGREGATE_COLS} "
         "FROM trades "
         "JOIN signals ON signals.id = trades.signal_id "
-        f"WHERE trades.outcome IN ('win','loss','expired') {ctx_clause} "
+        f"WHERE trades.track_mode = 'active' AND trades.outcome IN ('win','loss','expired') {ctx_clause} "
         "GROUP BY COALESCE(trades.vix_band, 'unknown')"
     )
     conn = db.get_connection()
@@ -487,7 +508,7 @@ def _stats_grouped_by_vix(
             f"group_col must be 'signal_type' or 'ticker', got {group_col!r}"
         )
 
-    where = "WHERE trades.outcome IN ('win','loss','expired')"
+    where = "WHERE trades.track_mode = 'active' AND trades.outcome IN ('win','loss','expired')"
     if extra_where:
         where += f" AND {extra_where}"
 
@@ -770,7 +791,7 @@ def stats_by_regime_x_vix(min_context: int = 0) -> list[PerfStats]:
         f"{_AGGREGATE_COLS} "
         "FROM trades "
         "JOIN signals ON signals.id = trades.signal_id "
-        f"WHERE trades.outcome IN ('win','loss','expired') {ctx_clause} "
+        f"WHERE trades.track_mode = 'active' AND trades.outcome IN ('win','loss','expired') {ctx_clause} "
         "GROUP BY COALESCE(trades.market_regime, 'unknown'), "
         "COALESCE(trades.vix_band, 'unknown')"
     )
@@ -804,7 +825,7 @@ def stats_by_context() -> list[PerfStats]:
         f"{_AGGREGATE_COLS} "
         "FROM trades "
         "JOIN signals ON signals.id = trades.signal_id "
-        "WHERE trades.outcome IN ('win','loss','expired') "
+        "WHERE trades.track_mode = 'active' AND trades.outcome IN ('win','loss','expired') "
         "GROUP BY COALESCE(trades.context_score, 0)"
     )
     conn = db.get_connection()

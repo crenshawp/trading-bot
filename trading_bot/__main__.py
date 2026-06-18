@@ -99,9 +99,10 @@ def cmd_outcomes_backfill() -> None:
     print(f"Backfilled {created} signals")
 
 
-def cmd_outcomes_status() -> None:
-    report = outcomes.summary()
-    print("Outcomes by signal type (closed trades only):")
+def cmd_outcomes_status(track_mode: str | None = "active") -> None:
+    report = outcomes.summary(track_mode=track_mode)
+    scope = "shadow" if track_mode == "shadow" else "active"
+    print(f"Outcomes by signal type ({scope} closed trades only):")
     if not report["by_signal_type"]:
         print("  (no closed trades yet)")
     for entry in report["by_signal_type"]:
@@ -177,8 +178,13 @@ def _format_perf_table(rows: list[PerfStats], title: str, label_header: str = "S
     return "\n".join(lines)
 
 
-def cmd_report_overall() -> None:
-    print(_format_perf_summary(performance.stats_overall(), "OVERALL PERFORMANCE"))
+def cmd_report_overall(track_mode: str | None = "active") -> None:
+    title = "OVERALL PERFORMANCE" + (
+        " (SHADOW)" if track_mode == "shadow" else ""
+    )
+    print(_format_perf_summary(
+        performance.stats_overall(track_mode=track_mode), title,
+    ))
 
 
 def cmd_report_recent(days: int) -> None:
@@ -1003,12 +1009,20 @@ def main() -> None:
     outcomes_sub = outcomes_parser.add_subparsers(dest="outcomes_cmd", required=True)
     outcomes_sub.add_parser("resolve")
     outcomes_sub.add_parser("backfill")
-    outcomes_sub.add_parser("status")
+    outcomes_status_p = outcomes_sub.add_parser("status")
+    outcomes_status_p.add_argument(
+        "--shadow", action="store_true",
+        help="Show shadow-tracked trades instead of active (Phase 3.1-LIVE)",
+    )
 
     # report (Phase 1.4 + Phase 2.1 --by-regime extensions)
     report_parser = sub.add_parser("report")
     report_sub = report_parser.add_subparsers(dest="report_cmd", required=True)
-    report_sub.add_parser("overall")
+    overall_p = report_sub.add_parser("overall")
+    overall_p.add_argument(
+        "--shadow", action="store_true",
+        help="Show shadow-tracked trades instead of active (Phase 3.1-LIVE)",
+    )
     recent_p = report_sub.add_parser("recent")
     recent_p.add_argument("--days", type=int, default=30)
     def _add_min_context(parser_: argparse.ArgumentParser) -> None:
@@ -1141,10 +1155,14 @@ def main() -> None:
         elif args.outcomes_cmd == "backfill":
             cmd_outcomes_backfill()
         elif args.outcomes_cmd == "status":
-            cmd_outcomes_status()
+            cmd_outcomes_status(
+                track_mode="shadow" if args.shadow else "active"
+            )
     elif args.command == "report":
         if args.report_cmd == "overall":
-            cmd_report_overall()
+            cmd_report_overall(
+                track_mode="shadow" if args.shadow else "active"
+            )
         elif args.report_cmd == "recent":
             cmd_report_recent(args.days)
         elif args.report_cmd == "by-signal":

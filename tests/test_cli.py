@@ -100,7 +100,7 @@ def test_outcomes_status_subcommand(
 ) -> None:
     monkeypatch.setattr(
         "trading_bot.outcomes.summary",
-        lambda: {
+        lambda **_kwargs: {
             "by_signal_type": [
                 {
                     "signal_type": "ema21_pullback",

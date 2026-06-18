@@ -343,8 +343,19 @@ def backfill_signals_without_trades() -> int:
 # ────────────────────────────────────────────────────────────────────────────
 
 
-def summary() -> dict[str, Any]:
-    """Aggregate closed-trade outcomes by signal_type, plus open/expired counts."""
+def summary(track_mode: str | None = "active") -> dict[str, Any]:
+    """Aggregate closed-trade outcomes by signal_type, plus open/expired counts.
+
+    ``track_mode`` (Phase 3.1-LIVE) defaults to ``'active'`` so shadow trades
+    don't pollute the headline win rates. Pass ``'shadow'`` for the shadow
+    view or ``None`` to include both.
+    """
+    tm = ""
+    tm_params: tuple[Any, ...] = ()
+    if track_mode is not None:
+        tm = " AND trades.track_mode = ?"
+        tm_params = (track_mode,)
+
     by_type_sql = (
         "SELECT "
         "  signals.signal_type AS signal_type, "
@@ -353,20 +364,23 @@ def summary() -> dict[str, Any]:
         "  AVG(CASE WHEN trades.outcome IN ('win','loss') THEN trades.pnl_pct END) AS avg_pnl "
         "FROM signals "
         "JOIN trades ON trades.signal_id = signals.id "
-        "WHERE trades.outcome IN ('win', 'loss') "
+        f"WHERE trades.outcome IN ('win', 'loss'){tm} "
         "GROUP BY signals.signal_type "
         "ORDER BY signals.signal_type"
     )
     open_sql = (
-        "SELECT COUNT(*) AS c FROM trades WHERE outcome IS NULL OR outcome = 'open'"
+        "SELECT COUNT(*) AS c FROM trades "
+        f"WHERE (outcome IS NULL OR outcome = 'open'){tm}"
     )
-    expired_sql = "SELECT COUNT(*) AS c FROM trades WHERE outcome = 'expired'"
+    expired_sql = (
+        f"SELECT COUNT(*) AS c FROM trades WHERE outcome = 'expired'{tm}"
+    )
 
     conn = db.get_connection()
     try:
-        by_type_rows = conn.execute(by_type_sql).fetchall()
-        open_row    = conn.execute(open_sql).fetchone()
-        expired_row = conn.execute(expired_sql).fetchone()
+        by_type_rows = conn.execute(by_type_sql, tm_params).fetchall()
+        open_row    = conn.execute(open_sql, tm_params).fetchone()
+        expired_row = conn.execute(expired_sql, tm_params).fetchone()
     finally:
         conn.close()
 
