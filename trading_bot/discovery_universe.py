@@ -37,6 +37,45 @@ EXCLUDED_TICKERS: frozenset[str] = frozenset(
     {"AAPL", "NFLX", "V", "MA", "CRM", "HD", "ORCL", "QQQ", "JPM"}
 )
 
+# ──────────────────────────────────────────────────────────────────────────
+# Live-shadow universe (Phase 3.1-LIVE)
+# ──────────────────────────────────────────────────────────────────────────
+#
+# 100 of the most liquid, highest-profile large/mega-cap and notable
+# high-momentum names. The scanner shadow-tracks every one of these that is
+# NOT already on the active watchlist: it runs the IDENTICAL signal pipeline,
+# opens trades tagged track_mode='shadow', and resolves them via the existing
+# resolver — but suppresses alerts. Promotion to the active watchlist is then
+# driven by RESOLVED shadow outcomes (see trading_bot.shadow_discovery).
+#
+# This is a STATIC, hand-editable seed list. A later phase will refresh it
+# automatically; for now, edit it here. EXCLUDED_TICKERS does NOT gate this
+# universe — under live-shadow, real resolved data is the judge, so a name's
+# historical backtest standing is irrelevant (note AAPL/NFLX/V/MA/CRM/HD/ORCL
+# appear here despite being excluded from the backtest universe).
+SHADOW_UNIVERSE: list[str] = [
+    # Mega-cap tech & semis
+    "AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "AMZN", "META", "AVGO", "TSLA", "ORCL",
+    "AMD", "NFLX", "ADBE", "CRM", "CSCO", "QCOM", "TXN", "INTC", "IBM", "NOW",
+    "INTU", "AMAT", "LRCX", "KLAC", "MU", "PLTR", "PANW", "SNPS", "CDNS", "ANET",
+    "MRVL", "ARM", "SMCI", "DELL", "CRWD", "FTNT", "ADI",
+    # High-growth / momentum software & platforms
+    "APP", "UBER", "ABNB", "SHOP", "PYPL", "COIN", "SNOW", "DDOG", "NET", "MDB",
+    "ZS", "TEAM", "WDAY",
+    # Financials
+    "JPM", "V", "MA", "BAC", "WFC", "GS", "MS", "BLK", "SCHW", "AXP",
+    "C", "SPGI", "ADP",
+    # Healthcare
+    "LLY", "UNH", "JNJ", "ABBV", "MRK", "PFE", "TMO", "ABT", "DHR", "AMGN",
+    "ISRG", "VRTX", "REGN",
+    # Consumer & staples
+    "WMT", "COST", "PG", "KO", "PEP", "MCD", "HD", "NKE", "SBUX", "LOW",
+    "TGT", "BKNG",
+    # Energy & industrials
+    "XOM", "CVX", "COP", "CAT", "BA", "GE", "HON", "UPS", "LIN", "DE",
+    "LMT", "RTX",
+]
+
 
 def _filter_universe(
     universe: Sequence[str], excluded: Collection[str]
