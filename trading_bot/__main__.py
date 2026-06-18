@@ -696,20 +696,18 @@ def _fmt_signed(value: float | None, places: int) -> str:
     return f"{sign}{value:.{places}f}"
 
 
-def cmd_discovery_scan(*, promote: bool, throttle_seconds: float) -> None:
-    run = discovery.run_discovery(
-        promote=promote, throttle_seconds=throttle_seconds
-    )
+def cmd_discovery_scan(*, throttle_seconds: float) -> None:
+    run = discovery.run_discovery(throttle_seconds=throttle_seconds)
 
-    print("DISCOVERY SCAN")
-    print("-" * 38)
+    print("DISCOVERY SCAN  (informational only — promotes nothing)")
+    print("-" * 54)
     print(f"Scanned:   {run.scanned}")
     print(f"Succeeded: {run.succeeded}")
     print(f"Failed:    {run.failed}")
     print()
 
     quals = run.qualifiers
-    print(f"Qualifiers ({len(quals)}) — trade_count >= 10 AND expectancy > 0:")
+    print(f"Ranked candidates ({len(quals)}) — trade_count >= 10 AND expectancy > 0:")
     if not quals:
         print("  (none)")
     else:
@@ -725,19 +723,10 @@ def cmd_discovery_scan(*, promote: bool, throttle_seconds: float) -> None:
                 f"{_fmt_signed(s.expectancy, 3):>10}"
             )
     print()
-
-    if not promote:
-        print("Promotion skipped (--no-promote)")
-    elif run.promoted:
-        print(
-            f"Newly promoted to watchlist ({len(run.promoted)}): "
-            f"{', '.join(run.promoted)}"
-        )
-    else:
-        print(
-            "Newly promoted to watchlist: "
-            "(none — all qualifiers already present)"
-        )
+    print(
+        "Promotion is owned by live-shadow — run `shadow evaluate` to promote "
+        "names whose RESOLVED shadow signals qualify."
+    )
     print()
 
     print(f"Failures ({run.failed}):")
@@ -1106,10 +1095,6 @@ def main() -> None:
     )
     scan_p = discovery_sub.add_parser("scan")
     scan_p.add_argument(
-        "--no-promote", action="store_true",
-        help="Score and persist only; do not modify the live watchlist",
-    )
-    scan_p.add_argument(
         "--throttle", type=float, default=discovery._THROTTLE_SECONDS,
         help="Seconds to sleep between yfinance calls (default 1.0)",
     )
@@ -1231,10 +1216,7 @@ def main() -> None:
             cmd_context_backfill()
     elif args.command == "discovery":
         if args.discovery_cmd == "scan":
-            cmd_discovery_scan(
-                promote=not args.no_promote,
-                throttle_seconds=args.throttle,
-            )
+            cmd_discovery_scan(throttle_seconds=args.throttle)
     elif args.command == "predictions":
         if args.predictions_cmd == "enable":
             cmd_predictions_enable()

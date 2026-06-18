@@ -257,24 +257,27 @@ def rank_qualifiers(scores: Sequence[TickerScore]) -> list[TickerScore]:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Auto-promotion + persistence (Section 5)
+# Informational ranking + persistence (Section 5)
 # ──────────────────────────────────────────────────────────────────────────
+#
+# As of Phase 3.1-LIVE the backtest scan is INFORMATIONAL ONLY — it ranks and
+# persists candidates but promotes NOTHING. Live-shadow (trading_bot.
+# shadow_discovery) is the sole path into the active watchlist, driven by real
+# resolved shadow outcomes rather than a backtest.
 
 
 @dataclass
 class DiscoveryRun:
-    """The full result of one on-demand discovery sweep.
+    """The full result of one on-demand backtest discovery sweep.
 
     ``scores`` is every successfully-backtested ticker; ``failures`` every one
-    that could not be scored; ``promoted`` the tickers newly inserted into the
-    live watchlist this run (empty when ``promote=False`` or all qualifiers
-    were already present).
+    that could not be scored. This sweep does not promote anything — see
+    :mod:`trading_bot.shadow_discovery` for the live-shadow promotion path.
     """
 
     run_timestamp: datetime
     scores: list[TickerScore]
     failures: list[DiscoveryFailure]
-    promoted: list[str]
 
     @property
     def scanned(self) -> int:
@@ -308,16 +311,15 @@ def _score_to_row(score: TickerScore) -> dict[str, object]:
 
 def run_discovery(
     *,
-    promote: bool = True,
     tickers: Sequence[str] | None = None,
     throttle_seconds: float = _THROTTLE_SECONDS,
 ) -> DiscoveryRun:
-    """Full sweep: backtest -> score -> persist -> (optionally) auto-promote.
+    """Informational backtest sweep: backtest -> score -> persist. Promotes nothing.
 
-    Persists every scored ticker to ``discovery_results`` regardless of
-    outcome (full audit trail). When ``promote`` is True, inserts qualifiers
-    not already on the watchlist into ``active_watchlist`` (source='discovery'),
-    skipping duplicates. Returns the full run for the caller to report on.
+    Persists every scored ticker to ``discovery_results`` (full audit trail)
+    and returns the ranked run for display. Promotion into the active watchlist
+    is owned exclusively by live-shadow (:mod:`trading_bot.shadow_discovery`);
+    this sweep never touches ``active_watchlist``.
     """
     run_ts = datetime.now(UTC)
     result = run_backtests(tickers=tickers, throttle_seconds=throttle_seconds)
@@ -327,15 +329,8 @@ def run_discovery(
         run_ts.isoformat(), [_score_to_row(s) for s in scores]
     )
 
-    promoted: list[str] = []
-    if promote:
-        for score in rank_qualifiers(scores):
-            if db.add_to_active_watchlist(score.ticker, "discovery"):
-                promoted.append(score.ticker)
-
     return DiscoveryRun(
         run_timestamp=run_ts,
         scores=scores,
         failures=result.failures,
-        promoted=promoted,
     )

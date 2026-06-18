@@ -197,31 +197,18 @@ def test_run_backtests_throttles_between_tickers(
 # ───────────────────────── run_discovery (promotion + persistence) ─────────────────────────
 
 
-def test_run_discovery_promotes_qualifiers_without_duplicates(
+def test_run_discovery_promotes_nothing(
     tmp_db: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # BBB is already on the watchlist; AAA + BBB both qualify; CCC fails.
-    db.add_to_active_watchlist("BBB", "manual")
+    """Phase 3.1-LIVE: the backtest sweep is informational only — even strong
+    qualifiers must NOT be promoted. Live-shadow owns promotion."""
+    _patch_backtest(monkeypatch, lambda t, a: _bt_df(_call_rows(wins=9, losses=1)))
+    run = discovery.run_discovery(tickers=["AAA", "BBB"], throttle_seconds=0)
 
-    def fake(ticker: str, _asset: str) -> pd.DataFrame | None:
-        if ticker in {"AAA", "BBB"}:
-            return _bt_df(_call_rows(wins=7, losses=3))
-        return None
-
-    _patch_backtest(monkeypatch, fake)
-    run = discovery.run_discovery(
-        tickers=["AAA", "BBB", "CCC"], promote=True, throttle_seconds=0
-    )
-
-    assert run.scanned == 3
-    assert run.succeeded == 2
-    assert run.failed == 1
     assert {s.ticker for s in run.qualifiers} == {"AAA", "BBB"}
-    # Only AAA is newly promoted — BBB was already present, no duplicate.
-    assert run.promoted == ["AAA"]
-    watchlist = db.get_active_watchlist()
-    assert watchlist.count("BBB") == 1
-    assert "AAA" in watchlist
+    # The watchlist is untouched and DiscoveryRun no longer exposes `promoted`.
+    assert db.get_active_watchlist() == []
+    assert not hasattr(run, "promoted")
 
 
 def test_run_discovery_persists_every_scored_ticker(
@@ -235,9 +222,7 @@ def test_run_discovery_persists_every_scored_ticker(
         return None  # CCC fails to backtest
 
     _patch_backtest(monkeypatch, fake)
-    discovery.run_discovery(
-        tickers=["AAA", "ZZZ", "CCC"], promote=True, throttle_seconds=0
-    )
+    discovery.run_discovery(tickers=["AAA", "ZZZ", "CCC"], throttle_seconds=0)
 
     persisted = db.get_discovery_results()
     by_ticker = {r["ticker"]: r for r in persisted}
@@ -246,19 +231,8 @@ def test_run_discovery_persists_every_scored_ticker(
     assert by_ticker["AAA"]["qualified"] is True
     assert by_ticker["ZZZ"]["qualified"] is False
     assert by_ticker["AAA"]["trade_count"] == 10
-
-
-def test_run_discovery_no_promote_leaves_watchlist_untouched(
-    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _patch_backtest(monkeypatch, lambda t, a: _bt_df(_call_rows(wins=8, losses=2)))
-    run = discovery.run_discovery(
-        tickers=["AAA"], promote=False, throttle_seconds=0
-    )
-    assert run.promoted == []
+    # And nothing was promoted as a side effect.
     assert db.get_active_watchlist() == []
-    # Persistence still happens even when promotion is off.
-    assert len(db.get_discovery_results()) == 1
 
 
 # ───────────────────────── db.add_to_active_watchlist ─────────────────────────

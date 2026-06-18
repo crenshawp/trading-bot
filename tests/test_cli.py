@@ -284,50 +284,22 @@ def test_cli_discovery_scan_reports_results(
             discovery.TickerScore("ZZZ", 40.0, 12, -0.5, -0.5, False),
         ],
         failures=[discovery.DiscoveryFailure("CCC", "no data")],
-        promoted=["AAA"],
     )
-    captured: dict[str, object] = {}
 
-    def fake_run_discovery(**kwargs: object) -> discovery.DiscoveryRun:
-        captured.update(kwargs)
+    def fake_run_discovery(**_kwargs: object) -> discovery.DiscoveryRun:
         return run
 
     monkeypatch.setattr("trading_bot.discovery.run_discovery", fake_run_discovery)
     _run(["discovery", "scan"])
     out = capsys.readouterr().out
     assert "DISCOVERY SCAN" in out
-    assert "Qualifiers (1)" in out
+    assert "informational only" in out
+    assert "Ranked candidates (1)" in out
     assert "AAA" in out
-    assert "Newly promoted to watchlist (1): AAA" in out
+    # Informational only — the scan promotes nothing and points to live-shadow.
+    assert "shadow evaluate" in out
     assert "Failures (1)" in out
     assert "CCC" in out
-    assert captured["promote"] is True
-
-
-def test_cli_discovery_scan_no_promote_and_empty(
-    tmp_db: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    from datetime import UTC, datetime
-
-    from trading_bot import discovery
-
-    run = discovery.DiscoveryRun(
-        run_timestamp=datetime.now(UTC), scores=[], failures=[], promoted=[]
-    )
-    captured: dict[str, object] = {}
-
-    def fake_run_discovery(**kwargs: object) -> discovery.DiscoveryRun:
-        captured.update(kwargs)
-        return run
-
-    monkeypatch.setattr("trading_bot.discovery.run_discovery", fake_run_discovery)
-    _run(["discovery", "scan", "--no-promote"])
-    out = capsys.readouterr().out
-    assert "Qualifiers (0)" in out
-    assert "Promotion skipped" in out
-    assert captured["promote"] is False
 
 
 # ───────────────────── Phase 2.1 regime + by-regime subcommands ─────────────────────
