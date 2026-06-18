@@ -29,6 +29,7 @@ from trading_bot.models import (
     Trade,
 )
 
+# Version 9 (Phase 3.1-LIVE) — adds the shadow_evaluations table.
 # Version 8 (Phase 3.1-LIVE) — adds trades.track_mode (active vs shadow).
 # Version 7 (Phase 3.1) — adds the discovery_results table (per-run scores).
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
@@ -36,7 +37,7 @@ from trading_bot.models import (
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -179,6 +180,25 @@ CREATE TABLE IF NOT EXISTS discovery_results (
 
 CREATE INDEX IF NOT EXISTS idx_discovery_results_run
     ON discovery_results (run_timestamp);
+
+-- Phase 3.1-LIVE: audit trail of every live-shadow promotion evaluation. One
+-- row per evaluated candidate per run: how many resolved shadow trades it had
+-- in the recent window, its win rate + expectancy, whether it met the bar
+-- (eligible), and whether it was actually promoted this run (False on dry-run
+-- or when already on the watchlist).
+CREATE TABLE IF NOT EXISTS shadow_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_timestamp TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    closed_count INTEGER NOT NULL,
+    win_rate REAL,
+    expectancy REAL,
+    eligible INTEGER NOT NULL,
+    promoted INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_shadow_evaluations_run
+    ON shadow_evaluations (run_timestamp);
 """
 
 # Whitelist for update_trade — never interpolate user input into SQL column names.
@@ -197,6 +217,7 @@ _TABLE_NAMES: tuple[str, ...] = (
     "signals", "trades", "daily_performance",
     "regime_snapshots", "vix_snapshots",
     "predictions", "settings", "active_watchlist", "discovery_results",
+    "shadow_evaluations",
 )
 
 # Whitelist for update_prediction — resolution flow + Phase 2.3 context backfill.
@@ -315,6 +336,15 @@ def _migrate_to_v8(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_to_v9(_conn: sqlite3.Connection) -> None:
+    """Phase 3.1-LIVE migration step.
+
+    Nothing to ALTER — the new ``shadow_evaluations`` table is created by the
+    ``CREATE TABLE IF NOT EXISTS`` block above. Documented hook only.
+    """
+    return None
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -327,6 +357,7 @@ def init_db() -> None:
         _migrate_to_v6(conn)
         _migrate_to_v7(conn)
         _migrate_to_v8(conn)
+        _migrate_to_v9(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -1345,6 +1376,98 @@ def get_discovery_results(limit: int = 100) -> list[dict[str, Any]]:
             "avg_return_pct": r["avg_return_pct"],
             "expectancy": r["expectancy"],
             "qualified": bool(r["qualified"]),
+        }
+        for r in rows
+    ]
+
+
+# ---- shadow trades + evaluations (Phase 3.1-LIVE) ----
+
+
+def get_resolved_shadow_outcomes(
+    ticker: str, since: datetime
+) -> list[tuple[str, float | None]]:
+    """Return ``(outcome, pnl_pct)`` for a ticker's RESOLVED shadow trades.
+
+    Only ``track_mode='shadow'`` trades with ``outcome IN ('win','loss')`` and
+    ``closed_at >= since`` (the recent window). Expired/open trades and active
+    trades are excluded. Drives the live-shadow promotion evaluator.
+    """
+    sql = (
+        "SELECT trades.outcome AS outcome, trades.pnl_pct AS pnl_pct "
+        "FROM trades JOIN signals ON signals.id = trades.signal_id "
+        "WHERE trades.track_mode = 'shadow' "
+        "  AND trades.outcome IN ('win','loss') "
+        "  AND signals.ticker = ? "
+        "  AND trades.closed_at IS NOT NULL "
+        "  AND trades.closed_at >= ? "
+        "ORDER BY trades.closed_at ASC"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, (ticker, since.isoformat())).fetchall()
+    finally:
+        conn.close()
+    return [(str(r["outcome"]), r["pnl_pct"]) for r in rows]
+
+
+def insert_shadow_evaluations(
+    run_timestamp: str, rows: Sequence[Mapping[str, Any]]
+) -> int:
+    """Persist one promotion-evaluation run. Returns rows inserted.
+
+    Each row mapping must carry ``ticker``, ``closed_count``, ``win_rate``,
+    ``expectancy``, ``eligible``, and ``promoted``.
+    """
+    sql = """
+        INSERT INTO shadow_evaluations (
+            run_timestamp, ticker, closed_count, win_rate,
+            expectancy, eligible, promoted
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    """
+    conn = get_connection()
+    try:
+        count = 0
+        for row in rows:
+            conn.execute(
+                sql,
+                (
+                    run_timestamp,
+                    str(row["ticker"]),
+                    int(row["closed_count"]),
+                    row["win_rate"],
+                    row["expectancy"],
+                    1 if row["eligible"] else 0,
+                    1 if row["promoted"] else 0,
+                ),
+            )
+            count += 1
+        conn.commit()
+        return count
+    finally:
+        conn.close()
+
+
+def get_shadow_evaluations(limit: int = 100) -> list[dict[str, Any]]:
+    """Return recent shadow_evaluations rows, newest run first."""
+    sql = (
+        "SELECT * FROM shadow_evaluations "
+        "ORDER BY run_timestamp DESC, expectancy DESC LIMIT ?"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, (limit,)).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "run_timestamp": str(r["run_timestamp"]),
+            "ticker": str(r["ticker"]),
+            "closed_count": int(r["closed_count"]),
+            "win_rate": r["win_rate"],
+            "expectancy": r["expectancy"],
+            "eligible": bool(r["eligible"]),
+            "promoted": bool(r["promoted"]),
         }
         for r in rows
     ]

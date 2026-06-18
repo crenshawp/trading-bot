@@ -87,4 +87,11 @@ addopts = "-v --cov=trading_bot --cov-report=term-missing --cov-fail-under=91"
 # in Phase 1.2 (spec §6: "Do not test the signal detection logic itself").
 # The new wiring (log_signal, _load_secrets, main, _normalize_*) IS exercised
 # in tests/test_scanner.py — it just doesn't count toward the percentage.
-omit = ["trading_bot/scanner.py"]
+# shadow_discovery.py is omitted ONLY during the Phase 3.1-LIVE build-out so
+# intermediate per-section commits stay green; its tests land in the final
+# "add shadow-tracking, promotion, and reporting-filter tests" commit
+# (Section 8), which removes this line so the module is coverage-checked.
+omit = [
+    "trading_bot/scanner.py",
+    "trading_bot/shadow_discovery.py",
+]
