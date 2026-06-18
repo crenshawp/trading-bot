@@ -9,12 +9,14 @@ from trading_bot import (
     context,
     db,
     discovery,
+    discovery_universe,
     outcomes,
     performance,
     predictions,
     regime,
     secrets,
     settings,
+    shadow_discovery,
     vix,
 )
 from trading_bot.migrate_csv import migrate_csv
@@ -743,6 +745,117 @@ def cmd_discovery_scan(*, throttle_seconds: float) -> None:
             print(f"  {f.ticker:<8} {f.reason}")
 
 
+# ---- shadow CLI (Phase 3.1-LIVE) ----
+
+
+def _fmt_win_rate(value: float | None) -> str:
+    return "    -" if value is None else f"{value:.1f}%"
+
+
+def _shadow_bar_line() -> str:
+    return (
+        f"Promotion bar: closed_count >= {shadow_discovery.MIN_SHADOW_SIGNALS} "
+        f"AND expectancy >= {shadow_discovery.PROMOTE_EXPECTANCY} "
+        f"(resolved within {shadow_discovery.RECENT_WINDOW_DAYS}d)"
+    )
+
+
+def _shadow_candidates() -> list[str]:
+    """Shadow-universe names not already on the active watchlist."""
+    try:
+        active = set(db.get_active_watchlist())
+    except Exception as exc:  # noqa: BLE001 - degrade gracefully for a read-only view
+        print(f"  (active watchlist unreadable: {exc})", file=sys.stderr)
+        active = set()
+    return [t for t in discovery_universe.SHADOW_UNIVERSE if t not in active]
+
+
+def cmd_shadow_status() -> None:
+    candidates = _shadow_candidates()
+    universe = len(discovery_universe.SHADOW_UNIVERSE)
+
+    print("SHADOW STATUS")
+    print("-" * 60)
+    print(
+        f"Universe: {universe}   on active watchlist (skipped): "
+        f"{universe - len(candidates)}   candidates: {len(candidates)}"
+    )
+    print(_shadow_bar_line())
+    print()
+
+    evals = [shadow_discovery.evaluate_ticker(t) for t in candidates]
+    with_data = [e for e in evals if e.closed_count > 0]
+    # Eligible first, then by expectancy desc, then by sample size desc.
+    with_data.sort(
+        key=lambda e: (not e.eligible, -(e.expectancy or -1e9), -e.closed_count)
+    )
+
+    print(f"  {'Ticker':<8} {'Resolved':>8}  {'Win rate':>8}  "
+          f"{'Expectancy':>10}  {'Eligible':>8}")
+    if not with_data:
+        print("  (no candidate has resolved shadow signals yet)")
+    for e in with_data:
+        print(
+            f"  {e.ticker:<8} {e.closed_count:>8}  {_fmt_win_rate(e.win_rate):>8}  "
+            f"{_fmt_signed(e.expectancy, 3):>10}  "
+            f"{'yes' if e.eligible else 'no':>8}"
+        )
+
+    no_data = len(candidates) - len(with_data)
+    print()
+    print(f"  ({no_data} candidates have no resolved shadow signals yet)")
+
+
+def _withhold_reason(ev: shadow_discovery.ShadowEvaluation) -> str:
+    if ev.closed_count < shadow_discovery.MIN_SHADOW_SIGNALS:
+        return (
+            f"only {ev.closed_count} resolved "
+            f"(need {shadow_discovery.MIN_SHADOW_SIGNALS})"
+        )
+    exp = "n/a" if ev.expectancy is None else f"{ev.expectancy:.3f}"
+    return f"expectancy {exp} < {shadow_discovery.PROMOTE_EXPECTANCY}"
+
+
+def cmd_shadow_evaluate(*, dry_run: bool) -> None:
+    evals = shadow_discovery.evaluate_shadow_universe(dry_run=dry_run)
+    eligible = [e for e in evals if e.eligible]
+
+    header = "SHADOW EVALUATE"
+    if dry_run:
+        header += "  (DRY RUN - no promotion, no persistence)"
+    print(header)
+    print("-" * 60)
+    print(f"Candidates evaluated: {len(evals)}   eligible: {len(eligible)}")
+    print(_shadow_bar_line())
+    print()
+
+    # In a real run, `promoted` reflects what was actually added; in dry-run,
+    # show the eligible names that WOULD be promoted.
+    shown = eligible if dry_run else [e for e in evals if e.promoted]
+    verb = "Would promote" if dry_run else "Promoted"
+    print(f"{verb} ({len(shown)}):")
+    if not shown:
+        print("  (none)")
+    for e in sorted(shown, key=lambda e: -(e.expectancy or 0.0)):
+        print(
+            f"  {e.ticker:<8} resolved={e.closed_count}  "
+            f"win_rate={_fmt_win_rate(e.win_rate)}  "
+            f"expectancy={_fmt_signed(e.expectancy, 3)}"
+        )
+    print()
+
+    withheld = [e for e in evals if not e.eligible and e.closed_count > 0]
+    print(f"Withheld with data ({len(withheld)}):")
+    if not withheld:
+        print("  (none)")
+    for e in sorted(withheld, key=lambda e: -e.closed_count):
+        print(f"  {e.ticker:<8} {_withhold_reason(e)}")
+
+    no_data = sum(1 for e in evals if e.closed_count == 0)
+    print()
+    print(f"  ({no_data} candidates have no resolved shadow signals yet)")
+
+
 # ---- predictions CLI (Phase 2.2b) ----
 
 # Seeded defaults — duplicated from scanner._PRED_DEFAULTS so the CLI can
@@ -1113,6 +1226,16 @@ def main() -> None:
         help="Seconds to sleep between yfinance calls (default 1.0)",
     )
 
+    # shadow (Phase 3.1-LIVE)
+    shadow_parser = sub.add_parser("shadow")
+    shadow_sub = shadow_parser.add_subparsers(dest="shadow_cmd", required=True)
+    shadow_sub.add_parser("status")
+    shadow_eval_p = shadow_sub.add_parser("evaluate")
+    shadow_eval_p.add_argument(
+        "--dry-run", action="store_true",
+        help="Evaluate without promoting or persisting",
+    )
+
     # predictions (Phase 2.2b)
     pred_parser = sub.add_parser("predictions")
     pred_sub = pred_parser.add_subparsers(dest="predictions_cmd", required=True)
@@ -1235,6 +1358,11 @@ def main() -> None:
     elif args.command == "discovery":
         if args.discovery_cmd == "scan":
             cmd_discovery_scan(throttle_seconds=args.throttle)
+    elif args.command == "shadow":
+        if args.shadow_cmd == "status":
+            cmd_shadow_status()
+        elif args.shadow_cmd == "evaluate":
+            cmd_shadow_evaluate(dry_run=args.dry_run)
     elif args.command == "predictions":
         if args.predictions_cmd == "enable":
             cmd_predictions_enable()
