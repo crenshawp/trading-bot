@@ -302,6 +302,90 @@ def test_cli_discovery_scan_reports_results(
     assert "CCC" in out
 
 
+# ───────────────────── Phase 3.1-LIVE shadow subcommands ─────────────────────
+
+
+def test_cli_shadow_status(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import shadow_discovery
+
+    monkeypatch.setattr(
+        "trading_bot.discovery_universe.SHADOW_UNIVERSE", ["AAA", "BBB"],
+    )
+
+    def fake_eval(ticker: str, **_kw: object) -> shadow_discovery.ShadowEvaluation:
+        if ticker == "AAA":
+            return shadow_discovery.ShadowEvaluation("AAA", 12, 75.0, 0.80, True, False)
+        return shadow_discovery.ShadowEvaluation("BBB", 4, 50.0, -0.10, False, False)
+
+    monkeypatch.setattr("trading_bot.shadow_discovery.evaluate_ticker", fake_eval)
+    _run(["shadow", "status"])
+    out = capsys.readouterr().out
+    assert "SHADOW STATUS" in out
+    assert "AAA" in out
+    assert "yes" in out          # AAA is eligible
+    assert "BBB" in out
+
+
+def test_cli_shadow_evaluate_promotes(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import shadow_discovery
+
+    evals = [
+        shadow_discovery.ShadowEvaluation("AAA", 12, 75.0, 0.80, True, True),
+        shadow_discovery.ShadowEvaluation("BBB", 4, 50.0, -0.10, False, False),
+    ]
+    captured: dict[str, object] = {}
+
+    def fake_universe(**kwargs: object) -> list[shadow_discovery.ShadowEvaluation]:
+        captured.update(kwargs)
+        return evals
+
+    monkeypatch.setattr(
+        "trading_bot.shadow_discovery.evaluate_shadow_universe", fake_universe,
+    )
+    _run(["shadow", "evaluate"])
+    out = capsys.readouterr().out
+    assert "SHADOW EVALUATE" in out
+    assert "Promoted (1)" in out
+    assert "AAA" in out
+    assert "Withheld with data (1)" in out
+    assert "BBB" in out
+    assert captured["dry_run"] is False
+
+
+def test_cli_shadow_evaluate_dry_run(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import shadow_discovery
+
+    # Dry-run: eligible but not promoted.
+    evals = [shadow_discovery.ShadowEvaluation("AAA", 12, 75.0, 0.80, True, False)]
+    captured: dict[str, object] = {}
+
+    def fake_universe(**kwargs: object) -> list[shadow_discovery.ShadowEvaluation]:
+        captured.update(kwargs)
+        return evals
+
+    monkeypatch.setattr(
+        "trading_bot.shadow_discovery.evaluate_shadow_universe", fake_universe,
+    )
+    _run(["shadow", "evaluate", "--dry-run"])
+    out = capsys.readouterr().out
+    assert "DRY RUN" in out
+    assert "Would promote (1)" in out
+    assert "AAA" in out
+    assert captured["dry_run"] is True
+
+
 # ───────────────────── Phase 2.1 regime + by-regime subcommands ─────────────────────
 
 

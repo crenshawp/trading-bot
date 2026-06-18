@@ -306,3 +306,169 @@ def test_active_watchlist_unreadable_falls_back_to_seed(
     result = scanner._active_stock_watchlist()
     assert result == list(scanner.STOCK_WATCHLIST)
     assert "unreadable" in capsys.readouterr().err
+
+
+# ─────────────── shadow tracking + alert suppression (Phase 3.1-LIVE) ───────────────
+
+
+def _offline_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force regime/VIX tagging offline so log_signal never hits the network —
+    it catches the fetch errors and tags the trade 'unknown'."""
+    from trading_bot import regime, vix
+
+    def _no_regime(*_a: object, **_k: object) -> object:
+        raise regime.RegimeFetchError("offline")
+
+    def _no_vix(*_a: object, **_k: object) -> object:
+        raise vix.VixFetchError("offline")
+
+    monkeypatch.setattr("trading_bot.regime.get_current_regime", _no_regime)
+    monkeypatch.setattr("trading_bot.vix.get_current_vix", _no_vix)
+
+
+def _stock_signal(ticker: str = "MSFT") -> dict[str, Any]:
+    return {
+        "ticker":      ticker,
+        "asset_type":  "stock",
+        "trade_type":  "📆 SWING TRADE",
+        "direction":   "CALL 📈",
+        "setup":       "EMA21 Pullback",
+        "detail":      "test",
+        "price":       100.0,
+        "take_profit": 104.0,
+        "stop_loss":   97.0,
+        "confidence":  "High",
+        "hold_days":   "3-5 days",
+    }
+
+
+def _trade_track_modes() -> list[str]:
+    conn = db.get_connection()
+    try:
+        rows = conn.execute("SELECT track_mode FROM trades").fetchall()
+    finally:
+        conn.close()
+    return [r["track_mode"] for r in rows]
+
+
+def test_shadow_signal_opens_shadow_trade_and_suppresses_alert(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _offline_context(monkeypatch)
+    posts: list[str] = []
+    monkeypatch.setattr(
+        "trading_bot.scanner.requests.post",
+        lambda url, **_k: posts.append(url),
+    )
+    monkeypatch.setattr(scanner, "DRY_RUN", False)
+
+    scanner.send_notification(_stock_signal(), track_mode="shadow", alert=False)
+
+    assert posts == [], "shadow signals must NOT alert"
+    assert _trade_track_modes() == ["shadow"]
+    assert "suppressed" in capsys.readouterr().out
+
+
+def test_active_signal_alerts_and_opens_active_trade(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _offline_context(monkeypatch)
+    posts: list[str] = []
+    monkeypatch.setattr(
+        "trading_bot.scanner.requests.post",
+        lambda url, **_k: posts.append(url),
+    )
+    monkeypatch.setattr(scanner, "DRY_RUN", False)
+
+    scanner.send_notification(_stock_signal(), track_mode="active", alert=True)
+
+    assert posts, "active signals must still alert (Discord + Pushover)"
+    assert _trade_track_modes() == ["active"]
+
+
+def _stub_shadow_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    universe: list[str],
+    active: list[str],
+    fire_for: set[str] | None = None,
+) -> None:
+    """Wire scan_shadow's dependencies for an offline run. ``fire_for`` names
+    produce a signal; the rest produce none. ``None`` means every ticker fires."""
+    monkeypatch.setattr(scanner, "is_market_open", lambda: True)
+    monkeypatch.setattr(scanner, "_active_stock_watchlist", lambda: active)
+    monkeypatch.setattr(scanner, "SHADOW_UNIVERSE", universe)
+    monkeypatch.setattr(scanner, "_SHADOW_THROTTLE_SECONDS", 0)
+    monkeypatch.setattr(scanner, "get_stock_data", lambda t: {"df": t})
+    monkeypatch.setattr(scanner, "add_stock_indicators", lambda df: df)
+
+    def fake_detect(ticker: str, _df: object) -> list[dict[str, Any]]:
+        if fire_for is None or ticker in fire_for:
+            return [_stock_signal(ticker)]
+        return []
+
+    monkeypatch.setattr(scanner, "detect_stock_signals", fake_detect)
+
+
+def test_scan_shadow_targets_only_non_active_tickers(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_shadow_pipeline(
+        monkeypatch, universe=["AAA", "BBB", "CCC"], active=["AAA"],
+    )
+    calls: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        scanner, "send_notification",
+        lambda s, **kw: calls.append((s["ticker"], kw)),
+    )
+
+    scanner.scan_shadow()
+
+    # AAA is on the active watchlist -> not shadowed.
+    assert [t for t, _ in calls] == ["BBB", "CCC"]
+    for _, kw in calls:
+        assert kw["track_mode"] == "shadow"
+        assert kw["alert"] is False
+
+
+def test_scan_shadow_logs_per_ticker_error_and_continues(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stub_shadow_pipeline(
+        monkeypatch, universe=["BAD", "GOOD"], active=[], fire_for={"GOOD"},
+    )
+
+    def fake_get(ticker: str) -> object:
+        if ticker == "BAD":
+            raise RuntimeError("rate limited")
+        return {"df": ticker}
+
+    monkeypatch.setattr(scanner, "get_stock_data", fake_get)
+    fired: list[str] = []
+    monkeypatch.setattr(
+        scanner, "send_notification", lambda s, **_kw: fired.append(s["ticker"]),
+    )
+
+    scanner.scan_shadow()
+
+    err = capsys.readouterr().err
+    assert "BAD" in err and "rate limited" in err   # logged, not silent
+    assert fired == ["GOOD"]                          # sweep continued past BAD
+
+
+def test_run_shadow_scan_never_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def boom() -> None:
+        raise RuntimeError("systemic shadow failure")
+
+    monkeypatch.setattr(scanner, "scan_shadow", boom)
+    # Must not propagate — the active pipeline is sacred.
+    scanner._run_shadow_scan()
+    assert "shadow scan error" in capsys.readouterr().err
