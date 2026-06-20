@@ -125,16 +125,24 @@ def evaluate_shadow_universe(
     run_ts = now if now is not None else datetime.now(UTC)
 
     try:
-        active = set(db.get_active_watchlist())
+        # The FULL watchlist — active AND benched. get_active_watchlist is
+        # status-agnostic, which is the decoupling contract this relies on.
+        watchlist = set(db.get_active_watchlist())
     except Exception as exc:  # noqa: BLE001 - degrade gracefully, never crash
         print(
             f"  shadow eval: active watchlist unreadable, "
             f"evaluating full universe: {exc}",
             file=sys.stderr,
         )
-        active = set()
+        watchlist = set()
 
-    candidates = [t for t in SHADOW_UNIVERSE if t not in active]
+    # DECOUPLING GUARD (Phase 3.3): shadow promotion may ONLY touch tickers that
+    # are NOT on the watchlist. Any ticker on the watchlist — active or
+    # benched — is owned exclusively by the state evaluator
+    # (trading_bot.watchlist_state). Excluding the whole watchlist here, plus
+    # add_to_active_watchlist's own dedup, guarantees a benched ticker can
+    # never be re-promoted by this path.
+    candidates = [t for t in SHADOW_UNIVERSE if t not in watchlist]
     evaluations: list[ShadowEvaluation] = []
 
     for ticker in candidates:
@@ -147,6 +155,8 @@ def evaluate_shadow_universe(
         promoted = False
         if ev.eligible and not dry_run:
             try:
+                # Second layer of the guard: add_to_active_watchlist is a no-op
+                # (returns False) if the ticker is somehow already present.
                 promoted = db.add_to_active_watchlist(ticker, "shadow")
             except Exception as exc:  # noqa: BLE001 - promotion failure isn't fatal
                 print(
