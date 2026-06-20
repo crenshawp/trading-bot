@@ -6,6 +6,7 @@ import sys
 from datetime import date
 
 from trading_bot import (
+    config,
     context,
     db,
     discovery,
@@ -18,6 +19,7 @@ from trading_bot import (
     settings,
     shadow_discovery,
     vix,
+    watchlist_state,
 )
 from trading_bot.migrate_csv import migrate_csv
 from trading_bot.performance import (
@@ -856,6 +858,113 @@ def cmd_shadow_evaluate(*, dry_run: bool) -> None:
     print(f"  ({no_data} candidates have no resolved shadow signals yet)")
 
 
+# ---- watchlist state-machine CLI (Phase 3.3) ----
+
+
+def _sm_bar_line() -> str:
+    return (
+        f"Bars: demote expectancy <= {config.SM_DEMOTE_EXPECTANCY}, "
+        f"recover >= {config.SM_PROMOTE_EXPECTANCY}, "
+        f"min sample {config.SM_MIN_CLOSED_SIGNALS}, "
+        f"window {config.SM_WINDOW_DAYS}d, active floor {config.SM_MIN_ACTIVE}"
+    )
+
+
+def cmd_watchlist_evaluate(*, dry_run: bool) -> None:
+    run = watchlist_state.evaluate_watchlist(dry_run=dry_run)
+
+    header = "WATCHLIST EVALUATE"
+    if dry_run:
+        header += "  (DRY RUN - no changes)"
+    print(header)
+    print("-" * 60)
+    print(_sm_bar_line())
+    print()
+
+    def _verdict_line(ev: watchlist_state.TickerEvaluation) -> str:
+        return (
+            f"  {ev.ticker:<8} {ev.status} -> {ev.new_status}  "
+            f"closed={ev.closed_count} expectancy={_fmt_signed(ev.expectancy, 3)}"
+            f"  {ev.reason}"
+        )
+
+    print(f"Demotions ({len(run.demotions)}):")
+    if not run.demotions:
+        print("  (none)")
+    for ev in run.demotions:
+        print(_verdict_line(ev))
+    print()
+
+    print(f"Recoveries ({len(run.recoveries)}):")
+    if not run.recoveries:
+        print("  (none)")
+    for ev in run.recoveries:
+        print(_verdict_line(ev))
+    print()
+
+    # Floor holds — demotions withheld to honour SM_MIN_ACTIVE — shown apart.
+    floor_holds = [e for e in run.holds if "active floor" in e.reason]
+    print(f"Floor holds ({len(floor_holds)}):")
+    if not floor_holds:
+        print("  (none)")
+    for ev in floor_holds:
+        print(
+            f"  {ev.ticker:<8} expectancy={_fmt_signed(ev.expectancy, 3)}  "
+            f"{ev.reason}"
+        )
+    print()
+
+    other_holds = [e for e in run.holds if "active floor" not in e.reason]
+    print(f"Other holds: {len(other_holds)} "
+          f"(insufficient sample / dead band)")
+    print()
+
+    print(f"Active  ({len(run.active_after)}): "
+          f"{', '.join(run.active_after) or '(none)'}")
+    print(f"Benched ({len(run.benched_after)}): "
+          f"{', '.join(run.benched_after) or '(none)'}")
+
+
+def _print_watchlist_rows(entries: list[dict[str, object]]) -> None:
+    if not entries:
+        print("  (none)")
+        return
+    print(
+        f"  {'Ticker':<8} {'Closed':>6}  {'Win rate':>8}  "
+        f"{'Expectancy':>10}  {'Source':<10}"
+    )
+    for entry in entries:
+        ticker = str(entry["ticker"])
+        try:
+            closed, win_rate, expectancy = watchlist_state.windowed_stats_for(ticker)
+        except Exception as exc:  # noqa: BLE001 - a read-only view must not crash
+            print(f"  {ticker:<8} (stats error: {exc})", file=sys.stderr)
+            continue
+        print(
+            f"  {ticker:<8} {closed:>6}  {_fmt_win_rate(win_rate):>8}  "
+            f"{_fmt_signed(expectancy, 3):>10}  {str(entry['source']):<10}"
+        )
+
+
+def cmd_watchlist_status() -> None:
+    try:
+        entries = db.get_watchlist_entries()
+    except Exception as exc:  # noqa: BLE001 - degrade gracefully for a read-only view
+        print(f"  watchlist unreadable: {exc}", file=sys.stderr)
+        entries = []
+
+    active = [e for e in entries if e["status"] == "active"]
+    benched = [e for e in entries if e["status"] == "benched"]
+
+    print("WATCHLIST STATUS")
+    print("-" * 60)
+    print(f"Active ({len(active)}):")
+    _print_watchlist_rows(active)
+    print()
+    print(f"Benched ({len(benched)}):")
+    _print_watchlist_rows(benched)
+
+
 # ---- predictions CLI (Phase 2.2b) ----
 
 # Seeded defaults — duplicated from scanner._PRED_DEFAULTS so the CLI can
@@ -1236,6 +1345,18 @@ def main() -> None:
         help="Evaluate without promoting or persisting",
     )
 
+    # watchlist state machine (Phase 3.3)
+    watchlist_parser = sub.add_parser("watchlist")
+    watchlist_sub = watchlist_parser.add_subparsers(
+        dest="watchlist_cmd", required=True
+    )
+    watchlist_sub.add_parser("status")
+    watchlist_eval_p = watchlist_sub.add_parser("evaluate")
+    watchlist_eval_p.add_argument(
+        "--dry-run", action="store_true",
+        help="Evaluate without changing any statuses or recording transitions",
+    )
+
     # predictions (Phase 2.2b)
     pred_parser = sub.add_parser("predictions")
     pred_sub = pred_parser.add_subparsers(dest="predictions_cmd", required=True)
@@ -1363,6 +1484,11 @@ def main() -> None:
             cmd_shadow_status()
         elif args.shadow_cmd == "evaluate":
             cmd_shadow_evaluate(dry_run=args.dry_run)
+    elif args.command == "watchlist":
+        if args.watchlist_cmd == "status":
+            cmd_watchlist_status()
+        elif args.watchlist_cmd == "evaluate":
+            cmd_watchlist_evaluate(dry_run=args.dry_run)
     elif args.command == "predictions":
         if args.predictions_cmd == "enable":
             cmd_predictions_enable()
