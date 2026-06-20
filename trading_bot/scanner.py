@@ -97,6 +97,31 @@ def _active_stock_watchlist() -> list[str]:
     return active
 
 
+def _active_stock_watchlist_entries() -> list[tuple[str, str]]:
+    """Return ``(ticker, status)`` for every watchlist row (Phase 3.3).
+
+    Status is 'active' or 'benched'. CRITICAL FALLBACK (same contract as
+    ``_active_stock_watchlist``): if the table is empty, missing, or unreadable
+    fall back to the hardcoded seed list, all treated as 'active', and log a
+    warning — the bot must never silently scan an empty watchlist.
+    """
+    try:
+        entries = db.get_watchlist_entries()
+    except Exception as exc:  # noqa: BLE001 - any DB failure must fall back, not crash
+        print(
+            f"  active_watchlist unreadable, falling back to seed list: {exc}",
+            file=sys.stderr,
+        )
+        return [(t, "active") for t in STOCK_WATCHLIST]
+    if not entries:
+        print(
+            "  active_watchlist empty, falling back to seed list",
+            file=sys.stderr,
+        )
+        return [(t, "active") for t in STOCK_WATCHLIST]
+    return [(str(e["ticker"]), str(e["status"])) for e in entries]
+
+
 def _load_secrets() -> None:
     """Populate module-level credential constants from the secrets layer.
 
@@ -1297,13 +1322,20 @@ def send_notification(signal, *, track_mode="active", alert=True):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def scan_stocks():
-    """Runs once per day at market open — daily candles, swing trades"""
+    """Runs once per day at market open — daily candles, swing trades.
+
+    Phase 3.3: scans every watchlist ticker, ACTIVE and BENCHED alike. Active
+    tickers alert (track_mode='active'); benched tickers are scanned + opened
+    silently (track_mode='shadow', alert suppressed) so their data collection
+    never stops — they are scanned here UNCONDITIONALLY, independent of the
+    100-name shadow universe, so a benched ticker can never go dark.
+    """
     if not is_market_open():
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Market closed — skipping stock scan")
         return
 
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scanning stocks...")
-    for ticker in _active_stock_watchlist():
+    for ticker, status in _active_stock_watchlist_entries():
         try:
             df = get_stock_data(ticker)
             if df is None:
@@ -1311,8 +1343,12 @@ def scan_stocks():
                 continue
             df      = add_stock_indicators(df)
             signals = detect_stock_signals(ticker, df)
+            is_active = status == "active"
             for s in signals:
-                send_notification(s)
+                if is_active:
+                    send_notification(s)
+                else:
+                    send_notification(s, track_mode="shadow", alert=False)
             if not signals:
                 print(f"  {ticker}: No signals")
         except Exception as e:
