@@ -472,3 +472,78 @@ def test_run_shadow_scan_never_raises(
     # Must not propagate — the active pipeline is sacred.
     scanner._run_shadow_scan()
     assert "shadow scan error" in capsys.readouterr().err
+
+
+# ─────────────── benched scanning + alert suppression (Phase 3.3) ───────────────
+
+
+def _stub_stock_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    entries: list[tuple[str, str]],
+) -> None:
+    """Wire scan_stocks' dependencies for an offline run with the given
+    ``(ticker, status)`` watchlist entries; every ticker fires one signal."""
+    monkeypatch.setattr(scanner, "is_market_open", lambda: True)
+    monkeypatch.setattr(scanner, "_active_stock_watchlist_entries", lambda: entries)
+    monkeypatch.setattr(scanner, "get_stock_data", lambda t: {"df": t})
+    monkeypatch.setattr(scanner, "add_stock_indicators", lambda df: df)
+    monkeypatch.setattr(
+        scanner, "detect_stock_signals", lambda t, _df: [_stock_signal(t)],
+    )
+
+
+def test_scan_stocks_alerts_active_suppresses_benched(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_stock_pipeline(
+        monkeypatch, entries=[("ACT", "active"), ("BEN", "benched")],
+    )
+    calls: dict[str, dict[str, Any]] = {}
+    monkeypatch.setattr(
+        scanner, "send_notification",
+        lambda s, **kw: calls.__setitem__(s["ticker"], kw),
+    )
+
+    scanner.scan_stocks()
+
+    # Active fires with defaults (alerts); benched is shadow-tagged + suppressed.
+    assert calls["ACT"] == {}
+    assert calls["BEN"] == {"track_mode": "shadow", "alert": False}
+
+
+def test_benched_ticker_scanned_logged_alert_suppressed(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _offline_context(monkeypatch)
+    posts: list[str] = []
+    monkeypatch.setattr(
+        "trading_bot.scanner.requests.post", lambda url, **_k: posts.append(url),
+    )
+    monkeypatch.setattr(scanner, "DRY_RUN", False)
+    _stub_stock_pipeline(monkeypatch, entries=[("BEN", "benched")])
+
+    scanner.scan_stocks()
+
+    assert posts == [], "benched alerts must be suppressed"
+    assert _trade_track_modes() == ["shadow"], "benched outcome still logged"
+    assert "suppressed" in capsys.readouterr().out
+
+
+def test_benched_ticker_not_in_shadow_universe_is_still_scanned(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BEN is benched and NOT in the shadow universe — it must still be scanned
+    # via scan_stocks (it lives in the watchlist), so it never goes dark.
+    monkeypatch.setattr(scanner, "SHADOW_UNIVERSE", ["SOMETHING_ELSE"])
+    _stub_stock_pipeline(monkeypatch, entries=[("BEN", "benched")])
+    fired: list[str] = []
+    monkeypatch.setattr(
+        scanner, "send_notification", lambda s, **_kw: fired.append(s["ticker"]),
+    )
+
+    scanner.scan_stocks()
+
+    assert fired == ["BEN"]

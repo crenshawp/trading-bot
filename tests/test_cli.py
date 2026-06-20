@@ -386,6 +386,100 @@ def test_cli_shadow_evaluate_dry_run(
     assert captured["dry_run"] is True
 
 
+# ───────────────────── Phase 3.3 watchlist subcommands ─────────────────────
+
+
+def test_cli_watchlist_evaluate(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import UTC, datetime
+
+    from trading_bot import watchlist_state
+
+    evals = [
+        watchlist_state.TickerEvaluation(
+            "BAD", "active", 10, 40.0, -0.4, "demote", "expectancy -0.400 <= 0.0"),
+        watchlist_state.TickerEvaluation(
+            "REC", "benched", 10, 70.0, 1.4, "recover", "expectancy 1.400 >= 0.05"),
+        watchlist_state.TickerEvaluation(
+            "HELD", "active", 10, 45.0, -0.1, "hold",
+            "held: active floor (active would drop below 5)"),
+        watchlist_state.TickerEvaluation(
+            "OK", "active", 10, 80.0, 1.4, "hold", "active held: ..."),
+    ]
+    run = watchlist_state.StateRun(
+        evaluated_at=datetime.now(UTC), evaluations=evals,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_eval(**kwargs: object) -> watchlist_state.StateRun:
+        captured.update(kwargs)
+        return run
+
+    monkeypatch.setattr(
+        "trading_bot.watchlist_state.evaluate_watchlist", fake_eval,
+    )
+    _run(["watchlist", "evaluate"])
+    out = capsys.readouterr().out
+    assert "WATCHLIST EVALUATE" in out
+    assert "Demotions (1)" in out and "BAD" in out
+    assert "Recoveries (1)" in out and "REC" in out
+    assert "Floor holds (1)" in out and "HELD" in out
+    assert "Active  (3)" in out          # HELD, OK, REC end active
+    assert "Benched (1)" in out          # BAD ends benched
+    assert captured["dry_run"] is False
+
+
+def test_cli_watchlist_evaluate_dry_run_passes_flag(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import UTC, datetime
+
+    from trading_bot import watchlist_state
+
+    run = watchlist_state.StateRun(
+        evaluated_at=datetime.now(UTC), evaluations=[],
+    )
+    captured: dict[str, object] = {}
+
+    def fake_eval(**kwargs: object) -> watchlist_state.StateRun:
+        captured.update(kwargs)
+        return run
+
+    monkeypatch.setattr(
+        "trading_bot.watchlist_state.evaluate_watchlist", fake_eval,
+    )
+    _run(["watchlist", "evaluate", "--dry-run"])
+    out = capsys.readouterr().out
+    assert "DRY RUN" in out
+    assert captured["dry_run"] is True
+
+
+def test_cli_watchlist_status(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import db
+
+    db.add_to_active_watchlist("ACT", "seed")
+    db.add_to_active_watchlist("BEN", "shadow")
+    db.set_watchlist_status("BEN", "benched")
+    monkeypatch.setattr(
+        "trading_bot.watchlist_state.windowed_stats_for",
+        lambda t, **_kw: (12, 75.0, 0.80) if t == "ACT" else (11, 40.0, -0.30),
+    )
+    _run(["watchlist", "status"])
+    out = capsys.readouterr().out
+    assert "WATCHLIST STATUS" in out
+    assert "Active (1)" in out and "ACT" in out
+    assert "Benched (1)" in out and "BEN" in out
+
+
 # ───────────────────── Phase 2.1 regime + by-regime subcommands ─────────────────────
 
 
