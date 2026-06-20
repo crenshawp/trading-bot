@@ -23,12 +23,15 @@ from trading_bot.models import (
     VALID_PREDICTION_OUTCOMES,
     VALID_TRACK_MODES,
     VALID_VIX_BANDS,
+    VALID_WATCHLIST_STATUSES,
     DailyPerf,
     Prediction,
     Signal,
     Trade,
 )
 
+# Version 10 (Phase 3.3) — adds active_watchlist.status + status_changed_at
+#                          and the watchlist_transitions table.
 # Version 9 (Phase 3.1-LIVE) — adds the shadow_evaluations table.
 # Version 8 (Phase 3.1-LIVE) — adds trades.track_mode (active vs shadow).
 # Version 7 (Phase 3.1) — adds the discovery_results table (per-run scores).
@@ -37,7 +40,7 @@ from trading_bot.models import (
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -199,6 +202,24 @@ CREATE TABLE IF NOT EXISTS shadow_evaluations (
 
 CREATE INDEX IF NOT EXISTS idx_shadow_evaluations_run
     ON shadow_evaluations (run_timestamp);
+
+-- Phase 3.3: audit trail of every active<->benched transition the state
+-- evaluator makes. One row per actual status change, with the windowed stats
+-- and the reason that drove it.
+CREATE TABLE IF NOT EXISTS watchlist_transitions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    from_status TEXT NOT NULL,
+    to_status TEXT NOT NULL,
+    evaluated_at TEXT NOT NULL,
+    win_rate REAL,
+    closed_count INTEGER NOT NULL,
+    expectancy REAL,
+    reason TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_watchlist_transitions_ticker
+    ON watchlist_transitions (ticker);
 """
 
 # Whitelist for update_trade — never interpolate user input into SQL column names.
@@ -217,7 +238,7 @@ _TABLE_NAMES: tuple[str, ...] = (
     "signals", "trades", "daily_performance",
     "regime_snapshots", "vix_snapshots",
     "predictions", "settings", "active_watchlist", "discovery_results",
-    "shadow_evaluations",
+    "shadow_evaluations", "watchlist_transitions",
 )
 
 # Whitelist for update_prediction — resolution flow + Phase 2.3 context backfill.
@@ -345,6 +366,28 @@ def _migrate_to_v9(_conn: sqlite3.Connection) -> None:
     return None
 
 
+def _migrate_to_v10(conn: sqlite3.Connection) -> None:
+    """Phase 3.3 migration step: add active_watchlist.status + status_changed_at.
+
+    ``status NOT NULL DEFAULT 'active'`` backfills every existing watchlist row
+    to 'active' (there is no pre-3.3 benched ticker, so 'active' is correct).
+    ``status_changed_at`` is nullable — NULL until the state evaluator flips a
+    ticker. The CHECK keeps status to the two valid states. The new
+    ``watchlist_transitions`` table is created by the schema block above.
+    """
+    cur = conn.execute("PRAGMA table_info(active_watchlist)")
+    cols = {str(row[1]) for row in cur.fetchall()}
+    if "status" not in cols:
+        conn.execute(
+            "ALTER TABLE active_watchlist ADD COLUMN status TEXT NOT NULL "
+            "DEFAULT 'active' CHECK (status IN ('active','benched'))"
+        )
+    if "status_changed_at" not in cols:
+        conn.execute(
+            "ALTER TABLE active_watchlist ADD COLUMN status_changed_at TEXT"
+        )
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -358,6 +401,7 @@ def init_db() -> None:
         _migrate_to_v7(conn)
         _migrate_to_v8(conn)
         _migrate_to_v9(conn)
+        _migrate_to_v10(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -1315,6 +1359,128 @@ def add_to_active_watchlist(ticker: str, source: str) -> bool:
         conn.close()
 
 
+# ---- watchlist status / transitions (Phase 3.3) ----
+
+
+def get_watchlist_entries() -> list[dict[str, Any]]:
+    """Return every watchlist row with its status, oldest-added first.
+
+    Includes BOTH active and benched tickers. ``status`` defaults to 'active'
+    for rows that pre-date the v10 column add (the migration backfills them).
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT ticker, source, status, added_at, status_changed_at "
+            "FROM active_watchlist ORDER BY added_at ASC, ticker ASC"
+        ).fetchall()
+    finally:
+        conn.close()
+    keys: set[str] = set(rows[0].keys()) if rows else set()
+    return [
+        {
+            "ticker": str(r["ticker"]),
+            "source": str(r["source"]),
+            "status": (
+                str(r["status"]) if "status" in keys and r["status"] is not None
+                else "active"
+            ),
+            "added_at": str(r["added_at"]),
+            "status_changed_at": (
+                r["status_changed_at"] if "status_changed_at" in keys else None
+            ),
+        }
+        for r in rows
+    ]
+
+
+def set_watchlist_status(
+    ticker: str, status: str, *, changed_at: datetime | None = None
+) -> None:
+    """Set a ticker's active/benched status and stamp status_changed_at.
+
+    Validates ``status`` against the allowed set so a typo fails loud rather
+    than silently writing a bad state. A no-op if the ticker isn't present.
+    """
+    if status not in VALID_WATCHLIST_STATUSES:
+        raise ValueError(
+            f"Invalid status '{status}' "
+            f"(expected one of {sorted(VALID_WATCHLIST_STATUSES)})"
+        )
+    when = (changed_at if changed_at is not None else datetime.now(UTC)).isoformat()
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE active_watchlist SET status = ?, status_changed_at = ? "
+            "WHERE ticker = ?",
+            (status, when, ticker),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def insert_watchlist_transition(
+    *,
+    ticker: str,
+    from_status: str,
+    to_status: str,
+    evaluated_at: datetime,
+    win_rate: float | None,
+    closed_count: int,
+    expectancy: float | None,
+    reason: str,
+) -> None:
+    """Record one active<->benched transition in the audit table."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO watchlist_transitions ("
+            "  ticker, from_status, to_status, evaluated_at, "
+            "  win_rate, closed_count, expectancy, reason"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ticker,
+                from_status,
+                to_status,
+                evaluated_at.isoformat(),
+                win_rate,
+                int(closed_count),
+                expectancy,
+                reason,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_watchlist_transitions(limit: int = 100) -> list[dict[str, Any]]:
+    """Return recent watchlist transitions, newest first."""
+    sql = (
+        "SELECT * FROM watchlist_transitions "
+        "ORDER BY evaluated_at DESC, id DESC LIMIT ?"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, (limit,)).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "ticker": str(r["ticker"]),
+            "from_status": str(r["from_status"]),
+            "to_status": str(r["to_status"]),
+            "evaluated_at": str(r["evaluated_at"]),
+            "win_rate": r["win_rate"],
+            "closed_count": int(r["closed_count"]),
+            "expectancy": r["expectancy"],
+            "reason": str(r["reason"]),
+        }
+        for r in rows
+    ]
+
+
 # ---- discovery results (Phase 3.1) ----
 
 
@@ -1384,31 +1550,48 @@ def get_discovery_results(limit: int = 100) -> list[dict[str, Any]]:
 # ---- shadow trades + evaluations (Phase 3.1-LIVE) ----
 
 
-def get_resolved_shadow_outcomes(
-    ticker: str, since: datetime
+def get_resolved_outcomes(
+    ticker: str, since: datetime, track_mode: str | None = None
 ) -> list[tuple[str, float | None]]:
-    """Return ``(outcome, pnl_pct)`` for a ticker's RESOLVED shadow trades.
+    """Return ``(outcome, pnl_pct)`` for a ticker's RESOLVED trades.
 
-    Only ``track_mode='shadow'`` trades with ``outcome IN ('win','loss')`` and
-    ``closed_at >= since`` (the recent window). Expired/open trades and active
-    trades are excluded. Drives the live-shadow promotion evaluator.
+    Win/loss trades with ``closed_at >= since`` (the recent window). Expired
+    and open trades are excluded. ``track_mode`` filters to one mode, or
+    ``None`` (default) spans ALL modes — the state evaluator needs every real
+    outcome regardless of how the ticker was tracked (a benched ticker's
+    recovery trades are tagged 'shadow' but are still its outcomes).
     """
+    clause = ""
+    params: list[Any] = [ticker, since.isoformat()]
+    if track_mode is not None:
+        clause = " AND trades.track_mode = ?"
+        params.append(track_mode)
     sql = (
         "SELECT trades.outcome AS outcome, trades.pnl_pct AS pnl_pct "
         "FROM trades JOIN signals ON signals.id = trades.signal_id "
-        "WHERE trades.track_mode = 'shadow' "
-        "  AND trades.outcome IN ('win','loss') "
+        "WHERE trades.outcome IN ('win','loss') "
         "  AND signals.ticker = ? "
         "  AND trades.closed_at IS NOT NULL "
         "  AND trades.closed_at >= ? "
+        f"{clause} "  # noqa: S608 - whitelisted fragment
         "ORDER BY trades.closed_at ASC"
     )
     conn = get_connection()
     try:
-        rows = conn.execute(sql, (ticker, since.isoformat())).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     finally:
         conn.close()
     return [(str(r["outcome"]), r["pnl_pct"]) for r in rows]
+
+
+def get_resolved_shadow_outcomes(
+    ticker: str, since: datetime
+) -> list[tuple[str, float | None]]:
+    """Resolved shadow trades only — drives live-shadow promotion.
+
+    Thin wrapper over :func:`get_resolved_outcomes` with ``track_mode='shadow'``.
+    """
+    return get_resolved_outcomes(ticker, since, track_mode="shadow")
 
 
 def insert_shadow_evaluations(

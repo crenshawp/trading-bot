@@ -84,6 +84,9 @@ VALID_PREDICTION_DIRECTIONS: frozenset[str] = frozenset({"HIGHER", "LOWER"})
 # headline reports; 'shadow' trades are opened silently on the shadow universe
 # (no alert) and drive live-shadow promotion. Existing rows backfill to 'active'.
 VALID_TRACK_MODES: frozenset[str] = frozenset({"active", "shadow"})
+# Phase 3.3: active_watchlist status. 'active' tickers alert; 'benched' tickers
+# are still scanned/resolved (data never stops) but their alerts are suppressed.
+VALID_WATCHLIST_STATUSES: frozenset[str] = frozenset({"active", "benched"})
 
 
 @dataclass(frozen=True)
