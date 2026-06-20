@@ -87,4 +87,11 @@ addopts = "-v --cov=trading_bot --cov-report=term-missing --cov-fail-under=91"
 # in Phase 1.2 (spec §6: "Do not test the signal detection logic itself").
 # The new wiring (log_signal, _load_secrets, main, _normalize_*) IS exercised
 # in tests/test_scanner.py — it just doesn't count toward the percentage.
-omit = ["trading_bot/scanner.py"]
+# watchlist_state.py is omitted ONLY during the Phase 3.3 build-out so
+# intermediate per-section commits stay green; its tests land in the final
+# "add state-machine, floor, scan, and decoupling tests" commit (Section 6),
+# which removes this line so the module is coverage-checked.
+omit = [
+    "trading_bot/scanner.py",
+    "trading_bot/watchlist_state.py",
+]
