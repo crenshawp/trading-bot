@@ -480,6 +480,101 @@ def test_cli_watchlist_status(
     assert "Benched (1)" in out and "BEN" in out
 
 
+# ───────────────────── Phase 4 pairs subcommands ─────────────────────
+
+
+def test_cli_pairs_evaluate(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import UTC, datetime
+
+    from trading_bot import signal_pairs
+
+    evals = [
+        signal_pairs.PairEvaluation(
+            "GOOGL", "ema21_pullback", "enabled", 10, 40.0, -0.4, "mute", "bad"),
+        signal_pairs.PairEvaluation(
+            "META", "overbought_reversal", "muted", 10, 70.0, 1.4, "enable", "good"),
+        signal_pairs.PairEvaluation(
+            "AMZN", "trend_continuation", "enabled", 10, 80.0, 1.4, "hold", "ok"),
+    ]
+    run = signal_pairs.PairRun(evaluated_at=datetime.now(UTC), evaluations=evals)
+    captured: dict[str, object] = {}
+
+    def fake(**kwargs: object) -> signal_pairs.PairRun:
+        captured.update(kwargs)
+        return run
+
+    monkeypatch.setattr("trading_bot.signal_pairs.evaluate_signal_pairs", fake)
+    _run(["pairs", "evaluate"])
+    out = capsys.readouterr().out
+    assert "PAIRS EVALUATE" in out
+    assert "Muted (1)" in out and "GOOGL/ema21_pullback" in out
+    assert "Enabled (1)" in out and "META/overbought_reversal" in out
+    assert "Muted now (1)" in out          # only GOOGL ends muted
+    assert captured["dry_run"] is False
+
+
+def test_cli_pairs_evaluate_dry_run_passes_flag(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import UTC, datetime
+
+    from trading_bot import signal_pairs
+
+    run = signal_pairs.PairRun(evaluated_at=datetime.now(UTC), evaluations=[])
+    captured: dict[str, object] = {}
+
+    def fake(**kwargs: object) -> signal_pairs.PairRun:
+        captured.update(kwargs)
+        return run
+
+    monkeypatch.setattr("trading_bot.signal_pairs.evaluate_signal_pairs", fake)
+    _run(["pairs", "evaluate", "--dry-run"])
+    assert "DRY RUN" in capsys.readouterr().out
+    assert captured["dry_run"] is True
+
+
+def test_cli_pairs_status(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import signal_pairs
+
+    stats = [
+        signal_pairs.PairStat("GOOGL", "ema21_pullback", "muted", 10, 40.0, -0.4),
+        signal_pairs.PairStat("AMZN", "trend_continuation", "enabled", 12, 80.0, 1.4),
+    ]
+    monkeypatch.setattr("trading_bot.signal_pairs.pair_stats", lambda **_kw: stats)
+    _run(["pairs", "status"])
+    out = capsys.readouterr().out
+    assert "PAIRS STATUS" in out
+    assert "Enabled (1)" in out and "AMZN" in out
+    assert "Muted (1)" in out and "GOOGL" in out
+
+
+def test_cli_report_pairs(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import signal_pairs
+
+    stats = [
+        signal_pairs.PairStat("GOOGL", "ema21_pullback", "muted", 10, 40.0, -0.4),
+    ]
+    monkeypatch.setattr("trading_bot.signal_pairs.pair_stats", lambda **_kw: stats)
+    _run(["report", "pairs"])
+    out = capsys.readouterr().out
+    assert "PER-PAIR PERFORMANCE" in out
+    assert "GOOGL" in out and "muted" in out
+
+
 # ───────────────────── Phase 2.1 regime + by-regime subcommands ─────────────────────
 
 

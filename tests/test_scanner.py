@@ -326,13 +326,15 @@ def _offline_context(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("trading_bot.vix.get_current_vix", _no_vix)
 
 
-def _stock_signal(ticker: str = "MSFT") -> dict[str, Any]:
+def _stock_signal(
+    ticker: str = "MSFT", setup: str = "EMA21 Pullback",
+) -> dict[str, Any]:
     return {
         "ticker":      ticker,
         "asset_type":  "stock",
         "trade_type":  "📆 SWING TRADE",
         "direction":   "CALL 📈",
-        "setup":       "EMA21 Pullback",
+        "setup":       setup,
         "detail":      "test",
         "price":       100.0,
         "take_profit": 104.0,
@@ -547,3 +549,64 @@ def test_benched_ticker_not_in_shadow_universe_is_still_scanned(
     scanner.scan_stocks()
 
     assert fired == ["BEN"]
+
+
+# ─────────────── per-pair alert gate (Phase 4) ───────────────
+
+
+def _stub_two_setup_pipeline(
+    monkeypatch: pytest.MonkeyPatch, *, entries: list[tuple[str, str]],
+) -> None:
+    """Each ticker fires two distinct setups: EMA21 Pullback + Trend Continuation."""
+    monkeypatch.setattr(scanner, "is_market_open", lambda: True)
+    monkeypatch.setattr(scanner, "_active_stock_watchlist_entries", lambda: entries)
+    monkeypatch.setattr(scanner, "get_stock_data", lambda t: {"df": t})
+    monkeypatch.setattr(scanner, "add_stock_indicators", lambda df: df)
+    monkeypatch.setattr(
+        scanner, "detect_stock_signals",
+        lambda t, _df: [
+            _stock_signal(t, "EMA21 Pullback"),
+            _stock_signal(t, "Trend Continuation"),
+        ],
+    )
+
+
+def test_muted_pair_is_shadow_while_enabled_pair_on_same_ticker_alerts(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db.add_to_active_watchlist("MSFT", "seed")  # active ticker
+    db.set_signal_pair_status("MSFT", "ema21_pullback", "muted")
+    # trend_continuation has no row -> default-enabled.
+    _stub_two_setup_pipeline(monkeypatch, entries=[("MSFT", "active")])
+    calls: dict[str, dict[str, Any]] = {}
+    monkeypatch.setattr(
+        scanner, "send_notification",
+        lambda s, **kw: calls.__setitem__(s["setup"], kw),
+    )
+
+    scanner.scan_stocks()
+
+    # Muted pair: shadow + suppressed. Enabled pair on the same ticker: alerts.
+    assert calls["EMA21 Pullback"] == {"track_mode": "shadow", "alert": False}
+    assert calls["Trend Continuation"] == {}
+
+
+def test_benched_ticker_alerts_on_nothing_regardless_of_pair_status(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db.add_to_active_watchlist("MSFT", "seed")
+    db.set_watchlist_status("MSFT", "benched")
+    # Pair explicitly ENABLED — ticker status must still dominate.
+    db.set_signal_pair_status("MSFT", "ema21_pullback", "enabled")
+    _stub_two_setup_pipeline(monkeypatch, entries=[("MSFT", "benched")])
+    calls: dict[str, dict[str, Any]] = {}
+    monkeypatch.setattr(
+        scanner, "send_notification",
+        lambda s, **kw: calls.__setitem__(s["setup"], kw),
+    )
+
+    scanner.scan_stocks()
+
+    # Every setup on a benched ticker is shadow + suppressed.
+    assert calls["EMA21 Pullback"] == {"track_mode": "shadow", "alert": False}
+    assert calls["Trend Continuation"] == {"track_mode": "shadow", "alert": False}
