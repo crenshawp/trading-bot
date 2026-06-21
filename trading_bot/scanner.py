@@ -122,6 +122,25 @@ def _active_stock_watchlist_entries() -> list[tuple[str, str]]:
     return [(str(e["ticker"]), str(e["status"])) for e in entries]
 
 
+def _pair_is_enabled(ticker: str, setup: object) -> bool:
+    """Per-pair alert gate (Phase 4).
+
+    Returns True if the ``(ticker, signal_type)`` pair is enabled. BEST-EFFORT
+    ISOLATION: if the gate lookup fails for any reason, default to enabled
+    (alerting) so a gate error can never silence a live signal — and log it.
+    """
+    try:
+        signal_type = _normalize_signal_type(str(setup))
+        return db.get_signal_pair_status(ticker, signal_type) == "enabled"
+    except Exception as exc:  # noqa: BLE001 - a gate failure must not break alerting
+        print(
+            f"  pair gate lookup failed for {ticker}/{setup}, "
+            f"defaulting enabled: {exc}",
+            file=sys.stderr,
+        )
+        return True
+
+
 def _load_secrets() -> None:
     """Populate module-level credential constants from the secrets layer.
 
@@ -1324,11 +1343,12 @@ def send_notification(signal, *, track_mode="active", alert=True):
 def scan_stocks():
     """Runs once per day at market open — daily candles, swing trades.
 
-    Phase 3.3: scans every watchlist ticker, ACTIVE and BENCHED alike. Active
-    tickers alert (track_mode='active'); benched tickers are scanned + opened
-    silently (track_mode='shadow', alert suppressed) so their data collection
-    never stops — they are scanned here UNCONDITIONALLY, independent of the
-    100-name shadow universe, so a benched ticker can never go dark.
+    Gating hierarchy (Phase 4): an alert fires ONLY IF the ticker is 'active'
+    AND its (ticker, signal_type) pair is 'enabled'. Ticker status dominates —
+    a benched ticker alerts on nothing. Within an active ticker a muted pair is
+    silent (fires as track_mode='shadow', alert suppressed, keeps collecting
+    data) while that ticker's enabled pairs still alert. Benched tickers and
+    muted pairs are scanned here UNCONDITIONALLY so nothing ever goes dark.
     """
     if not is_market_open():
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Market closed — skipping stock scan")
@@ -1345,9 +1365,18 @@ def scan_stocks():
             signals = detect_stock_signals(ticker, df)
             is_active = status == "active"
             for s in signals:
-                if is_active:
+                # Alert only when the ticker is active AND the pair is enabled.
+                # _pair_is_enabled is short-circuited for benched tickers.
+                if is_active and _pair_is_enabled(ticker, s.get("setup", "")):
                     send_notification(s)
                 else:
+                    if is_active:
+                        # Active ticker, muted pair: gate the alert but keep
+                        # collecting data so the pair can recover.
+                        print(
+                            f"  [muted pair] {ticker}/{s.get('setup', '')} — "
+                            f"alert gated, opening as shadow"
+                        )
                     send_notification(s, track_mode="shadow", alert=False)
             if not signals:
                 print(f"  {ticker}: No signals")
