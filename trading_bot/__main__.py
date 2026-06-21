@@ -1000,6 +1000,91 @@ def cmd_watchlist_status() -> None:
     _print_watchlist_rows(benched)
 
 
+# ---- per-pair gate CLI (Phase 4) ----
+
+
+def _sp_bar_line() -> str:
+    return (
+        f"Bars: mute expectancy <= {config.SP_MUTE_EXPECTANCY}, "
+        f"enable >= {config.SP_ENABLE_EXPECTANCY}, "
+        f"min sample {config.SP_MIN_CLOSED_SIGNALS}, "
+        f"window {config.SP_WINDOW_DAYS}d"
+    )
+
+
+def cmd_pairs_evaluate(*, dry_run: bool) -> None:
+    run = signal_pairs.evaluate_signal_pairs(dry_run=dry_run)
+
+    header = "PAIRS EVALUATE"
+    if dry_run:
+        header += "  (DRY RUN - no changes)"
+    print(header)
+    print("-" * 60)
+    print(_sp_bar_line())
+    print()
+
+    def _line(ev: signal_pairs.PairEvaluation) -> str:
+        return (
+            f"  {ev.ticker}/{ev.signal_type:<22} {ev.status} -> "
+            f"{ev.new_status:<8} closed={ev.closed_count} "
+            f"expectancy={_fmt_signed(ev.expectancy, 3)}  {ev.reason}"
+        )
+
+    print(f"Muted ({len(run.mutes)}):")
+    if not run.mutes:
+        print("  (none)")
+    for ev in run.mutes:
+        print(_line(ev))
+    print()
+
+    print(f"Enabled ({len(run.enables)}):")
+    if not run.enables:
+        print("  (none)")
+    for ev in run.enables:
+        print(_line(ev))
+    print()
+
+    print(f"Holds: {len(run.holds)} (dead band / insufficient sample)")
+    print()
+
+    muted_now = sorted(
+        f"{e.ticker}/{e.signal_type}"
+        for e in run.evaluations if e.new_status == "muted"
+    )
+    enabled_now = sum(1 for e in run.evaluations if e.new_status == "enabled")
+    print(f"Muted now ({len(muted_now)}): {', '.join(muted_now) or '(none)'}")
+    print(f"Enabled now: {enabled_now}")
+
+
+def _print_pair_rows(rows: list[signal_pairs.PairStat]) -> None:
+    if not rows:
+        print("  (none)")
+        return
+    print(
+        f"  {'Ticker':<8} {'Signal type':<22} {'Closed':>6}  "
+        f"{'Win rate':>8}  {'Expectancy':>10}"
+    )
+    for s in rows:
+        print(
+            f"  {s.ticker:<8} {s.signal_type:<22} {s.closed_count:>6}  "
+            f"{_fmt_win_rate(s.win_rate):>8}  {_fmt_signed(s.expectancy, 3):>10}"
+        )
+
+
+def cmd_pairs_status() -> None:
+    stats = signal_pairs.pair_stats()
+    enabled = [s for s in stats if s.status == "enabled"]
+    muted = [s for s in stats if s.status == "muted"]
+
+    print("PAIRS STATUS")
+    print("-" * 60)
+    print(f"Enabled ({len(enabled)}):")
+    _print_pair_rows(enabled)
+    print()
+    print(f"Muted ({len(muted)}):")
+    _print_pair_rows(muted)
+
+
 # ---- predictions CLI (Phase 2.2b) ----
 
 # Seeded defaults — duplicated from scanner._PRED_DEFAULTS so the CLI can
@@ -1393,6 +1478,16 @@ def main() -> None:
         help="Evaluate without changing any statuses or recording transitions",
     )
 
+    # per-pair gate (Phase 4)
+    pairs_parser = sub.add_parser("pairs")
+    pairs_sub = pairs_parser.add_subparsers(dest="pairs_cmd", required=True)
+    pairs_sub.add_parser("status")
+    pairs_eval_p = pairs_sub.add_parser("evaluate")
+    pairs_eval_p.add_argument(
+        "--dry-run", action="store_true",
+        help="Evaluate without changing any statuses or recording transitions",
+    )
+
     # predictions (Phase 2.2b)
     pred_parser = sub.add_parser("predictions")
     pred_sub = pred_parser.add_subparsers(dest="predictions_cmd", required=True)
@@ -1527,6 +1622,11 @@ def main() -> None:
             cmd_watchlist_status()
         elif args.watchlist_cmd == "evaluate":
             cmd_watchlist_evaluate(dry_run=args.dry_run)
+    elif args.command == "pairs":
+        if args.pairs_cmd == "status":
+            cmd_pairs_status()
+        elif args.pairs_cmd == "evaluate":
+            cmd_pairs_evaluate(dry_run=args.dry_run)
     elif args.command == "predictions":
         if args.predictions_cmd == "enable":
             cmd_predictions_enable()
