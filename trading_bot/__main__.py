@@ -18,6 +18,7 @@ from trading_bot import (
     secrets,
     settings,
     shadow_discovery,
+    signal_pairs,
     vix,
     watchlist_state,
 )
@@ -239,6 +240,40 @@ def cmd_report_cross() -> None:
         "BY SIGNAL TYPE x TICKER  (slices with >=3 trades)",
         label_header="Signal / Ticker",
     ))
+
+
+def cmd_report_pairs() -> None:
+    """Per-(ticker, signal_type) performance (Phase 4).
+
+    Windowed resolved stats across ALL track_modes — so a muted pair (which
+    fires as shadow) still shows its real standing — plus its current gate
+    status. Headline active reports are unaffected: muted pairs fire as shadow
+    and are already excluded from those.
+    """
+    stats = signal_pairs.pair_stats()
+    print(
+        f"PER-PAIR PERFORMANCE  "
+        f"(window {config.SP_WINDOW_DAYS}d, all track modes)"
+    )
+    print("-" * 72)
+    if not stats:
+        print("  (no traded pairs yet)")
+        return
+    # Worst expectancy first so problem pairs surface; None (no data) last.
+    rows = sorted(
+        stats,
+        key=lambda s: (s.expectancy is None, s.expectancy if s.expectancy is not None else 0.0),
+    )
+    print(
+        f"  {'Ticker':<8} {'Signal type':<22} {'Closed':>6}  "
+        f"{'Win rate':>8}  {'Expectancy':>10}  {'Status':<8}"
+    )
+    for s in rows:
+        print(
+            f"  {s.ticker:<8} {s.signal_type:<22} {s.closed_count:>6}  "
+            f"{_fmt_win_rate(s.win_rate):>8}  {_fmt_signed(s.expectancy, 3):>10}  "
+            f"{s.status:<8}"
+        )
 
 
 def cmd_report_daily_backfill() -> None:
@@ -1283,6 +1318,7 @@ def main() -> None:
     _add_min_context(by_rv_p)
     report_sub.add_parser("by-context")          # Phase 2.3
     report_sub.add_parser("context-matrix")      # Phase 2.3
+    report_sub.add_parser("pairs")               # Phase 4
     pred_report_p = report_sub.add_parser("predictions")
     pred_report_axis = pred_report_p.add_mutually_exclusive_group()
     pred_report_axis.add_argument("--by-regime", action="store_true",
@@ -1440,6 +1476,8 @@ def main() -> None:
             cmd_report_by_context()
         elif args.report_cmd == "context-matrix":
             cmd_report_context_matrix()
+        elif args.report_cmd == "pairs":
+            cmd_report_pairs()
         elif args.report_cmd == "predictions":
             mc = _maybe_min_context(args)
             if getattr(args, "by_regime", False):
