@@ -87,6 +87,10 @@ VALID_TRACK_MODES: frozenset[str] = frozenset({"active", "shadow"})
 # Phase 3.3: active_watchlist status. 'active' tickers alert; 'benched' tickers
 # are still scanned/resolved (data never stops) but their alerts are suppressed.
 VALID_WATCHLIST_STATUSES: frozenset[str] = frozenset({"active", "benched"})
+# Phase 4: (ticker, signal_type) pair gate. 'enabled' pairs alert; 'muted'
+# pairs fire as shadow (no alert) but keep collecting data. A pair with no row
+# is treated as 'enabled' (default-enabled).
+VALID_PAIR_STATUSES: frozenset[str] = frozenset({"enabled", "muted"})
 
 
 @dataclass(frozen=True)

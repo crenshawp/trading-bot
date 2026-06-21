@@ -19,6 +19,7 @@ from trading_bot.models import (
     VALID_DIRECTIONS,
     VALID_MARKET_REGIMES,
     VALID_OUTCOMES,
+    VALID_PAIR_STATUSES,
     VALID_PREDICTION_DIRECTIONS,
     VALID_PREDICTION_OUTCOMES,
     VALID_TRACK_MODES,
@@ -30,6 +31,7 @@ from trading_bot.models import (
     Trade,
 )
 
+# Version 11 (Phase 4) — adds signal_pair_status + signal_pair_transitions.
 # Version 10 (Phase 3.3) — adds active_watchlist.status + status_changed_at
 #                          and the watchlist_transitions table.
 # Version 9 (Phase 3.1-LIVE) — adds the shadow_evaluations table.
@@ -40,7 +42,7 @@ from trading_bot.models import (
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -220,6 +222,37 @@ CREATE TABLE IF NOT EXISTS watchlist_transitions (
 
 CREATE INDEX IF NOT EXISTS idx_watchlist_transitions_ticker
     ON watchlist_transitions (ticker);
+
+-- Phase 4: per-(ticker, signal_type) gate. A pair with NO row is treated as
+-- ENABLED (default-enabled — innocent until proven losing); a row only exists
+-- once the evaluator has muted/enabled it. status_changed_at is NULL until the
+-- first transition.
+CREATE TABLE IF NOT EXISTS signal_pair_status (
+    ticker TEXT NOT NULL,
+    signal_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'enabled'
+        CHECK (status IN ('enabled','muted')),
+    status_changed_at TEXT,
+    PRIMARY KEY (ticker, signal_type)
+);
+
+-- Phase 4: audit trail of every enabled<->muted transition the per-pair
+-- evaluator makes. One row per actual status change.
+CREATE TABLE IF NOT EXISTS signal_pair_transitions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    signal_type TEXT NOT NULL,
+    from_status TEXT NOT NULL,
+    to_status TEXT NOT NULL,
+    evaluated_at TEXT NOT NULL,
+    win_rate REAL,
+    closed_count INTEGER NOT NULL,
+    expectancy REAL,
+    reason TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_pair_transitions_pair
+    ON signal_pair_transitions (ticker, signal_type);
 """
 
 # Whitelist for update_trade — never interpolate user input into SQL column names.
@@ -239,6 +272,7 @@ _TABLE_NAMES: tuple[str, ...] = (
     "regime_snapshots", "vix_snapshots",
     "predictions", "settings", "active_watchlist", "discovery_results",
     "shadow_evaluations", "watchlist_transitions",
+    "signal_pair_status", "signal_pair_transitions",
 )
 
 # Whitelist for update_prediction — resolution flow + Phase 2.3 context backfill.
@@ -388,6 +422,16 @@ def _migrate_to_v10(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_to_v11(_conn: sqlite3.Connection) -> None:
+    """Phase 4 migration step.
+
+    Nothing to ALTER — the new ``signal_pair_status`` and
+    ``signal_pair_transitions`` tables are created by the
+    ``CREATE TABLE IF NOT EXISTS`` block above. Documented hook only.
+    """
+    return None
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -402,6 +446,7 @@ def init_db() -> None:
         _migrate_to_v8(conn)
         _migrate_to_v9(conn)
         _migrate_to_v10(conn)
+        _migrate_to_v11(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -1481,6 +1526,161 @@ def get_watchlist_transitions(limit: int = 100) -> list[dict[str, Any]]:
     ]
 
 
+# ---- signal pair status / transitions (Phase 4) ----
+
+
+def get_signal_pair_status(ticker: str, signal_type: str) -> str:
+    """Return a pair's gate status, or ``'enabled'`` when no row exists.
+
+    Default-enabled (innocent until proven losing): a (ticker, signal_type)
+    pair only has a row once the evaluator has muted/enabled it.
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT status FROM signal_pair_status "
+            "WHERE ticker = ? AND signal_type = ?",
+            (ticker, signal_type),
+        ).fetchone()
+    finally:
+        conn.close()
+    return str(row["status"]) if row is not None else "enabled"
+
+
+def set_signal_pair_status(
+    ticker: str,
+    signal_type: str,
+    status: str,
+    *,
+    changed_at: datetime | None = None,
+) -> None:
+    """Upsert a pair's gate status and stamp status_changed_at.
+
+    Validates ``status`` so a typo fails loud rather than writing a bad gate.
+    """
+    if status not in VALID_PAIR_STATUSES:
+        raise ValueError(
+            f"Invalid status '{status}' "
+            f"(expected one of {sorted(VALID_PAIR_STATUSES)})"
+        )
+    when = (changed_at if changed_at is not None else datetime.now(UTC)).isoformat()
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO signal_pair_status "
+            "  (ticker, signal_type, status, status_changed_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(ticker, signal_type) DO UPDATE SET "
+            "  status = excluded.status, "
+            "  status_changed_at = excluded.status_changed_at",
+            (ticker, signal_type, status, when),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_signal_pair_statuses() -> dict[tuple[str, str], str]:
+    """Return every EXPLICIT (ticker, signal_type) -> status row.
+
+    Pairs absent from this mapping are enabled by default — callers that need
+    a pair's effective status should use :func:`get_signal_pair_status`.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT ticker, signal_type, status FROM signal_pair_status"
+        ).fetchall()
+    finally:
+        conn.close()
+    return {
+        (str(r["ticker"]), str(r["signal_type"])): str(r["status"]) for r in rows
+    }
+
+
+def insert_signal_pair_transition(
+    *,
+    ticker: str,
+    signal_type: str,
+    from_status: str,
+    to_status: str,
+    evaluated_at: datetime,
+    win_rate: float | None,
+    closed_count: int,
+    expectancy: float | None,
+    reason: str,
+) -> None:
+    """Record one enabled<->muted pair transition in the audit table."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO signal_pair_transitions ("
+            "  ticker, signal_type, from_status, to_status, evaluated_at, "
+            "  win_rate, closed_count, expectancy, reason"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ticker,
+                signal_type,
+                from_status,
+                to_status,
+                evaluated_at.isoformat(),
+                win_rate,
+                int(closed_count),
+                expectancy,
+                reason,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_signal_pair_transitions(limit: int = 100) -> list[dict[str, Any]]:
+    """Return recent signal-pair transitions, newest first."""
+    sql = (
+        "SELECT * FROM signal_pair_transitions "
+        "ORDER BY evaluated_at DESC, id DESC LIMIT ?"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, (limit,)).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "ticker": str(r["ticker"]),
+            "signal_type": str(r["signal_type"]),
+            "from_status": str(r["from_status"]),
+            "to_status": str(r["to_status"]),
+            "evaluated_at": str(r["evaluated_at"]),
+            "win_rate": r["win_rate"],
+            "closed_count": int(r["closed_count"]),
+            "expectancy": r["expectancy"],
+            "reason": str(r["reason"]),
+        }
+        for r in rows
+    ]
+
+
+def get_traded_signal_pairs() -> list[tuple[str, str]]:
+    """Distinct (ticker, signal_type) pairs that have at least one trade.
+
+    Joins trades -> signals so only pairs that have actually fired are
+    returned. Drives the per-pair evaluator and the per-pair report.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT signals.ticker AS ticker, "
+            "       signals.signal_type AS signal_type "
+            "FROM trades JOIN signals ON signals.id = trades.signal_id "
+            "ORDER BY signals.ticker ASC, signals.signal_type ASC"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [(str(r["ticker"]), str(r["signal_type"])) for r in rows]
+
+
 # ---- discovery results (Phase 3.1) ----
 
 
@@ -1551,7 +1751,10 @@ def get_discovery_results(limit: int = 100) -> list[dict[str, Any]]:
 
 
 def get_resolved_outcomes(
-    ticker: str, since: datetime, track_mode: str | None = None
+    ticker: str,
+    since: datetime,
+    track_mode: str | None = None,
+    signal_type: str | None = None,
 ) -> list[tuple[str, float | None]]:
     """Return ``(outcome, pnl_pct)`` for a ticker's RESOLVED trades.
 
@@ -1560,12 +1763,17 @@ def get_resolved_outcomes(
     ``None`` (default) spans ALL modes — the state evaluator needs every real
     outcome regardless of how the ticker was tracked (a benched ticker's
     recovery trades are tagged 'shadow' but are still its outcomes).
+    ``signal_type`` narrows to a single setup so the same query serves the
+    per-(ticker, signal_type) pair evaluator (Phase 4).
     """
-    clause = ""
+    clauses = ""
     params: list[Any] = [ticker, since.isoformat()]
     if track_mode is not None:
-        clause = " AND trades.track_mode = ?"
+        clauses += " AND trades.track_mode = ?"
         params.append(track_mode)
+    if signal_type is not None:
+        clauses += " AND signals.signal_type = ?"
+        params.append(signal_type)
     sql = (
         "SELECT trades.outcome AS outcome, trades.pnl_pct AS pnl_pct "
         "FROM trades JOIN signals ON signals.id = trades.signal_id "
@@ -1573,7 +1781,7 @@ def get_resolved_outcomes(
         "  AND signals.ticker = ? "
         "  AND trades.closed_at IS NOT NULL "
         "  AND trades.closed_at >= ? "
-        f"{clause} "  # noqa: S608 - whitelisted fragment
+        f"{clauses} "  # noqa: S608 - whitelisted fragments
         "ORDER BY trades.closed_at ASC"
     )
     conn = get_connection()

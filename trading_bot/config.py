@@ -32,3 +32,15 @@ SM_WINDOW_DAYS: int = 60          # recency window for the expectancy stats
 SM_DEMOTE_EXPECTANCY: float = 0.0   # active -> benched when expectancy <= this
 SM_PROMOTE_EXPECTANCY: float = 0.05  # benched -> active when expectancy >= this
 SM_MIN_ACTIVE: int = 5            # never demote below this many active tickers
+
+# ──────────────────────────────────────────────────────────────────────────
+# Per-pair signal gating (Phase 4)
+# ──────────────────────────────────────────────────────────────────────────
+# (ticker, signal_type) enable/mute thresholds. Mirror the watchlist state
+# machine (SM_*) one grain finer for coherence: same window, same min sample,
+# same hysteresis dead band. No min-floor — muting one setup on a ticker can
+# never empty the watchlist, so the floor is deliberately omitted.
+SP_MIN_CLOSED_SIGNALS: int = 10    # minimum resolved trades to act (else hold)
+SP_WINDOW_DAYS: int = 60           # recency window for the expectancy stats
+SP_MUTE_EXPECTANCY: float = 0.0     # enabled -> muted when expectancy <= this
+SP_ENABLE_EXPECTANCY: float = 0.05  # muted -> enabled when expectancy >= this
