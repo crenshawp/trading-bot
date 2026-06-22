@@ -21,6 +21,9 @@ KNOWN_SECRETS: frozenset[str] = frozenset({
     "PUSHOVER_USER_KEY",
     "PUSHOVER_APP_TOKEN",
     "NEWSAPI_KEY",
+    # Phase 5: advisory LLM sentiment scoring. Optional — when unset, sentiment
+    # fails soft to neutral and signals proceed unaffected.
+    "ANTHROPIC_API_KEY",
 })
 
 _SERVICE_NAME = "trading_bot"
