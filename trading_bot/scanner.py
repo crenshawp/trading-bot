@@ -31,12 +31,16 @@ from trading_bot import (
     context,
     db,
     earnings,
+    news_client,
     outcomes,
     performance,
     predictions,
     regime,
     settings,
     vix,
+)
+from trading_bot import (
+    sentiment as sentiment_mod,
 )
 from trading_bot.discovery_universe import SHADOW_UNIVERSE
 from trading_bot.models import Signal, Trade
@@ -164,14 +168,34 @@ def _should_check_earnings(signal: dict) -> bool:
     )
 
 
+def _score_signal_sentiment(signal: dict) -> object:
+    """Fetch news + score advisory sentiment for a signal that WILL alert.
+
+    Called only after the ticker-active, pair-enabled, and earnings-blackout
+    gates pass — so news/LLM cost is bounded to signals that actually alert.
+    Both the news client and the scorer are already fail-soft; this is wrapped
+    once more so the alert proceeds (with no sentiment) even on a surprise.
+    """
+    ticker = str(signal.get("ticker", ""))
+    try:
+        news = news_client.fetch_headlines(ticker)
+        return sentiment_mod.score(ticker, news)
+    except Exception as exc:  # noqa: BLE001 - advisory work must never block an alert
+        print(
+            f"  sentiment pipeline error for {ticker}, alerting without it: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
 def _emit_active_signal(signal: dict) -> None:
     """Handle a signal that passed ticker-active AND pair-enabled.
 
     The ONE hard gate runs first: if a known earnings report falls inside the
     trade's hold window, suppress the alert and do NOT open the trade. Otherwise
-    alert. (Phase 5 Section 5 layers advisory sentiment enrichment in here,
-    after the blackout gate, so news/LLM work only happens for signals that
-    will actually alert.)
+    score advisory sentiment (only now — after all alert-gating checks pass, so
+    news/LLM work happens solely for signals that will alert) and fire the
+    enriched alert.
     """
     if _should_check_earnings(signal):
         try:
@@ -193,7 +217,8 @@ def _emit_active_signal(signal: dict) -> None:
             )
             return
 
-    send_notification(signal)
+    sentiment_result = _score_signal_sentiment(signal)
+    send_notification(signal, sentiment=sentiment_result)
 
 
 def _load_secrets() -> None:
@@ -1317,7 +1342,21 @@ def detect_crypto_signals(ticker, df):
 # NOTIFICATIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def send_notification(signal, *, track_mode="active", alert=True):
+def _sentiment_alert_lines(sentiment: object) -> str:
+    """Render the advisory sentiment block for an alert, or '' when absent."""
+    if sentiment is None:
+        return ""
+    score = getattr(sentiment, "score", None)
+    label = getattr(sentiment, "label", None)
+    rationale = getattr(sentiment, "rationale", "")
+    score_txt = f"{score:+.2f}" if isinstance(score, (int, float)) else "n/a"
+    lines = f"Sentiment:   {label} ({score_txt}) — {rationale}\n"
+    if getattr(sentiment, "heavy_news", False):
+        lines += "Heavy news:  elevated headline volume — trade with care\n"
+    return lines
+
+
+def send_notification(signal, *, track_mode="active", alert=True, sentiment=None):
     """Persist the signal/trade and (unless suppressed) fire the alert.
 
     Phase 3.1-LIVE: ``track_mode`` tags the opened trade ('active' or
@@ -1325,9 +1364,13 @@ def send_notification(signal, *, track_mode="active", alert=True):
     shadow-universe signals. The DB write ALWAYS happens — shadow trades must
     accumulate so the resolver can settle them — only the notification is
     gated. Each suppressed alert is logged so the shadow layer is observable.
+
+    Phase 5: ``sentiment`` is an optional advisory ``SentimentResult`` — it is
+    persisted on the trade row and (for alerting signals) shown in the alert.
+    It NEVER suppresses anything.
     """
     try:
-        log_signal(signal, track_mode=track_mode)
+        log_signal(signal, track_mode=track_mode, sentiment=sentiment)
     except Exception as e:
         # DB write failure for the signal/trade row. Route to stderr so a
         # silently-failing log doesn't hide that a fired alert was never
@@ -1354,6 +1397,7 @@ def send_notification(signal, *, track_mode="active", alert=True):
         f"Stop Loss:   ${signal['stop_loss']:.2f}\n"
         f"Hold Time:   {signal['hold_days']}\n"
         f"Confidence:  {signal['confidence']}\n"
+        f"{_sentiment_alert_lines(sentiment)}"
         f"Time:        {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
     )
 
@@ -1362,25 +1406,37 @@ def send_notification(signal, *, track_mode="active", alert=True):
         print(msg)
         return
 
+    embed_fields = [
+        {"name": "Asset",       "value": signal['asset_type'].upper(), "inline": True},
+        {"name": "Type",        "value": signal['trade_type'],         "inline": True},
+        {"name": "Direction",   "value": signal['direction'],          "inline": True},
+        {"name": "Setup",       "value": signal['setup'],              "inline": False},
+        {"name": "Detail",      "value": signal['detail'],             "inline": False},
+        {"name": "Price",       "value": f"${signal['price']:.2f}",    "inline": True},
+        {"name": "Take Profit", "value": f"${signal['take_profit']:.2f}", "inline": True},
+        {"name": "Stop Loss",   "value": f"${signal['stop_loss']:.2f}",   "inline": True},
+        {"name": "Hold Time",   "value": signal['hold_days'],          "inline": True},
+        {"name": "Confidence",  "value": signal['confidence'],         "inline": True},
+    ]
+    if sentiment is not None:
+        _s = getattr(sentiment, "score", None)
+        _s_txt = f"{_s:+.2f}" if isinstance(_s, (int, float)) else "n/a"
+        embed_fields.append({
+            "name": "Sentiment",
+            "value": f"{getattr(sentiment, 'label', 'n/a')} ({_s_txt})"
+                     + ("  ⚠️ heavy news" if getattr(sentiment, "heavy_news", False) else ""),
+            "inline": True,
+        })
+    embed_fields.append(
+        {"name": "Time", "value": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "inline": True}
+    )
     try:
         resp = requests.post(DISCORD_WEBHOOK_URL, json={
             "content": "@everyone 🚨 TRADE ALERT",
             "embeds": [{
                 "title": f"🚨 TRADE ALERT — {signal['ticker']}",
                 "color": 3066993,
-                "fields": [
-                    {"name": "Asset",       "value": signal['asset_type'].upper(), "inline": True},
-                    {"name": "Type",        "value": signal['trade_type'],         "inline": True},
-                    {"name": "Direction",   "value": signal['direction'],          "inline": True},
-                    {"name": "Setup",       "value": signal['setup'],              "inline": False},
-                    {"name": "Detail",      "value": signal['detail'],             "inline": False},
-                    {"name": "Price",       "value": f"${signal['price']:.2f}",    "inline": True},
-                    {"name": "Take Profit", "value": f"${signal['take_profit']:.2f}", "inline": True},
-                    {"name": "Stop Loss",   "value": f"${signal['stop_loss']:.2f}",   "inline": True},
-                    {"name": "Hold Time",   "value": signal['hold_days'],          "inline": True},
-                    {"name": "Confidence",  "value": signal['confidence'],         "inline": True},
-                    {"name": "Time",        "value": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "inline": True},
-                ],
+                "fields": embed_fields,
             }],
         })
         _warn_if_bad_status(resp, "Discord")
@@ -1419,6 +1475,9 @@ def scan_stocks():
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Market closed — skipping stock scan")
         return
 
+    # Fresh per-cycle news cache so one cycle's fired signals reuse fetches but
+    # the next cycle gets current headlines.
+    news_client.clear_cache()
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scanning stocks...")
     for ticker, status in _active_stock_watchlist_entries():
         try:

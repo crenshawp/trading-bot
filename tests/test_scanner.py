@@ -495,12 +495,26 @@ def _stub_stock_pipeline(
     )
 
 
+def _offline_alert_externals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the active-alert path (earnings blackout + sentiment) offline."""
+    monkeypatch.setattr(
+        "trading_bot.earnings.is_in_blackout", lambda *a, **k: (False, "no blackout"),
+    )
+    monkeypatch.setattr(scanner, "_score_signal_sentiment", lambda s: None)
+
+
+def _alerted(kw: dict[str, Any]) -> bool:
+    """True if a captured send_notification call would alert (not suppressed)."""
+    return kw.get("alert", True) is True and kw.get("track_mode", "active") == "active"
+
+
 def test_scan_stocks_alerts_active_suppresses_benched(
     tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _stub_stock_pipeline(
         monkeypatch, entries=[("ACT", "active"), ("BEN", "benched")],
     )
+    _offline_alert_externals(monkeypatch)
     calls: dict[str, dict[str, Any]] = {}
     monkeypatch.setattr(
         scanner, "send_notification",
@@ -509,8 +523,8 @@ def test_scan_stocks_alerts_active_suppresses_benched(
 
     scanner.scan_stocks()
 
-    # Active fires with defaults (alerts); benched is shadow-tagged + suppressed.
-    assert calls["ACT"] == {}
+    # Active alerts (via _emit_active_signal); benched is shadow + suppressed.
+    assert _alerted(calls["ACT"])
     assert calls["BEN"] == {"track_mode": "shadow", "alert": False}
 
 
@@ -578,6 +592,7 @@ def test_muted_pair_is_shadow_while_enabled_pair_on_same_ticker_alerts(
     db.set_signal_pair_status("MSFT", "ema21_pullback", "muted")
     # trend_continuation has no row -> default-enabled.
     _stub_two_setup_pipeline(monkeypatch, entries=[("MSFT", "active")])
+    _offline_alert_externals(monkeypatch)
     calls: dict[str, dict[str, Any]] = {}
     monkeypatch.setattr(
         scanner, "send_notification",
@@ -588,7 +603,7 @@ def test_muted_pair_is_shadow_while_enabled_pair_on_same_ticker_alerts(
 
     # Muted pair: shadow + suppressed. Enabled pair on the same ticker: alerts.
     assert calls["EMA21 Pullback"] == {"track_mode": "shadow", "alert": False}
-    assert calls["Trend Continuation"] == {}
+    assert _alerted(calls["Trend Continuation"])
 
 
 def test_benched_ticker_alerts_on_nothing_regardless_of_pair_status(
