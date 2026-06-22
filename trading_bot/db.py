@@ -1695,6 +1695,51 @@ def get_signal_pair_transitions(limit: int = 100) -> list[dict[str, Any]]:
     ]
 
 
+def get_recent_trade_sentiment(limit: int = 20) -> list[dict[str, Any]]:
+    """Recent fired signals that carry advisory sentiment context (Phase 5).
+
+    Joins trades -> signals, newest first, restricted to trades that were
+    sentiment-scored (``sentiment_label`` populated — i.e. the active alerting
+    signals). Each row carries the signal identity, the sentiment fields, and
+    the eventual outcome so sentiment sits next to results.
+    """
+    sql = (
+        "SELECT signals.ticker AS ticker, "
+        "       signals.signal_type AS signal_type, "
+        "       signals.direction AS direction, "
+        "       trades.opened_at AS opened_at, "
+        "       trades.outcome AS outcome, "
+        "       trades.track_mode AS track_mode, "
+        "       trades.sentiment_score AS sentiment_score, "
+        "       trades.sentiment_label AS sentiment_label, "
+        "       trades.heavy_news AS heavy_news, "
+        "       trades.headline_count AS headline_count "
+        "FROM trades JOIN signals ON signals.id = trades.signal_id "
+        "WHERE trades.sentiment_label IS NOT NULL "
+        "ORDER BY trades.opened_at DESC LIMIT ?"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, (limit,)).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "ticker": str(r["ticker"]),
+            "signal_type": str(r["signal_type"]),
+            "direction": str(r["direction"]),
+            "opened_at": str(r["opened_at"]),
+            "outcome": r["outcome"],
+            "track_mode": str(r["track_mode"]),
+            "sentiment_score": r["sentiment_score"],
+            "sentiment_label": str(r["sentiment_label"]),
+            "heavy_news": bool(r["heavy_news"]),
+            "headline_count": r["headline_count"],
+        }
+        for r in rows
+    ]
+
+
 def get_traded_signal_pairs() -> list[tuple[str, str]]:
     """Distinct (ticker, signal_type) pairs that have at least one trade.
 

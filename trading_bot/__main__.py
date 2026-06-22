@@ -1085,6 +1085,36 @@ def cmd_pairs_status() -> None:
     _print_pair_rows(muted)
 
 
+# ---- sentiment CLI (Phase 5) ----
+
+
+def cmd_sentiment_status(limit: int = 20) -> None:
+    """Recent fired signals with their advisory sentiment context."""
+    rows = db.get_recent_trade_sentiment(limit=limit)
+    print("SENTIMENT STATUS  (recent scored signals)")
+    print("-" * 86)
+    if not rows:
+        print("  (no sentiment-scored signals yet)")
+        return
+    print(
+        f"  {'Opened':<20} {'Ticker':<8} {'Signal':<20} {'Score':>6}  "
+        f"{'Label':<8} {'News':>4}  {'Heavy':<5} {'Outcome':<8}"
+    )
+    for r in rows:
+        score = r["sentiment_score"]
+        score_txt = (
+            f"{score:+.2f}" if isinstance(score, (int, float)) else "   -"
+        )
+        opened = r["opened_at"][:19].replace("T", " ")
+        headlines = r["headline_count"] if r["headline_count"] is not None else "-"
+        print(
+            f"  {opened:<20} {r['ticker']:<8} {r['signal_type']:<20} "
+            f"{score_txt:>6}  {r['sentiment_label']:<8} {str(headlines):>4}  "
+            f"{('yes' if r['heavy_news'] else 'no'):<5} "
+            f"{str(r['outcome'] or 'open'):<8}"
+        )
+
+
 # ---- predictions CLI (Phase 2.2b) ----
 
 # Seeded defaults — duplicated from scanner._PRED_DEFAULTS so the CLI can
@@ -1488,6 +1518,17 @@ def main() -> None:
         help="Evaluate without changing any statuses or recording transitions",
     )
 
+    # sentiment (Phase 5)
+    sentiment_parser = sub.add_parser("sentiment")
+    sentiment_sub = sentiment_parser.add_subparsers(
+        dest="sentiment_cmd", required=True
+    )
+    sent_status_p = sentiment_sub.add_parser("status")
+    sent_status_p.add_argument(
+        "--limit", type=int, default=20,
+        help="How many recent scored signals to show (default 20)",
+    )
+
     # predictions (Phase 2.2b)
     pred_parser = sub.add_parser("predictions")
     pred_sub = pred_parser.add_subparsers(dest="predictions_cmd", required=True)
@@ -1627,6 +1668,9 @@ def main() -> None:
             cmd_pairs_status()
         elif args.pairs_cmd == "evaluate":
             cmd_pairs_evaluate(dry_run=args.dry_run)
+    elif args.command == "sentiment":
+        if args.sentiment_cmd == "status":
+            cmd_sentiment_status(limit=args.limit)
     elif args.command == "predictions":
         if args.predictions_cmd == "enable":
             cmd_predictions_enable()
