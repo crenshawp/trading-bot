@@ -87,13 +87,4 @@ addopts = "-v --cov=trading_bot --cov-report=term-missing --cov-fail-under=91"
 # in Phase 1.2 (spec §6: "Do not test the signal detection logic itself").
 # The new wiring (log_signal, _load_secrets, main, _normalize_*) IS exercised
 # in tests/test_scanner.py — it just doesn't count toward the percentage.
-# news_client.py / earnings.py / sentiment.py are omitted ONLY during the
-# Phase 5 build-out so intermediate per-section commits stay green; their tests
-# land in the final "add news, earnings-blackout, and sentiment tests" commit
-# (Section 7), which removes these lines so the modules are coverage-checked.
-omit = [
-    "trading_bot/scanner.py",
-    "trading_bot/news_client.py",
-    "trading_bot/earnings.py",
-    "trading_bot/sentiment.py",
-]
+omit = ["trading_bot/scanner.py"]

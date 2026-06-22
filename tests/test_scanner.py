@@ -625,3 +625,127 @@ def test_benched_ticker_alerts_on_nothing_regardless_of_pair_status(
     # Every setup on a benched ticker is shadow + suppressed.
     assert calls["EMA21 Pullback"] == {"track_mode": "shadow", "alert": False}
     assert calls["Trend Continuation"] == {"track_mode": "shadow", "alert": False}
+
+
+# ─────────────── earnings blackout + sentiment enrichment (Phase 5) ───────────────
+
+
+def _trade_count() -> int:
+    conn = db.get_connection()
+    try:
+        return int(conn.execute("SELECT COUNT(*) c FROM trades").fetchone()["c"])
+    finally:
+        conn.close()
+
+
+def test_earnings_blackout_suppresses_alert_and_opens_no_trade(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    db.add_to_active_watchlist("MSFT", "seed")
+    _stub_stock_pipeline(monkeypatch, entries=[("MSFT", "active")])
+    monkeypatch.setattr(
+        "trading_bot.earnings.is_in_blackout",
+        lambda *a, **k: (True, "earnings within window"),
+    )
+    posts: list[str] = []
+    monkeypatch.setattr(
+        "trading_bot.scanner.requests.post", lambda url, **_k: posts.append(url),
+    )
+    monkeypatch.setattr(scanner, "DRY_RUN", False)
+
+    scanner.scan_stocks()
+
+    assert posts == [], "earnings-blackout must suppress the alert"
+    assert _trade_count() == 0, "earnings-blackout must not open a trade"
+    assert "earnings-blackout" in capsys.readouterr().err
+
+
+def test_news_sentiment_skipped_for_benched_ticker(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db.add_to_active_watchlist("MSFT", "seed")
+    db.set_watchlist_status("MSFT", "benched")
+    _stub_stock_pipeline(monkeypatch, entries=[("MSFT", "benched")])
+    scored: list[str] = []
+    monkeypatch.setattr(
+        scanner, "_score_signal_sentiment",
+        lambda s: scored.append(s["ticker"]),
+    )
+    monkeypatch.setattr(scanner, "send_notification", lambda s, **kw: None)
+
+    scanner.scan_stocks()
+
+    # Benched -> never reaches _emit_active_signal, so no news/LLM work.
+    assert scored == []
+
+
+def test_news_sentiment_skipped_for_muted_pair(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db.add_to_active_watchlist("MSFT", "seed")
+    db.set_signal_pair_status("MSFT", "ema21_pullback", "muted")
+    _stub_two_setup_pipeline(monkeypatch, entries=[("MSFT", "active")])
+    monkeypatch.setattr(
+        "trading_bot.earnings.is_in_blackout", lambda *a, **k: (False, "ok"),
+    )
+    scored: list[str] = []
+    monkeypatch.setattr(
+        scanner, "_score_signal_sentiment",
+        lambda s: scored.append(s["setup"]),
+    )
+    monkeypatch.setattr(scanner, "send_notification", lambda s, **kw: None)
+
+    scanner.scan_stocks()
+
+    # Only the enabled pair triggers sentiment work; the muted one is skipped.
+    assert scored == ["Trend Continuation"]
+
+
+def test_sentiment_persisted_on_trade_row(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trading_bot.sentiment import SentimentResult
+
+    _offline_context(monkeypatch)
+    monkeypatch.setattr(
+        "trading_bot.scanner.requests.post", lambda url, **_k: None,
+    )
+    monkeypatch.setattr(scanner, "DRY_RUN", False)
+
+    sent = SentimentResult(0.6, "bullish", "Beat.", 9, True, True)
+    scanner.send_notification(_stock_signal("GOOGL"), sentiment=sent)
+
+    conn = db.get_connection()
+    try:
+        row = conn.execute(
+            "SELECT sentiment_score, sentiment_label, heavy_news, headline_count "
+            "FROM trades"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["sentiment_score"] == pytest.approx(0.6)
+    assert row["sentiment_label"] == "bullish"
+    assert row["heavy_news"] == 1
+    assert row["headline_count"] == 9
+
+
+def test_alert_includes_sentiment_context(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot.sentiment import SentimentResult
+
+    _offline_context(monkeypatch)
+    monkeypatch.setattr(scanner, "DRY_RUN", True)
+
+    sent = SentimentResult(0.6, "bullish", "Strong beat.", 9, True, True)
+    scanner.send_notification(_stock_signal("GOOGL"), sentiment=sent)
+
+    out = capsys.readouterr().out
+    assert "Sentiment:" in out
+    assert "bullish" in out
+    assert "+0.60" in out
+    assert "Heavy news" in out

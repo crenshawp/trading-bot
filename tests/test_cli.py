@@ -575,6 +575,43 @@ def test_cli_report_pairs(
     assert "GOOGL" in out and "muted" in out
 
 
+# ───────────────────── Phase 5 sentiment subcommand ─────────────────────
+
+
+def test_cli_sentiment_status(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rows = [{
+        "ticker": "GOOGL", "signal_type": "ema21_pullback", "direction": "call",
+        "opened_at": "2026-06-01T10:00:00", "outcome": "win", "track_mode": "active",
+        "sentiment_score": 0.6, "sentiment_label": "bullish",
+        "heavy_news": True, "headline_count": 9,
+    }]
+    monkeypatch.setattr(
+        "trading_bot.db.get_recent_trade_sentiment", lambda **_kw: rows,
+    )
+    _run(["sentiment", "status"])
+    out = capsys.readouterr().out
+    assert "SENTIMENT STATUS" in out
+    assert "GOOGL" in out
+    assert "bullish" in out
+    assert "+0.60" in out
+
+
+def test_cli_sentiment_status_empty(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "trading_bot.db.get_recent_trade_sentiment", lambda **_kw: [],
+    )
+    _run(["sentiment", "status"])
+    assert "no sentiment-scored signals yet" in capsys.readouterr().out
+
+
 # ───────────────────── Phase 2.1 regime + by-regime subcommands ─────────────────────
 
 
