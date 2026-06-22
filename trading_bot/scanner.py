@@ -27,8 +27,10 @@ import schedule
 import yfinance as yf
 
 from trading_bot import (
+    config,
     context,
     db,
+    earnings,
     outcomes,
     performance,
     predictions,
@@ -139,6 +141,59 @@ def _pair_is_enabled(ticker: str, setup: object) -> bool:
             file=sys.stderr,
         )
         return True
+
+
+def _hold_window_days(signal: dict) -> int:
+    """Parse the trade's intended hold horizon (days) from the signal's
+    ``hold_days`` string, e.g. ``"3-5 days"`` -> 5. Falls back to the config
+    default when unparseable. Used as the earnings-blackout window."""
+    import re
+
+    nums = re.findall(r"\d+", str(signal.get("hold_days", "")))
+    if nums:
+        return max(int(n) for n in nums)
+    return config.EARNINGS_BLACKOUT_DEFAULT_DAYS
+
+
+def _should_check_earnings(signal: dict) -> bool:
+    """Earnings blackout applies only to stock TRADE signals (call/put).
+    Crypto has no earnings; warning entries aren't trades."""
+    return (
+        str(signal.get("asset_type", "")) == "stock"
+        and _normalize_direction(str(signal.get("direction", ""))) in {"call", "put"}
+    )
+
+
+def _emit_active_signal(signal: dict) -> None:
+    """Handle a signal that passed ticker-active AND pair-enabled.
+
+    The ONE hard gate runs first: if a known earnings report falls inside the
+    trade's hold window, suppress the alert and do NOT open the trade. Otherwise
+    alert. (Phase 5 Section 5 layers advisory sentiment enrichment in here,
+    after the blackout gate, so news/LLM work only happens for signals that
+    will actually alert.)
+    """
+    if _should_check_earnings(signal):
+        try:
+            days = _hold_window_days(signal)
+            blackout, reason = earnings.is_in_blackout(signal["ticker"], days)
+        except Exception as exc:  # noqa: BLE001 - gate failure must not block alerts
+            print(
+                f"  earnings blackout check failed for {signal['ticker']}, "
+                f"proceeding: {exc}",
+                file=sys.stderr,
+            )
+            blackout, reason = False, "blackout check error — fail-open"
+        if blackout:
+            print(
+                f"  [earnings-blackout] {signal['ticker']} "
+                f"{signal.get('setup', '')} — alert suppressed, trade NOT "
+                f"opened ({reason})",
+                file=sys.stderr,
+            )
+            return
+
+    send_notification(signal)
 
 
 def _load_secrets() -> None:
@@ -1368,7 +1423,9 @@ def scan_stocks():
                 # Alert only when the ticker is active AND the pair is enabled.
                 # _pair_is_enabled is short-circuited for benched tickers.
                 if is_active and _pair_is_enabled(ticker, s.get("setup", "")):
-                    send_notification(s)
+                    # Earnings-blackout gate runs inside _emit_active_signal,
+                    # before any alert/trade (and before Phase 5 sentiment work).
+                    _emit_active_signal(s)
                 else:
                     if is_active:
                         # Active ticker, muted pair: gate the alert but keep

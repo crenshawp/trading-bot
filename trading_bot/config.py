@@ -44,3 +44,18 @@ SP_MIN_CLOSED_SIGNALS: int = 10    # minimum resolved trades to act (else hold)
 SP_WINDOW_DAYS: int = 60           # recency window for the expectancy stats
 SP_MUTE_EXPECTANCY: float = 0.0     # enabled -> muted when expectancy <= this
 SP_ENABLE_EXPECTANCY: float = 0.05  # muted -> enabled when expectancy >= this
+
+# ──────────────────────────────────────────────────────────────────────────
+# News & sentiment (Phase 5)
+# ──────────────────────────────────────────────────────────────────────────
+# Earnings blackout window: suppress a stock alert if a known earnings date
+# falls within this many days. We use the trade's INTENDED hold horizon (parsed
+# from the signal's hold_days estimate, ~1-5 days), NOT the resolver's 30-day
+# expiry — a 30-day window would blanket-suppress, since quarterly earnings hit
+# nearly every name. This is the fallback when hold_days can't be parsed.
+EARNINGS_BLACKOUT_DEFAULT_DAYS: int = 5
+
+# Sentiment LLM model — Haiku is the cost/latency choice for per-signal scoring.
+SENTIMENT_LLM_MODEL: str = "claude-haiku-4-5-20251001"
+# "Heavy news day" flag: set when a ticker's fetched headline count is >= this.
+SENTIMENT_HEAVY_NEWS_THRESHOLD: int = 8
