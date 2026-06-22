@@ -31,6 +31,7 @@ from trading_bot.models import (
     Trade,
 )
 
+# Version 12 (Phase 5) — adds trades sentiment columns (advisory news context).
 # Version 11 (Phase 4) — adds signal_pair_status + signal_pair_transitions.
 # Version 10 (Phase 3.3) — adds active_watchlist.status + status_changed_at
 #                          and the watchlist_transitions table.
@@ -42,7 +43,7 @@ from trading_bot.models import (
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -432,6 +433,28 @@ def _migrate_to_v11(_conn: sqlite3.Connection) -> None:
     return None
 
 
+def _migrate_to_v12(conn: sqlite3.Connection) -> None:
+    """Phase 5 migration step: add advisory sentiment columns to trades.
+
+    All nullable (``heavy_news`` defaults 0): a trade opened before Phase 5,
+    or any shadow/crypto trade that isn't sentiment-scored, simply leaves them
+    NULL/0. Sentiment sits next to the eventual resolved outcome for later
+    evaluation.
+    """
+    cur = conn.execute("PRAGMA table_info(trades)")
+    cols = {str(row[1]) for row in cur.fetchall()}
+    if "sentiment_score" not in cols:
+        conn.execute("ALTER TABLE trades ADD COLUMN sentiment_score REAL")
+    if "sentiment_label" not in cols:
+        conn.execute("ALTER TABLE trades ADD COLUMN sentiment_label TEXT")
+    if "heavy_news" not in cols:
+        conn.execute(
+            "ALTER TABLE trades ADD COLUMN heavy_news INTEGER NOT NULL DEFAULT 0"
+        )
+    if "headline_count" not in cols:
+        conn.execute("ALTER TABLE trades ADD COLUMN headline_count INTEGER")
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -447,6 +470,7 @@ def init_db() -> None:
         _migrate_to_v9(conn)
         _migrate_to_v10(conn)
         _migrate_to_v11(conn)
+        _migrate_to_v12(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -662,8 +686,9 @@ def insert_trade(trade: Trade) -> int:
         INSERT INTO trades (
             signal_id, opened_at, closed_at, exit_price,
             outcome, pnl_pct, pnl_dollars, notes, market_regime,
-            vix_level, vix_band, context_score, track_mode
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            vix_level, vix_band, context_score, track_mode,
+            sentiment_score, sentiment_label, heavy_news, headline_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = (
         trade.signal_id,
@@ -679,6 +704,10 @@ def insert_trade(trade: Trade) -> int:
         trade.vix_band,
         trade.context_score,
         trade.track_mode,
+        trade.sentiment_score,
+        trade.sentiment_label,
+        int(trade.heavy_news),
+        trade.headline_count,
     )
     conn = get_connection()
     try:
@@ -770,6 +799,10 @@ def _row_to_trade(row: sqlite3.Row) -> Trade:
         vix_band=row["vix_band"] if "vix_band" in keys else None,
         context_score=row["context_score"] if "context_score" in keys else None,
         track_mode=row["track_mode"] if "track_mode" in keys else "active",
+        sentiment_score=row["sentiment_score"] if "sentiment_score" in keys else None,
+        sentiment_label=row["sentiment_label"] if "sentiment_label" in keys else None,
+        heavy_news=bool(row["heavy_news"]) if "heavy_news" in keys else False,
+        headline_count=row["headline_count"] if "headline_count" in keys else None,
         id=int(row["id"]),
     )
 

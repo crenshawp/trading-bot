@@ -542,13 +542,19 @@ def _normalize_signal_type(raw: str) -> str:
     return raw.strip().lower().replace(" ", "_").replace("-", "_")
 
 
-def log_signal(signal: dict, track_mode: str = "active") -> int | None:
+def log_signal(
+    signal: dict, track_mode: str = "active", sentiment: object = None,
+) -> int | None:
     """Translate a legacy-shape ``signal`` dict into a ``Signal`` row and open
     a corresponding ``Trade`` record (Phase 1.3).
 
     ``track_mode`` (Phase 3.1-LIVE) tags the opened trade ``'active'`` (default,
     so existing callers are unchanged) or ``'shadow'`` for shadow-universe
     scans whose alerts are suppressed.
+
+    ``sentiment`` (Phase 5) is an optional advisory ``SentimentResult`` captured
+    at fire time; its fields are persisted on the trade row next to the eventual
+    outcome. ``None`` leaves the sentiment columns empty (shadow/crypto trades).
 
     Returns the inserted (or deduped) signal id, or ``None`` if the entry is a
     risk-warning alert (``direction = "⚠️ WARNING"``) that the legacy code
@@ -637,6 +643,10 @@ def log_signal(signal: dict, track_mode: str = "active") -> int | None:
                 vix_band=vix_band,
                 context_score=context_score,
                 track_mode=track_mode,
+                sentiment_score=getattr(sentiment, "score", None),
+                sentiment_label=getattr(sentiment, "label", None),
+                heavy_news=bool(getattr(sentiment, "heavy_news", False)),
+                headline_count=getattr(sentiment, "headline_count", None),
             )
         )
 
