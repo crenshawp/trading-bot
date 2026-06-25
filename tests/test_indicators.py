@@ -175,3 +175,142 @@ def test_obv_flat_close_carries_prior_total() -> None:
     df["Volume"] = [100, 200, 300]
     # every close flat -> no volume added -> OBV stays 0 throughout
     assert list(indicators.obv(df)) == [0.0, 0.0, 0.0]
+
+
+# ─────────────────────── correlation: pure pairwise math ─────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _clear_corr_cache() -> None:
+    """The correlation memo is module-level — reset it between tests."""
+    indicators.clear_correlation_cache()
+
+
+def test_average_pairwise_correlation_identical_is_one() -> None:
+    r = pd.DataFrame({"A": [0.1, -0.1, 0.1], "B": [0.1, -0.1, 0.1]})
+    assert indicators.average_pairwise_correlation(r, "A") == pytest.approx(1.0)
+
+
+def test_average_pairwise_correlation_offsets_to_zero() -> None:
+    # B identical to A (corr +1), C exact mirror of A (corr -1) -> mean 0.
+    r = pd.DataFrame(
+        {"A": [0.1, -0.1, 0.1, -0.1],
+         "B": [0.1, -0.1, 0.1, -0.1],
+         "C": [-0.1, 0.1, -0.1, 0.1]}
+    )
+    assert indicators.average_pairwise_correlation(r, "A") == pytest.approx(0.0)
+
+
+def test_average_pairwise_correlation_none_when_absent_or_no_peers() -> None:
+    r = pd.DataFrame({"A": [0.1, -0.1], "B": [0.1, -0.1]})
+    assert indicators.average_pairwise_correlation(r, "Z") is None      # absent
+    solo = pd.DataFrame({"A": [0.1, -0.1]})
+    assert indicators.average_pairwise_correlation(solo, "A") is None    # no peers
+
+
+@pytest.mark.parametrize(
+    ("avg_corr", "label"),
+    [
+        (0.7, "concentrated"),
+        (0.6, "concentrated"),   # boundary: >= concentrated_at
+        (0.59, "moderate"),
+        (0.3, "moderate"),       # boundary: not < diversified_at
+        (0.29, "diversified"),
+        (-0.8, "diversified"),
+        (None, "unknown"),
+    ],
+)
+def test_classify_concentration(avg_corr: float | None, label: str) -> None:
+    assert indicators.classify_concentration(avg_corr) == label
+
+
+# ─────────────────────── correlation: fail-soft wrapper ──────────────────────────
+
+
+def _fetch_from(data: dict[str, pd.Series]) -> "object":
+    def _fetch(name: str) -> pd.Series | None:
+        return data.get(name)
+    return _fetch
+
+
+def test_correlation_concentration_concentrated_when_names_move_together() -> None:
+    common = pd.Series([100.0, 101.0, 103.0, 106.0, 110.0])
+    data = {"AAA": common, "BBB": common, "CCC": common}
+    avg, label = indicators.correlation_concentration(
+        "AAA", ["AAA", "BBB", "CCC"], _fetch_from(data),
+    )
+    assert avg == pytest.approx(1.0)
+    assert label == "concentrated"
+
+
+def test_correlation_concentration_diversified_when_anti_correlated() -> None:
+    data = {
+        "AAA": pd.Series([100.0, 110.0, 100.0, 110.0, 100.0]),
+        "BBB": pd.Series([100.0, 90.0, 100.0, 90.0, 100.0]),  # mirror of AAA
+    }
+    avg, label = indicators.correlation_concentration(
+        "AAA", ["AAA", "BBB"], _fetch_from(data),
+    )
+    assert avg is not None and avg < 0.0
+    assert label == "diversified"
+
+
+def test_correlation_concentration_unknown_with_too_few_names(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    avg, label = indicators.correlation_concentration("AAA", [], _fetch_from({}))
+    assert (avg, label) == (None, "unknown")
+    assert "active name" in capsys.readouterr().err
+
+
+def test_correlation_concentration_unknown_when_every_fetch_fails(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    avg, label = indicators.correlation_concentration(
+        "AAA", ["AAA", "BBB"], lambda _n: None,
+    )
+    assert (avg, label) == (None, "unknown")
+    assert "insufficient data" in capsys.readouterr().err
+
+
+def test_correlation_concentration_fail_soft_on_raising_fetch(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def boom(_name: str) -> pd.Series | None:
+        raise RuntimeError("network down")
+
+    avg, label = indicators.correlation_concentration("AAA", ["AAA", "BBB"], boom)
+    assert (avg, label) == (None, "unknown")
+    err = capsys.readouterr().err
+    assert "fetch failed" in err  # per-name failure logged, never raised
+
+
+def test_correlation_concentration_unknown_on_insufficient_overlap() -> None:
+    # one close per name -> no returns to correlate -> undefined -> unknown
+    data = {"AAA": pd.Series([100.0]), "BBB": pd.Series([100.0])}
+    avg, label = indicators.correlation_concentration(
+        "AAA", ["AAA", "BBB"], _fetch_from(data),
+    )
+    assert (avg, label) == (None, "unknown")
+
+
+def test_correlation_memo_avoids_refetch_until_cleared() -> None:
+    common = pd.Series([100.0, 101.0, 103.0, 106.0, 110.0])
+    data = {"AAA": common, "BBB": common, "CCC": common}
+    calls: list[str] = []
+
+    def counting_fetch(name: str) -> pd.Series | None:
+        calls.append(name)
+        return data.get(name)
+
+    universe = ["AAA", "BBB", "CCC"]
+    indicators.correlation_concentration("AAA", universe, counting_fetch)
+    after_first = len(calls)
+    assert after_first == 3  # fetched each name once
+
+    indicators.correlation_concentration("BBB", universe, counting_fetch)
+    assert len(calls) == after_first  # same universe -> memo reused, no refetch
+
+    indicators.clear_correlation_cache()
+    indicators.correlation_concentration("CCC", universe, counting_fetch)
+    assert len(calls) > after_first  # refetched after the cache was cleared

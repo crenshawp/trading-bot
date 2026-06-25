@@ -13,8 +13,8 @@ not, computed on the same OHLCV candle structure the scanner already uses
 4. **Volume** — OBV, a cumulative volume-flow measure beyond the scanner's
    existing volume-ratio check.
 5. **Correlation** — rolling cross-asset correlation among the currently-active
-   watchlist names (a concentration measure), in :mod:`correlation` helpers
-   below.
+   watchlist names (a concentration measure); the correlation helpers below
+   take their price data dependency-injected.
 
 The families are kept independent ON PURPOSE: a pile of correlated oscillators
 would corrupt the per-pair statistics with multiple-comparisons false
@@ -25,6 +25,9 @@ new indicators reuse it rather than re-fetching.
 """
 
 from __future__ import annotations
+
+import sys
+from collections.abc import Callable, Sequence
 
 import pandas as pd
 
@@ -195,3 +198,148 @@ def obv(df: pd.DataFrame) -> pd.Series:
     direction = (delta > 0.0).astype(float) - (delta < 0.0).astype(float)
     signed_volume = direction * df["Volume"]
     return signed_volume.cumsum()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CORRELATION FAMILY — cross-asset concentration among active watchlist names
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# This family is the odd one out: it is not a per-ticker series but a property
+# of the active SET. It answers "are the names we're trading all moving together
+# (a hidden single-bet) or genuinely diversified?". The price data is injected
+# (a fetch callable + the active universe) so this module never imports the
+# scanner; a per-scan memo avoids refetching the universe on every fired signal.
+
+# Memo of the built returns frame, keyed by the sorted active universe. Cleared
+# at the top of each scan via clear_correlation_cache() — mirrors the news cache.
+_returns_cache: dict[tuple[str, ...], pd.DataFrame] = {}
+
+
+def clear_correlation_cache() -> None:
+    """Drop the per-scan correlation memo. Called at the start of a scan cycle."""
+    _returns_cache.clear()
+
+
+def average_pairwise_correlation(
+    returns: pd.DataFrame, ticker: str
+) -> float | None:
+    """Mean correlation of ``ticker``'s returns against every other column.
+
+    Pure. Returns ``None`` when it cannot be computed — ``ticker`` absent, no
+    peers, or every pairwise correlation undefined (constant/too-short series).
+    """
+    if ticker not in returns.columns:
+        return None
+    others = [c for c in returns.columns if c != ticker]
+    if not others:
+        return None
+    corr_row = returns.corr().loc[ticker, others].dropna()
+    if corr_row.empty:
+        return None
+    return float(corr_row.mean())
+
+
+def classify_concentration(
+    avg_corr: float | None,
+    *,
+    concentrated_at: float = config.CORR_CONCENTRATED_AT,
+    diversified_at: float = config.CORR_DIVERSIFIED_AT,
+) -> str:
+    """Bucket an average pairwise correlation into a concentration label.
+
+    High positive correlation == the active names move together == a hidden
+    single-bet (``concentrated``). Low/negative == genuine spread
+    (``diversified``). ``None`` -> ``unknown``.
+    """
+    if avg_corr is None:
+        return "unknown"
+    if avg_corr >= concentrated_at:
+        return "concentrated"
+    if avg_corr < diversified_at:
+        return "diversified"
+    return "moderate"
+
+
+def _build_active_returns(
+    universe: Sequence[str],
+    fetch_closes: Callable[[str], pd.Series | None],
+    window: int,
+) -> pd.DataFrame | None:
+    """Fetch closes for the universe and build a trailing returns frame.
+
+    Memoized by the sorted universe so a scan that fires several signals only
+    pays the fetch once. A per-name fetch failure drops that name (logged) but
+    never sinks the whole frame. Returns ``None`` if fewer than two names yield
+    data.
+    """
+    key = tuple(sorted(universe))
+    cached = _returns_cache.get(key)
+    if cached is not None:
+        return cached
+
+    closes: dict[str, pd.Series] = {}
+    for name in universe:
+        try:
+            series = fetch_closes(name)
+        except Exception as exc:  # noqa: BLE001 - one name must not sink the frame
+            print(f"  correlation: fetch failed for {name}: {exc}", file=sys.stderr)
+            series = None
+        if series is not None and not series.empty:
+            # window+1 closes -> window returns after pct_change.
+            closes[name] = series.tail(window + 1)
+
+    if len(closes) < 2:
+        return None
+
+    frame = pd.DataFrame(closes).pct_change(fill_method=None)
+    _returns_cache[key] = frame
+    return frame
+
+
+def correlation_concentration(
+    ticker: str,
+    active_tickers: Sequence[str],
+    fetch_closes: Callable[[str], pd.Series | None],
+    *,
+    window: int = config.CORR_RETURN_WINDOW,
+    min_names: int = config.CORR_MIN_NAMES,
+) -> tuple[float | None, str]:
+    """``(avg_corr, concentration_label)`` for ``ticker`` vs the active set.
+
+    FAIL-SOFT: any shortfall — too few active names, every fetch failing, or
+    insufficient overlapping data — returns ``(None, "unknown")`` and logs the
+    reason. NEVER raises, so the correlation family can never block a signal.
+    """
+    try:
+        universe = list(dict.fromkeys(active_tickers))
+        if ticker not in universe:
+            universe = [ticker, *universe]
+        if len(universe) < min_names:
+            print(
+                f"  correlation: only {len(universe)} active name(s) — "
+                f"unknown for {ticker}",
+                file=sys.stderr,
+            )
+            return None, "unknown"
+
+        returns = _build_active_returns(universe, fetch_closes, window)
+        if returns is None or ticker not in returns.columns:
+            print(
+                f"  correlation: insufficient data for {ticker} — unknown",
+                file=sys.stderr,
+            )
+            return None, "unknown"
+
+        avg = average_pairwise_correlation(returns, ticker)
+        if avg is None:
+            print(
+                f"  correlation: undefined for {ticker} — unknown",
+                file=sys.stderr,
+            )
+        return avg, classify_concentration(avg)
+    except Exception as exc:  # noqa: BLE001 - correlation must never block a signal
+        print(
+            f"  correlation: error for {ticker}, returning unknown: {exc}",
+            file=sys.stderr,
+        )
+        return None, "unknown"
