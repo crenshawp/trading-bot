@@ -91,3 +91,65 @@ def test_classify_vol_regime_unknown_on_bad_baseline(
     atr_now: float | None, baseline: float | None
 ) -> None:
     assert indicators.classify_vol_regime(atr_now, baseline) == "unknown"
+
+
+# ───────────────────────────── momentum: RSI ────────────────────────────────────
+
+
+def test_rsi_all_gains_is_100() -> None:
+    rsi = indicators.rsi(pd.Series([1.0, 2.0, 3.0, 4.0, 5.0]), period=2)
+    assert rsi.iloc[-1] == pytest.approx(100.0)
+
+
+def test_rsi_known_intermediate_value() -> None:
+    # gains avg = (10+0)/2 = 5; losses avg = (0+5)/2 = 2.5; RS = 2 -> RSI 66.667
+    rsi = indicators.rsi(pd.Series([100.0, 110.0, 105.0]), period=2)
+    assert rsi.iloc[-1] == pytest.approx(66.66667, abs=1e-4)
+
+
+def test_rsi_flat_series_is_undefined() -> None:
+    rsi = indicators.rsi(pd.Series([5.0, 5.0, 5.0]), period=2)
+    assert pd.isna(rsi.iloc[-1])   # 0 gains / 0 losses -> genuinely undefined
+
+
+# ─────────────────────────── trend strength: ADX ────────────────────────────────
+
+
+def _UP() -> pd.DataFrame:
+    return _ohlc(
+        highs=[10, 11, 12, 13, 14, 15],
+        lows=[8, 9, 10, 11, 12, 13],
+        closes=[9, 10, 11, 12, 13, 14],
+    )
+
+
+def _DOWN() -> pd.DataFrame:
+    return _ohlc(
+        highs=[15, 14, 13, 12, 11, 10],
+        lows=[13, 12, 11, 10, 9, 8],
+        closes=[14, 13, 12, 11, 10, 9],
+    )
+
+
+def _CHOP() -> pd.DataFrame:
+    return _ohlc(
+        highs=[10, 12, 10, 12, 10, 12],
+        lows=[8, 10, 8, 10, 8, 10],
+        closes=[9, 11, 9, 11, 9, 11],
+    )
+
+
+def test_adx_steady_uptrend_is_max() -> None:
+    # +DM dominates entirely, -DM=0 -> DX=100 every candle -> ADX=100.
+    assert indicators.adx(_UP(), period=2).iloc[-1] == pytest.approx(100.0)
+
+
+def test_adx_is_direction_agnostic() -> None:
+    # A steady DOWN-move is just as strong a trend -> also maxes ADX.
+    assert indicators.adx(_DOWN(), period=2).iloc[-1] == pytest.approx(100.0)
+
+
+def test_adx_choppy_is_weaker_than_trending() -> None:
+    chop = indicators.adx(_CHOP(), period=2).iloc[-1]
+    trend = indicators.adx(_UP(), period=2).iloc[-1]
+    assert chop < trend

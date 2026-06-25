@@ -116,3 +116,61 @@ def classify_vol_regime(
     if ratio > high_ratio:
         return "high"
     return "normal"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MOMENTUM FAMILY — RSI (one representative oscillator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def rsi(close: pd.Series, period: int = config.RSI_PERIOD) -> pd.Series:
+    """Relative Strength Index over ``period`` candles.
+
+    SMA-smoothed gains/losses, identical to the scanner's ``calculate_rsi`` so
+    the advisory momentum reading matches what the signal logic already uses.
+    An all-gains window divides by a zero average loss -> RS is +inf -> RSI 100;
+    a perfectly flat window is 0/0 -> NaN (genuinely undefined).
+
+    RSI is the SINGLE momentum representative for this phase by design — adding
+    Stochastic / Williams %R / CCI would be the same family and corrupt the
+    per-pair statistics with correlated duplicates.
+    """
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TREND-STRENGTH FAMILY — ADX (distinct from EMA direction)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def adx(df: pd.DataFrame, period: int = config.ADX_PERIOD) -> pd.Series:
+    """Average Directional Index — trend STRENGTH, not direction.
+
+    ADX answers "is the trend strong enough to trust?" and is deliberately
+    direction-agnostic: a steady up-move and a steady down-move both score high.
+    That is what makes it independent of the scanner's existing EMA *direction*
+    checks rather than a restatement of them.
+
+    Wilder's +DM / -DM / DX construction with SMA smoothing (consistent with
+    this module's ATR). ``DX`` is undefined (NaN) on a candle with no directional
+    movement; the rolling mean skips those.
+    """
+    up_move = df["High"].diff()
+    down_move = -df["Low"].diff()
+
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0.0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0.0), 0.0)
+
+    atr_s = true_range(df).rolling(period).mean()
+    plus_di = 100.0 * plus_dm.rolling(period).mean() / atr_s
+    minus_di = 100.0 * minus_dm.rolling(period).mean() / atr_s
+
+    di_sum = plus_di + minus_di
+    dx = 100.0 * (plus_di - minus_di).abs() / di_sum
+    return dx.rolling(period).mean()
