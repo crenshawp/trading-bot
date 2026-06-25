@@ -749,3 +749,152 @@ def test_alert_includes_sentiment_context(
     assert "bullish" in out
     assert "+0.60" in out
     assert "Heavy news" in out
+
+
+# ─────────────── indicator-family attach point (Phase 6) ───────────────
+
+
+def test_indicators_skipped_for_benched_ticker(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db.add_to_active_watchlist("MSFT", "seed")
+    db.set_watchlist_status("MSFT", "benched")
+    _stub_stock_pipeline(monkeypatch, entries=[("MSFT", "benched")])
+    computed: list[str] = []
+    monkeypatch.setattr(
+        scanner, "_compute_signal_indicators",
+        lambda s, df: computed.append(s["ticker"]),
+    )
+    monkeypatch.setattr(scanner, "send_notification", lambda s, **kw: None)
+
+    scanner.scan_stocks()
+
+    # Benched -> never reaches _emit_active_signal, so no indicator work.
+    assert computed == []
+
+
+def test_indicators_skipped_for_muted_pair(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db.add_to_active_watchlist("MSFT", "seed")
+    db.set_signal_pair_status("MSFT", "ema21_pullback", "muted")
+    _stub_two_setup_pipeline(monkeypatch, entries=[("MSFT", "active")])
+    monkeypatch.setattr(
+        "trading_bot.earnings.is_in_blackout", lambda *a, **k: (False, "ok"),
+    )
+    monkeypatch.setattr(scanner, "_score_signal_sentiment", lambda s: None)
+    computed: list[str] = []
+    monkeypatch.setattr(
+        scanner, "_compute_signal_indicators",
+        lambda s, df: computed.append(s["setup"]),
+    )
+    monkeypatch.setattr(scanner, "send_notification", lambda s, **kw: None)
+
+    scanner.scan_stocks()
+
+    # Only the enabled pair triggers indicator work; the muted one is skipped.
+    assert computed == ["Trend Continuation"]
+
+
+def test_indicators_computed_for_active_enabled_signal(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db.add_to_active_watchlist("MSFT", "seed")
+    _stub_stock_pipeline(monkeypatch, entries=[("MSFT", "active")])
+    _offline_alert_externals(monkeypatch)
+    computed: list[str] = []
+    monkeypatch.setattr(
+        scanner, "_compute_signal_indicators",
+        lambda s, df: computed.append(s["ticker"]),
+    )
+    monkeypatch.setattr(scanner, "send_notification", lambda s, **kw: None)
+
+    scanner.scan_stocks()
+
+    assert computed == ["MSFT"]
+
+
+def test_indicator_context_persisted_on_trade_row(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trading_bot.indicators import IndicatorContext
+
+    _offline_context(monkeypatch)
+    monkeypatch.setattr("trading_bot.scanner.requests.post", lambda url, **_k: None)
+    monkeypatch.setattr(scanner, "DRY_RUN", False)
+
+    ctx = IndicatorContext(
+        atr=2.5, realized_vol=0.018, vol_regime="normal", rsi=54.3, adx=27.1,
+        obv=123456.0, correlation=0.42, concentration="moderate", ok=True,
+    )
+    scanner.send_notification(_stock_signal("GOOGL"), indicators=ctx)
+
+    conn = db.get_connection()
+    try:
+        row = conn.execute(
+            "SELECT ind_atr, ind_realized_vol, ind_vol_regime, ind_rsi, ind_adx, "
+            "ind_obv, ind_correlation, ind_concentration FROM trades"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["ind_atr"] == pytest.approx(2.5)
+    assert row["ind_realized_vol"] == pytest.approx(0.018)
+    assert row["ind_vol_regime"] == "normal"
+    assert row["ind_rsi"] == pytest.approx(54.3)
+    assert row["ind_adx"] == pytest.approx(27.1)
+    assert row["ind_obv"] == pytest.approx(123456.0)
+    assert row["ind_correlation"] == pytest.approx(0.42)
+    assert row["ind_concentration"] == "moderate"
+
+
+def test_scan_persists_real_indicator_values_end_to_end(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pandas as pd
+
+    db.add_to_active_watchlist("GOOGL", "seed")
+    closes = [100.0 + i + (2.0 if i % 2 else 0.0) for i in range(40)]
+    frame = pd.DataFrame(
+        {
+            "Open": closes,
+            "High": [c + 2.0 for c in closes],
+            "Low": [c - 2.0 for c in closes],
+            "Close": closes,
+            "Volume": [1_000_000] * 40,
+        },
+        index=pd.date_range("2026-01-01", periods=40, freq="D"),
+    )
+    _offline_context(monkeypatch)
+    monkeypatch.setattr(scanner, "is_market_open", lambda: True)
+    monkeypatch.setattr(
+        scanner, "_active_stock_watchlist_entries", lambda: [("GOOGL", "active")],
+    )
+    monkeypatch.setattr(scanner, "get_stock_data", lambda t: frame)
+    monkeypatch.setattr(scanner, "add_stock_indicators", lambda d: d)
+    monkeypatch.setattr(
+        scanner, "detect_stock_signals", lambda t, _d: [_stock_signal("GOOGL")],
+    )
+    monkeypatch.setattr(
+        "trading_bot.earnings.is_in_blackout", lambda *a, **k: (False, "ok"),
+    )
+    monkeypatch.setattr(scanner, "_score_signal_sentiment", lambda s: None)
+    monkeypatch.setattr(scanner, "DRY_RUN", True)  # no network; log_signal still runs
+
+    scanner.scan_stocks()
+
+    conn = db.get_connection()
+    try:
+        row = conn.execute(
+            "SELECT track_mode, ind_vol_regime, ind_rsi, ind_adx, ind_obv, "
+            "ind_concentration FROM trades"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["track_mode"] == "active"
+    # Real families computed from the frame at the signal's reference candle.
+    assert row["ind_vol_regime"] in {"low", "normal", "high"}
+    assert row["ind_rsi"] is not None
+    assert row["ind_adx"] is not None
+    assert row["ind_obv"] is not None
+    # Only one active name -> correlation can't be computed -> unknown.
+    assert row["ind_concentration"] == "unknown"
