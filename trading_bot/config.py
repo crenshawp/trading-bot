@@ -59,3 +59,30 @@ EARNINGS_BLACKOUT_DEFAULT_DAYS: int = 5
 SENTIMENT_LLM_MODEL: str = "claude-haiku-4-5-20251001"
 # "Heavy news day" flag: set when a ticker's fetched headline count is >= this.
 SENTIMENT_HEAVY_NEWS_THRESHOLD: int = 8
+
+# ──────────────────────────────────────────────────────────────────────────
+# Advanced indicator families (Phase 6)
+# ──────────────────────────────────────────────────────────────────────────
+# Five deliberately INDEPENDENT families attached to fired signals as advisory
+# context (see trading_bot.indicators for the multiple-comparisons caveat).
+#
+# Volatility regime: classify the current ATR against its own longer baseline.
+# ratio < LOW -> 'low' (quiet), ratio > HIGH -> 'high' (violent), else 'normal'.
+VOL_REGIME_LOW_RATIO: float = 0.8
+VOL_REGIME_HIGH_RATIO: float = 1.2
+VOL_ATR_PERIOD: int = 14            # ATR lookback (matches the legacy scanner ATR)
+VOL_ATR_BASELINE_PERIOD: int = 20   # baseline ATR the regime ratio is taken against
+VOL_REALIZED_PERIOD: int = 20       # realized-volatility (std of returns) lookback
+VOL_BAND_NUM_STD: float = 2.0       # width of the realized-vol envelope, in std
+
+# Momentum (RSI) and trend strength (ADX) — one representative each, no
+# correlated duplicates (Stochastic/Williams/CCI would be the same family).
+RSI_PERIOD: int = 14
+ADX_PERIOD: int = 14
+
+# Cross-asset correlation among active-watchlist names: rolling return window +
+# the concentration bands the average pairwise correlation is classified into.
+CORR_RETURN_WINDOW: int = 20        # trailing daily returns used per ticker
+CORR_MIN_NAMES: int = 2             # need at least this many peers to correlate
+CORR_CONCENTRATED_AT: float = 0.6   # avg pairwise corr >= this -> 'concentrated'
+CORR_DIVERSIFIED_AT: float = 0.3    # avg pairwise corr <  this -> 'diversified'
