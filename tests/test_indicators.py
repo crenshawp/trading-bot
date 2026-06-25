@@ -153,3 +153,25 @@ def test_adx_choppy_is_weaker_than_trending() -> None:
     chop = indicators.adx(_CHOP(), period=2).iloc[-1]
     trend = indicators.adx(_UP(), period=2).iloc[-1]
     assert chop < trend
+
+
+# ───────────────────────────── volume: OBV ──────────────────────────────────────
+
+
+def test_obv_accumulates_signed_volume() -> None:
+    df = _ohlc(
+        highs=[10, 11, 10, 10, 12],
+        lows=[10, 11, 10, 10, 12],
+        closes=[10, 11, 10, 10, 12],
+    )
+    df["Volume"] = [100, 200, 300, 400, 500]
+    obv = indicators.obv(df)
+    # dir: [0, +1, -1, 0(flat), +1]; signed vol cumsum: [0, 200, -100, -100, 400]
+    assert list(obv) == [0.0, 200.0, -100.0, -100.0, 400.0]
+
+
+def test_obv_flat_close_carries_prior_total() -> None:
+    df = _ohlc(highs=[10, 10, 10], lows=[10, 10, 10], closes=[10, 10, 10])
+    df["Volume"] = [100, 200, 300]
+    # every close flat -> no volume added -> OBV stays 0 throughout
+    assert list(indicators.obv(df)) == [0.0, 0.0, 0.0]

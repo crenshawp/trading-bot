@@ -174,3 +174,24 @@ def adx(df: pd.DataFrame, period: int = config.ADX_PERIOD) -> pd.Series:
     di_sum = plus_di + minus_di
     dx = 100.0 * (plus_di - minus_di).abs() / di_sum
     return dx.rolling(period).mean()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VOLUME FAMILY — OBV (cumulative volume flow)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def obv(df: pd.DataFrame) -> pd.Series:
+    """On-Balance Volume — running total that adds the candle's volume on an up
+    close and subtracts it on a down close (flat closes carry the prior total).
+
+    This measures the DIRECTION of volume flow (is volume confirming the move?),
+    which is a different question than the scanner's existing volume-vs-MA
+    *ratio* check (is there enough volume?). The series starts at 0 on the first
+    candle, so only its slope/changes are meaningful — the absolute level is
+    anchored to the start of the window.
+    """
+    delta = df["Close"].diff()
+    direction = (delta > 0.0).astype(float) - (delta < 0.0).astype(float)
+    signed_volume = direction * df["Volume"]
+    return signed_volume.cumsum()
