@@ -285,6 +285,23 @@ def test_correlation_concentration_fail_soft_on_raising_fetch(
     assert "fetch failed" in err  # per-name failure logged, never raised
 
 
+def test_correlation_concentration_outer_guard_never_raises(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Force a systemic failure AFTER the frame is built; the outer guard must
+    # still return unknown rather than propagate.
+    def boom(*_a: object, **_k: object) -> float | None:
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(indicators, "average_pairwise_correlation", boom)
+    common = pd.Series([100.0, 101.0, 103.0, 106.0])
+    avg, label = indicators.correlation_concentration(
+        "AAA", ["AAA", "BBB"], _fetch_from({"AAA": common, "BBB": common}),
+    )
+    assert (avg, label) == (None, "unknown")
+    assert "error for AAA" in capsys.readouterr().err
+
+
 def test_correlation_concentration_unknown_on_insufficient_overlap() -> None:
     # one close per name -> no returns to correlate -> undefined -> unknown
     data = {"AAA": pd.Series([100.0]), "BBB": pd.Series([100.0])}
@@ -314,3 +331,64 @@ def test_correlation_memo_avoids_refetch_until_cleared() -> None:
     indicators.clear_correlation_cache()
     indicators.correlation_concentration("CCC", universe, counting_fetch)
     assert len(calls) > after_first  # refetched after the cache was cleared
+
+
+# ─────────────────────── context bundle: compute_context ─────────────────────────
+
+
+def _trending_frame(n: int = 40) -> pd.DataFrame:
+    closes = [100.0 + i + (2.0 if i % 2 else 0.0) for i in range(n)]
+    return _ohlc(
+        highs=[c + 2.0 for c in closes],
+        lows=[c - 2.0 for c in closes],
+        closes=closes,
+    )
+
+
+def test_compute_context_populates_all_families() -> None:
+    ctx = indicators.compute_context(
+        _trending_frame(), correlation=0.5, concentration="moderate", at=-1,
+    )
+    assert ctx.ok is True
+    assert ctx.atr is not None and ctx.atr > 0.0
+    assert ctx.realized_vol is not None
+    assert ctx.rsi is not None
+    assert ctx.adx is not None
+    assert ctx.obv is not None
+    assert ctx.vol_regime in {"low", "normal", "high"}
+    # the correlation pair is injected, passed straight through
+    assert ctx.correlation == pytest.approx(0.5)
+    assert ctx.concentration == "moderate"
+
+
+def test_compute_context_fail_soft_on_bad_frame(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # no "Close" column -> per-ticker math raises -> empty bundle, ok=False,
+    # but the injected correlation pair is still preserved.
+    bad = pd.DataFrame({"High": [1.0, 2.0], "Low": [1.0, 2.0], "Volume": [1, 2]})
+    ctx = indicators.compute_context(
+        bad, correlation=0.3, concentration="diversified",
+    )
+    assert ctx.ok is False
+    assert ctx.atr is None and ctx.rsi is None and ctx.adx is None
+    assert ctx.correlation == pytest.approx(0.3)
+    assert ctx.concentration == "diversified"
+    assert "context computation failed" in capsys.readouterr().err
+
+
+def test_compute_context_out_of_range_candle_is_none_not_error() -> None:
+    # at=-2 on a single-candle frame: positions are out of range -> None values,
+    # but no exception (ok stays True).
+    one = _ohlc(highs=[10.0], lows=[8.0], closes=[9.0])
+    ctx = indicators.compute_context(one, at=-2)
+    assert ctx.ok is True
+    assert ctx.atr is None and ctx.rsi is None
+
+
+def test_compute_context_nan_warmup_candle_is_none() -> None:
+    # at=0 -> rolling indicators have not warmed up yet -> NaN -> None.
+    ctx = indicators.compute_context(_trending_frame(), at=0)
+    assert ctx.ok is True
+    assert ctx.atr is None        # ATR(14) is NaN at the first candle
+    assert ctx.vol_regime == "unknown"   # no baseline -> unknown

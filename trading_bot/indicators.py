@@ -22,12 +22,25 @@ positives. Everything here is pure (no I/O, no globals) except the correlation
 helpers, which take their price data dependency-injected so this module never
 imports the scanner. All functions operate on the legacy candle structure so
 new indicators reuse it rather than re-fetching.
+
+MULTIPLE-COMPARISONS CAVEAT — READ BEFORE TRUSTING ANY SINGLE INDICATOR.
+These families are ADVISORY context only: they are computed and stored next to
+the eventual trade outcome so they can be evaluated LATER, on accumulated
+evidence. They do NOT create or block signals in this phase. Five families
+tested at once means five chances to find a spurious edge; an indicator that
+looks predictive on a small sample is most likely noise. Any apparent edge must
+clear the same per-pair minimum-sample and windowed-expectancy bar as every
+other gating decision (see trading_bot.signal_pairs / watchlist_state) before it
+is believed — that is a job for Phase 9, on real accumulated data, not for a
+hunch off a handful of trades. Keeping the families independent is what keeps
+that future evaluation statistically honest.
 """
 
 from __future__ import annotations
 
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 import pandas as pd
 
@@ -343,3 +356,87 @@ def correlation_concentration(
             file=sys.stderr,
         )
         return None, "unknown"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONTEXT BUNDLE — the per-signal snapshot attached to a fired trade
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class IndicatorContext:
+    """The five families snapshotted for one fired signal, advisory only.
+
+    Per-ticker families (volatility/momentum/trend/volume) come from the scan's
+    candle frame; the correlation pair is injected (it is a property of the
+    active set, not of one ticker). ``ok`` is False whenever the per-ticker math
+    fell through to a fail-soft empty bundle — callers persist it either way and
+    never gate on it.
+    """
+
+    atr: float | None = None
+    realized_vol: float | None = None
+    vol_regime: str = "unknown"
+    rsi: float | None = None
+    adx: float | None = None
+    obv: float | None = None
+    correlation: float | None = None
+    concentration: str = "unknown"
+    ok: bool = False
+
+
+def _value_at(series: pd.Series, at: int) -> float | None:
+    """Latest valid scalar at position ``at``; None on out-of-range or NaN."""
+    try:
+        value = series.iloc[at]
+    except (IndexError, KeyError):
+        return None
+    if pd.isna(value):
+        return None
+    return float(value)
+
+
+def compute_context(
+    df: pd.DataFrame,
+    *,
+    correlation: float | None = None,
+    concentration: str = "unknown",
+    at: int = -1,
+    atr_period: int = config.VOL_ATR_PERIOD,
+    baseline_period: int = config.VOL_ATR_BASELINE_PERIOD,
+    realized_period: int = config.VOL_REALIZED_PERIOD,
+    rsi_period: int = config.RSI_PERIOD,
+    adx_period: int = config.ADX_PERIOD,
+) -> IndicatorContext:
+    """Snapshot the per-ticker families at candle ``at`` and bundle the injected
+    correlation pair. FAIL-SOFT: any error (short frame, missing columns)
+    returns a bundle carrying just the correlation pair with ``ok=False``; it
+    never raises, so attaching context can never block a signal.
+
+    ``at`` defaults to ``-1`` (latest candle); the stock scanner passes ``-2`` to
+    match the last fully-closed candle that ``detect_stock_signals`` reasons on.
+    """
+    try:
+        close = df["Close"]
+        atr_series = atr(df, atr_period)
+        atr_now = _value_at(atr_series, at)
+        atr_baseline = _value_at(atr_series.rolling(baseline_period).mean(), at)
+        return IndicatorContext(
+            atr=atr_now,
+            realized_vol=_value_at(realized_volatility(close, realized_period), at),
+            vol_regime=classify_vol_regime(atr_now, atr_baseline),
+            rsi=_value_at(rsi(close, rsi_period), at),
+            adx=_value_at(adx(df, adx_period), at),
+            obv=_value_at(obv(df), at),
+            correlation=correlation,
+            concentration=concentration,
+            ok=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - attaching context must never block a signal
+        print(
+            f"  indicators: context computation failed, attaching empty: {exc}",
+            file=sys.stderr,
+        )
+        return IndicatorContext(
+            correlation=correlation, concentration=concentration, ok=False,
+        )

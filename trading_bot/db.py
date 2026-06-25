@@ -41,9 +41,10 @@ from trading_bot.models import (
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
+# Version 13 (Phase 6) — adds trades.ind_* advisory indicator-family columns.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -455,6 +456,30 @@ def _migrate_to_v12(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE trades ADD COLUMN headline_count INTEGER")
 
 
+def _migrate_to_v13(conn: sqlite3.Connection) -> None:
+    """Phase 6 migration step: add advisory indicator-family columns to trades.
+
+    All nullable: a trade opened before Phase 6, or any shadow/crypto trade that
+    isn't indicator-scored, leaves them NULL. The five families sit next to the
+    eventual resolved outcome for later (Phase 9) evaluation — they are advisory
+    metadata, never a gate. Mirrors the Phase 5 sentiment-column add (v12).
+    """
+    cur = conn.execute("PRAGMA table_info(trades)")
+    cols = {str(row[1]) for row in cur.fetchall()}
+    for column, coltype in (
+        ("ind_atr", "REAL"),
+        ("ind_realized_vol", "REAL"),
+        ("ind_vol_regime", "TEXT"),
+        ("ind_rsi", "REAL"),
+        ("ind_adx", "REAL"),
+        ("ind_obv", "REAL"),
+        ("ind_correlation", "REAL"),
+        ("ind_concentration", "TEXT"),
+    ):
+        if column not in cols:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {column} {coltype}")
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -471,6 +496,7 @@ def init_db() -> None:
         _migrate_to_v10(conn)
         _migrate_to_v11(conn)
         _migrate_to_v12(conn)
+        _migrate_to_v13(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -687,8 +713,11 @@ def insert_trade(trade: Trade) -> int:
             signal_id, opened_at, closed_at, exit_price,
             outcome, pnl_pct, pnl_dollars, notes, market_regime,
             vix_level, vix_band, context_score, track_mode,
-            sentiment_score, sentiment_label, heavy_news, headline_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            sentiment_score, sentiment_label, heavy_news, headline_count,
+            ind_atr, ind_realized_vol, ind_vol_regime, ind_rsi, ind_adx,
+            ind_obv, ind_correlation, ind_concentration
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = (
         trade.signal_id,
@@ -708,6 +737,14 @@ def insert_trade(trade: Trade) -> int:
         trade.sentiment_label,
         int(trade.heavy_news),
         trade.headline_count,
+        trade.ind_atr,
+        trade.ind_realized_vol,
+        trade.ind_vol_regime,
+        trade.ind_rsi,
+        trade.ind_adx,
+        trade.ind_obv,
+        trade.ind_correlation,
+        trade.ind_concentration,
     )
     conn = get_connection()
     try:
@@ -803,6 +840,16 @@ def _row_to_trade(row: sqlite3.Row) -> Trade:
         sentiment_label=row["sentiment_label"] if "sentiment_label" in keys else None,
         heavy_news=bool(row["heavy_news"]) if "heavy_news" in keys else False,
         headline_count=row["headline_count"] if "headline_count" in keys else None,
+        ind_atr=row["ind_atr"] if "ind_atr" in keys else None,
+        ind_realized_vol=row["ind_realized_vol"] if "ind_realized_vol" in keys else None,
+        ind_vol_regime=row["ind_vol_regime"] if "ind_vol_regime" in keys else None,
+        ind_rsi=row["ind_rsi"] if "ind_rsi" in keys else None,
+        ind_adx=row["ind_adx"] if "ind_adx" in keys else None,
+        ind_obv=row["ind_obv"] if "ind_obv" in keys else None,
+        ind_correlation=row["ind_correlation"] if "ind_correlation" in keys else None,
+        ind_concentration=(
+            row["ind_concentration"] if "ind_concentration" in keys else None
+        ),
         id=int(row["id"]),
     )
 

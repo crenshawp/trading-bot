@@ -31,6 +31,7 @@ from trading_bot import (
     context,
     db,
     earnings,
+    indicators,
     news_client,
     outcomes,
     performance,
@@ -188,14 +189,62 @@ def _score_signal_sentiment(signal: dict) -> object:
         return None
 
 
-def _emit_active_signal(signal: dict) -> None:
+def _close_series_for(ticker: str) -> object:
+    """Fetch a ticker's Close series for the correlation universe, or None.
+
+    Reuses the scanner's existing daily fetch. Fail-soft: any failure (no data,
+    unexpected shape) returns None so one name never sinks the correlation
+    frame. ``indicators.correlation_concentration`` is itself fail-soft too.
+    """
+    try:
+        data = get_stock_data(ticker)
+        if data is None:
+            return None
+        return data["Close"]
+    except Exception as exc:  # noqa: BLE001 - one name's fetch must not raise
+        print(f"  indicators: close fetch failed for {ticker}: {exc}", file=sys.stderr)
+        return None
+
+
+def _compute_signal_indicators(signal: dict, df: object) -> object:
+    """Compute the Phase 6 advisory indicator families for a signal that WILL
+    alert (called only after the ticker-active / pair-enabled / earnings gates
+    pass — so the families are never computed for signals that won't fire).
+
+    Per-ticker families come from ``df`` (the scan's enriched candle frame);
+    the correlation pair is computed against the currently-ACTIVE watchlist
+    names. Everything here is fail-soft: ``compute_context`` and
+    ``correlation_concentration`` both swallow their own errors, and this
+    wrapper guards anything systemic so the alert proceeds without context.
+    """
+    ticker = str(signal.get("ticker", ""))
+    try:
+        active_tickers = [
+            t for t, status in _active_stock_watchlist_entries() if status == "active"
+        ]
+        corr, concentration = indicators.correlation_concentration(
+            ticker, active_tickers, _close_series_for,
+        )
+        # Stocks reason on the last fully-closed candle (detect uses iloc[-2]).
+        return indicators.compute_context(
+            df, correlation=corr, concentration=concentration, at=-2,
+        )
+    except Exception as exc:  # noqa: BLE001 - advisory context must never block an alert
+        print(
+            f"  indicators pipeline error for {ticker}, alerting without it: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _emit_active_signal(signal: dict, df: object = None) -> None:
     """Handle a signal that passed ticker-active AND pair-enabled.
 
     The ONE hard gate runs first: if a known earnings report falls inside the
     trade's hold window, suppress the alert and do NOT open the trade. Otherwise
-    score advisory sentiment (only now — after all alert-gating checks pass, so
-    news/LLM work happens solely for signals that will alert) and fire the
-    enriched alert.
+    score advisory sentiment AND compute the Phase 6 indicator families (only
+    now — after all alert-gating checks pass, so news/LLM and indicator work
+    happen solely for signals that will alert) and fire the enriched alert.
     """
     if _should_check_earnings(signal):
         try:
@@ -218,7 +267,10 @@ def _emit_active_signal(signal: dict) -> None:
             return
 
     sentiment_result = _score_signal_sentiment(signal)
-    send_notification(signal, sentiment=sentiment_result)
+    indicator_ctx = (
+        _compute_signal_indicators(signal, df) if df is not None else None
+    )
+    send_notification(signal, sentiment=sentiment_result, indicators=indicator_ctx)
 
 
 def _load_secrets() -> None:
@@ -569,6 +621,7 @@ def _normalize_signal_type(raw: str) -> str:
 
 def log_signal(
     signal: dict, track_mode: str = "active", sentiment: object = None,
+    indicators: object = None,
 ) -> int | None:
     """Translate a legacy-shape ``signal`` dict into a ``Signal`` row and open
     a corresponding ``Trade`` record (Phase 1.3).
@@ -580,6 +633,10 @@ def log_signal(
     ``sentiment`` (Phase 5) is an optional advisory ``SentimentResult`` captured
     at fire time; its fields are persisted on the trade row next to the eventual
     outcome. ``None`` leaves the sentiment columns empty (shadow/crypto trades).
+
+    ``indicators`` (Phase 6) is an optional advisory ``IndicatorContext`` — the
+    five indicator families snapshotted at fire time, persisted the same way.
+    ``None`` leaves the ind_* columns empty (shadow/crypto trades).
 
     Returns the inserted (or deduped) signal id, or ``None`` if the entry is a
     risk-warning alert (``direction = "⚠️ WARNING"``) that the legacy code
@@ -672,6 +729,14 @@ def log_signal(
                 sentiment_label=getattr(sentiment, "label", None),
                 heavy_news=bool(getattr(sentiment, "heavy_news", False)),
                 headline_count=getattr(sentiment, "headline_count", None),
+                ind_atr=getattr(indicators, "atr", None),
+                ind_realized_vol=getattr(indicators, "realized_vol", None),
+                ind_vol_regime=getattr(indicators, "vol_regime", None),
+                ind_rsi=getattr(indicators, "rsi", None),
+                ind_adx=getattr(indicators, "adx", None),
+                ind_obv=getattr(indicators, "obv", None),
+                ind_correlation=getattr(indicators, "correlation", None),
+                ind_concentration=getattr(indicators, "concentration", None),
             )
         )
 
@@ -1356,7 +1421,9 @@ def _sentiment_alert_lines(sentiment: object) -> str:
     return lines
 
 
-def send_notification(signal, *, track_mode="active", alert=True, sentiment=None):
+def send_notification(
+    signal, *, track_mode="active", alert=True, sentiment=None, indicators=None,
+):
     """Persist the signal/trade and (unless suppressed) fire the alert.
 
     Phase 3.1-LIVE: ``track_mode`` tags the opened trade ('active' or
@@ -1368,9 +1435,15 @@ def send_notification(signal, *, track_mode="active", alert=True, sentiment=None
     Phase 5: ``sentiment`` is an optional advisory ``SentimentResult`` — it is
     persisted on the trade row and (for alerting signals) shown in the alert.
     It NEVER suppresses anything.
+
+    Phase 6: ``indicators`` is an optional advisory ``IndicatorContext`` — the
+    five indicator families snapshotted at fire time, persisted on the trade
+    row. Like sentiment, it NEVER suppresses anything.
     """
     try:
-        log_signal(signal, track_mode=track_mode, sentiment=sentiment)
+        log_signal(
+            signal, track_mode=track_mode, sentiment=sentiment, indicators=indicators,
+        )
     except Exception as e:
         # DB write failure for the signal/trade row. Route to stderr so a
         # silently-failing log doesn't hide that a fired alert was never
@@ -1476,8 +1549,10 @@ def scan_stocks():
         return
 
     # Fresh per-cycle news cache so one cycle's fired signals reuse fetches but
-    # the next cycle gets current headlines.
+    # the next cycle gets current headlines. The Phase 6 correlation memo is
+    # cleared the same way — one universe fetch per scan, fresh each cycle.
     news_client.clear_cache()
+    indicators.clear_correlation_cache()
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scanning stocks...")
     for ticker, status in _active_stock_watchlist_entries():
         try:
@@ -1493,8 +1568,10 @@ def scan_stocks():
                 # _pair_is_enabled is short-circuited for benched tickers.
                 if is_active and _pair_is_enabled(ticker, s.get("setup", "")):
                     # Earnings-blackout gate runs inside _emit_active_signal,
-                    # before any alert/trade (and before Phase 5 sentiment work).
-                    _emit_active_signal(s)
+                    # before any alert/trade (and before Phase 5 sentiment +
+                    # Phase 6 indicator work). df is passed so the indicator
+                    # families snapshot the same candle frame detect used.
+                    _emit_active_signal(s, df)
                 else:
                     if is_active:
                         # Active ticker, muted pair: gate the alert but keep

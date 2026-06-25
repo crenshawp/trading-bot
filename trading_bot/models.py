@@ -48,6 +48,16 @@ class Trade:
     sentiment_label: str | None = None      # bullish | neutral | bearish
     heavy_news: bool = False                # headline volume above threshold
     headline_count: int | None = None       # headlines the score was based on
+    # Phase 6 advisory indicator families, captured at fire time (NULL = not
+    # computed — shadow/crypto trades, or a fail-soft empty bundle).
+    ind_atr: float | None = None            # ATR (absolute price distance)
+    ind_realized_vol: float | None = None   # realized vol (fractional)
+    ind_vol_regime: str | None = None       # low | normal | high | unknown
+    ind_rsi: float | None = None            # momentum oscillator
+    ind_adx: float | None = None            # trend strength (direction-agnostic)
+    ind_obv: float | None = None            # cumulative volume flow
+    ind_correlation: float | None = None    # avg pairwise corr vs active set
+    ind_concentration: str | None = None    # concentrated | moderate | diversified | unknown
     id: int | None = None
 
 
