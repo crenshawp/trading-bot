@@ -1787,6 +1787,64 @@ def get_recent_trade_sentiment(limit: int = 20) -> list[dict[str, Any]]:
     ]
 
 
+def get_recent_trade_indicators(limit: int = 20) -> list[dict[str, Any]]:
+    """Recent fired signals that carry advisory indicator-family context (Phase 6).
+
+    Joins trades -> signals, newest first, restricted to trades that were
+    indicator-scored (``ind_vol_regime`` populated — i.e. the active alerting
+    stock signals; crypto/shadow leave it NULL). Each row carries the signal
+    identity, the five families, and the eventual outcome so the indicators sit
+    next to results — the per-signal report view for Phase 6.
+    """
+    sql = (
+        "SELECT signals.ticker AS ticker, "
+        "       signals.signal_type AS signal_type, "
+        "       signals.direction AS direction, "
+        "       trades.opened_at AS opened_at, "
+        "       trades.outcome AS outcome, "
+        "       trades.track_mode AS track_mode, "
+        "       trades.ind_atr AS ind_atr, "
+        "       trades.ind_realized_vol AS ind_realized_vol, "
+        "       trades.ind_vol_regime AS ind_vol_regime, "
+        "       trades.ind_rsi AS ind_rsi, "
+        "       trades.ind_adx AS ind_adx, "
+        "       trades.ind_obv AS ind_obv, "
+        "       trades.ind_correlation AS ind_correlation, "
+        "       trades.ind_concentration AS ind_concentration "
+        "FROM trades JOIN signals ON signals.id = trades.signal_id "
+        "WHERE trades.ind_vol_regime IS NOT NULL "
+        "ORDER BY trades.opened_at DESC LIMIT ?"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, (limit,)).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "ticker": str(r["ticker"]),
+            "signal_type": str(r["signal_type"]),
+            "direction": str(r["direction"]),
+            "opened_at": str(r["opened_at"]),
+            "outcome": r["outcome"],
+            "track_mode": str(r["track_mode"]),
+            "ind_atr": r["ind_atr"],
+            "ind_realized_vol": r["ind_realized_vol"],
+            "ind_vol_regime": str(r["ind_vol_regime"]),
+            "ind_rsi": r["ind_rsi"],
+            "ind_adx": r["ind_adx"],
+            "ind_obv": r["ind_obv"],
+            "ind_correlation": r["ind_correlation"],
+            "ind_concentration": (
+                str(r["ind_concentration"])
+                if r["ind_concentration"] is not None
+                else None
+            ),
+        }
+        for r in rows
+    ]
+
+
 def get_traded_signal_pairs() -> list[tuple[str, str]]:
     """Distinct (ticker, signal_type) pairs that have at least one trade.
 

@@ -207,3 +207,47 @@ def test_schema_version_returns_zero_on_uninitialized_db(
     monkeypatch.setattr("trading_bot.config.DB_PATH", tmp_path / "empty.db")
     # init_db NOT called — schema_version should report 0 gracefully
     assert db.schema_version() == 0
+
+
+# ---- indicator-family context (Phase 6) ----
+
+
+def test_get_recent_trade_indicators_only_returns_scored_rows(tmp_db: Path) -> None:
+    # An indicator-scored (active stock) trade...
+    sid_scored = db.insert_signal(_make_signal(ticker="GOOGL"))
+    db.insert_trade(Trade(
+        signal_id=sid_scored, opened_at=datetime(2026, 6, 1, 10, 0), outcome="win",
+        ind_atr=2.5, ind_realized_vol=0.018, ind_vol_regime="normal",
+        ind_rsi=54.3, ind_adx=27.1, ind_obv=1_234_567.0,
+        ind_correlation=0.42, ind_concentration="moderate",
+    ))
+    # ...and an un-scored (crypto/shadow) trade with ind_vol_regime left NULL.
+    sid_plain = db.insert_signal(
+        _make_signal(ticker="BTC-USD", asset_class="crypto", direction="long")
+    )
+    db.insert_trade(Trade(
+        signal_id=sid_plain, opened_at=datetime(2026, 6, 1, 11, 0), outcome="loss",
+    ))
+
+    rows = db.get_recent_trade_indicators()
+    assert len(rows) == 1                       # NULL-regime row excluded
+    row = rows[0]
+    assert row["ticker"] == "GOOGL"
+    assert row["ind_vol_regime"] == "normal"
+    assert row["ind_rsi"] == pytest.approx(54.3)
+    assert row["ind_adx"] == pytest.approx(27.1)
+    assert row["ind_obv"] == pytest.approx(1_234_567.0)
+    assert row["ind_correlation"] == pytest.approx(0.42)
+    assert row["ind_concentration"] == "moderate"
+    assert row["outcome"] == "win"
+
+
+def test_get_recent_trade_indicators_newest_first_and_limit(tmp_db: Path) -> None:
+    for i, ticker in enumerate(["AAA", "BBB", "CCC"]):
+        sid = db.insert_signal(_make_signal(ticker=ticker, signal_type=f"s{i}"))
+        db.insert_trade(Trade(
+            signal_id=sid, opened_at=datetime(2026, 6, 1, 10 + i, 0),
+            outcome="open", ind_vol_regime="high",
+        ))
+    rows = db.get_recent_trade_indicators(limit=2)
+    assert [r["ticker"] for r in rows] == ["CCC", "BBB"]   # newest first, capped at 2

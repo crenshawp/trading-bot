@@ -1115,6 +1115,43 @@ def cmd_sentiment_status(limit: int = 20) -> None:
         )
 
 
+# ---- indicators CLI (Phase 6) ----
+
+
+def cmd_indicators_status(limit: int = 20) -> None:
+    """Recent fired signals with their advisory indicator-family context.
+
+    The per-signal Phase 6 report view: volatility regime, RSI, ADX, OBV
+    (volume flow) and the cross-asset correlation/concentration, next to the
+    eventual outcome. Advisory only — these never gated the signal.
+    """
+    def _n(value: object, spec: str) -> str:
+        return format(value, spec) if isinstance(value, (int, float)) else "-"
+
+    rows = db.get_recent_trade_indicators(limit=limit)
+    print("INDICATOR STATUS  (recent signals with indicator-family context)")
+    print("-" * 104)
+    if not rows:
+        print("  (no indicator-scored signals yet)")
+        return
+    print(
+        f"  {'Opened':<20} {'Ticker':<7} {'Signal':<20} {'Vol':<7} "
+        f"{'RSI':>5} {'ADX':>5} {'OBV':>13} {'Corr':>6} "
+        f"{'Concentration':<13} {'Outcome':<8}"
+    )
+    for r in rows:
+        opened = r["opened_at"][:19].replace("T", " ")
+        print(
+            f"  {opened:<20} {r['ticker']:<7} {r['signal_type']:<20} "
+            f"{r['ind_vol_regime']:<7} "
+            f"{_n(r['ind_rsi'], '.1f'):>5} {_n(r['ind_adx'], '.1f'):>5} "
+            f"{_n(r['ind_obv'], ',.0f'):>13} "
+            f"{_n(r['ind_correlation'], '+.2f'):>6} "
+            f"{(r['ind_concentration'] or '-'):<13} "
+            f"{str(r['outcome'] or 'open'):<8}"
+        )
+
+
 # ---- predictions CLI (Phase 2.2b) ----
 
 # Seeded defaults — duplicated from scanner._PRED_DEFAULTS so the CLI can
@@ -1529,6 +1566,17 @@ def main() -> None:
         help="How many recent scored signals to show (default 20)",
     )
 
+    # indicators (Phase 6)
+    indicators_parser = sub.add_parser("indicators")
+    indicators_sub = indicators_parser.add_subparsers(
+        dest="indicators_cmd", required=True
+    )
+    ind_status_p = indicators_sub.add_parser("status")
+    ind_status_p.add_argument(
+        "--limit", type=int, default=20,
+        help="How many recent indicator-scored signals to show (default 20)",
+    )
+
     # predictions (Phase 2.2b)
     pred_parser = sub.add_parser("predictions")
     pred_sub = pred_parser.add_subparsers(dest="predictions_cmd", required=True)
@@ -1671,6 +1719,9 @@ def main() -> None:
     elif args.command == "sentiment":
         if args.sentiment_cmd == "status":
             cmd_sentiment_status(limit=args.limit)
+    elif args.command == "indicators":
+        if args.indicators_cmd == "status":
+            cmd_indicators_status(limit=args.limit)
     elif args.command == "predictions":
         if args.predictions_cmd == "enable":
             cmd_predictions_enable()
