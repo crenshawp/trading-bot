@@ -25,6 +25,7 @@ block a signal.
 from __future__ import annotations
 
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from trading_bot import config
@@ -118,3 +119,120 @@ def _unavailable(why: str) -> SizeRecommendation:
     """A fail-soft 'no size' recommendation, logged."""
     print(f"  risk: size unavailable ({why})", file=sys.stderr)
     return SizeRecommendation(ok=False, reason=f"size unavailable: {why}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PORTFOLIO RISK — advisory verdicts across currently-open positions
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class OpenPosition:
+    """A currently-open trade's contribution to portfolio risk.
+
+    ``risk_pct`` is the recommended risk recorded on that trade at its own fire
+    time (``None`` for trades opened before Phase 7 — skipped from the sums).
+    ``concentration`` is its persisted Phase 6 label.
+    """
+
+    risk_pct: float | None
+    concentration: str = "unknown"
+
+
+@dataclass(frozen=True)
+class PortfolioRisk:
+    """Advisory portfolio-level verdicts for a candidate against the open book.
+
+    Each verdict is ``ok`` / ``would-exceed-X`` / ``unknown`` and is RECORDED,
+    never enforced. ``ok`` is True only when all three verdicts are ``ok``.
+    """
+
+    total_risk_pct: float | None = None       # open + candidate risk, % of notional
+    portfolio_verdict: str = "unknown"        # ok | would-exceed-portfolio | unknown
+    position_pct: float | None = None         # candidate position size, % of notional
+    position_verdict: str = "unknown"         # ok | would-exceed-position | unknown
+    cluster_risk_pct: float | None = None     # concentrated-cluster risk, % of notional
+    cluster_verdict: str = "unknown"          # ok | would-exceed-cluster | unknown
+    ok: bool = False
+    reason: str = "not computed"
+
+
+def portfolio_risk(
+    candidate: SizeRecommendation,
+    candidate_concentration: str,
+    open_positions: Sequence[OpenPosition],
+    *,
+    max_portfolio_pct: float = config.MAX_PORTFOLIO_RISK_PCT,
+    max_position_pct: float = config.MAX_POSITION_PCT,
+    max_cluster_pct: float = config.MAX_CORRELATED_CLUSTER_PCT,
+) -> PortfolioRisk:
+    """Advisory verdicts: summed open risk vs the portfolio cap, the candidate's
+    per-position size vs the position cap, and correlated-cluster exposure vs the
+    cluster cap.
+
+    Cluster exposure reuses the Phase 6 concentration label: a ``concentrated``
+    candidate joins the cluster of all currently-open ``concentrated`` positions
+    (names that move with the pack are a hidden single bet), and their combined
+    risk is compared to ``max_cluster_pct``. A non-concentrated candidate is not
+    adding to a cluster (verdict ``ok``); an ``unknown`` concentration yields an
+    ``unknown`` cluster verdict.
+
+    FAIL-SOFT: if the candidate has no usable size, or any input is malformed,
+    the verdicts are ``unknown`` (logged); it never raises.
+    """
+    try:
+        if not candidate.ok or candidate.risk_pct is None:
+            print("  risk: portfolio verdicts unknown (candidate size unavailable)",
+                  file=sys.stderr)
+            return PortfolioRisk(reason="portfolio risk unknown: candidate size unavailable")
+
+        open_risk = sum(
+            p.risk_pct for p in open_positions if p.risk_pct is not None
+        )
+        total = open_risk + candidate.risk_pct
+        portfolio_verdict = (
+            "would-exceed-portfolio" if total > max_portfolio_pct else "ok"
+        )
+
+        position_pct = candidate.position_pct
+        position_verdict = (
+            "would-exceed-position"
+            if position_pct is not None and position_pct >= max_position_pct
+            else "ok"
+        )
+
+        cluster_open = sum(
+            p.risk_pct for p in open_positions
+            if p.risk_pct is not None and p.concentration == "concentrated"
+        )
+        if candidate_concentration == "unknown":
+            cluster_risk: float | None = None
+            cluster_verdict = "unknown"
+        elif candidate_concentration == "concentrated":
+            cluster_risk = cluster_open + candidate.risk_pct
+            cluster_verdict = (
+                "would-exceed-cluster" if cluster_risk > max_cluster_pct else "ok"
+            )
+        else:  # moderate / diversified — not joining a correlated cluster
+            cluster_risk = cluster_open
+            cluster_verdict = "ok"
+
+        ok = (
+            portfolio_verdict == "ok"
+            and position_verdict == "ok"
+            and cluster_verdict == "ok"
+        )
+        return PortfolioRisk(
+            total_risk_pct=total,
+            portfolio_verdict=portfolio_verdict,
+            position_pct=position_pct,
+            position_verdict=position_verdict,
+            cluster_risk_pct=cluster_risk,
+            cluster_verdict=cluster_verdict,
+            ok=ok,
+            reason="ok",
+        )
+    except Exception as exc:  # noqa: BLE001 - portfolio risk must never block a signal
+        print(f"  risk: portfolio verdicts failed, returning unknown: {exc}",
+              file=sys.stderr)
+        return PortfolioRisk(reason=f"portfolio risk unknown: {exc}")
