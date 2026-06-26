@@ -236,3 +236,73 @@ def portfolio_risk(
         print(f"  risk: portfolio verdicts failed, returning unknown: {exc}",
               file=sys.stderr)
         return PortfolioRisk(reason=f"portfolio risk unknown: {exc}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ASSESSMENT — the per-signal bundle attached to a fired trade
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class RiskAssessment:
+    """Flat sizing + portfolio bundle snapshotted for one fired signal.
+
+    Combines :class:`SizeRecommendation` and :class:`PortfolioRisk` into one
+    object the scanner persists on the trade row. Advisory only.
+    """
+
+    recommended_size: float | None = None
+    stop_distance: float | None = None
+    dollar_risk: float | None = None
+    risk_pct: float | None = None
+    position_pct: float | None = None
+    capped: bool = False
+    total_risk_pct: float | None = None
+    portfolio_verdict: str = "unknown"
+    position_verdict: str = "unknown"
+    cluster_risk_pct: float | None = None
+    cluster_verdict: str = "unknown"
+    ok: bool = False
+    reason: str = "not computed"
+
+
+def assess(
+    entry: float | None,
+    atr: float | None,
+    concentration: str,
+    open_positions: Sequence[OpenPosition],
+    *,
+    account: float = config.NOTIONAL_ACCOUNT,
+    risk_per_trade_pct: float = config.RISK_PER_TRADE_PCT,
+    stop_multiple: float = config.RISK_ATR_STOP_MULTIPLE,
+    max_position_pct: float = config.MAX_POSITION_PCT,
+    max_portfolio_pct: float = config.MAX_PORTFOLIO_RISK_PCT,
+    max_cluster_pct: float = config.MAX_CORRELATED_CLUSTER_PCT,
+) -> RiskAssessment:
+    """Size the candidate, then judge it against the open book. Pure — the open
+    positions are injected. Fail-soft throughout (sizing/portfolio each swallow
+    their own errors)."""
+    size = position_size(
+        entry, atr, account, risk_per_trade_pct,
+        stop_multiple=stop_multiple, max_position_pct=max_position_pct,
+    )
+    pf = portfolio_risk(
+        size, concentration, open_positions,
+        max_portfolio_pct=max_portfolio_pct, max_position_pct=max_position_pct,
+        max_cluster_pct=max_cluster_pct,
+    )
+    return RiskAssessment(
+        recommended_size=size.recommended_size,
+        stop_distance=size.stop_distance,
+        dollar_risk=size.dollar_risk,
+        risk_pct=size.risk_pct,
+        position_pct=size.position_pct,
+        capped=size.capped,
+        total_risk_pct=pf.total_risk_pct,
+        portfolio_verdict=pf.portfolio_verdict,
+        position_verdict=pf.position_verdict,
+        cluster_risk_pct=pf.cluster_risk_pct,
+        cluster_verdict=pf.cluster_verdict,
+        ok=size.ok and pf.ok,
+        reason=size.reason if not size.ok else pf.reason,
+    )

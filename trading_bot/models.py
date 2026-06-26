@@ -58,6 +58,19 @@ class Trade:
     ind_obv: float | None = None            # cumulative volume flow
     ind_correlation: float | None = None    # avg pairwise corr vs active set
     ind_concentration: str | None = None    # concentrated | moderate | diversified | unknown
+    # Phase 7 advisory risk recommendation, captured at fire time (NULL = not
+    # computed — shadow/crypto trades, or a fail-soft unavailable assessment).
+    risk_recommended_size: float | None = None  # units (shares/contracts)
+    risk_stop_distance: float | None = None      # ATR * stop multiple
+    risk_dollar_risk: float | None = None        # notional $ at risk
+    risk_pct: float | None = None                # dollar_risk as % of notional
+    risk_position_pct: float | None = None       # position value as % of notional
+    risk_capped: bool = False                    # per-position cap bound the size
+    risk_total_pct: float | None = None          # portfolio open + candidate risk %
+    risk_portfolio_verdict: str | None = None    # ok | would-exceed-portfolio | unknown
+    risk_position_verdict: str | None = None     # ok | would-exceed-position | unknown
+    risk_cluster_pct: float | None = None        # concentrated-cluster risk %
+    risk_cluster_verdict: str | None = None      # ok | would-exceed-cluster | unknown
     id: int | None = None
 
 

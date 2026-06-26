@@ -37,6 +37,7 @@ from trading_bot import (
     performance,
     predictions,
     regime,
+    risk,
     settings,
     vix,
 )
@@ -237,14 +238,47 @@ def _compute_signal_indicators(signal: dict, df: object) -> object:
         return None
 
 
+def _compute_signal_risk(signal: dict, indicator_ctx: object) -> object:
+    """Compute the advisory Phase 7 risk assessment for a signal that WILL alert.
+
+    Consumes the Phase 6 ATR (stop distance) and concentration label (cluster
+    exposure) from ``indicator_ctx``, plus the currently-open ACTIVE book for
+    portfolio exposure (the candidate is not yet logged, so it is never
+    double-counted). Advisory/notional only. Fail-soft: ``risk.assess`` already
+    swallows its own errors; this wraps anything systemic (the open-trades read)
+    so the alert proceeds without a recommendation.
+    """
+    ticker = str(signal.get("ticker", ""))
+    try:
+        entry = float(signal.get("price", 0.0))
+        atr = getattr(indicator_ctx, "atr", None)
+        concentration = getattr(indicator_ctx, "concentration", "unknown") or "unknown"
+        open_positions = [
+            risk.OpenPosition(
+                risk_pct=t.risk_pct,
+                concentration=t.ind_concentration or "unknown",
+            )
+            for t in db.get_open_trades()
+            if t.track_mode == "active"
+        ]
+        return risk.assess(entry, atr, concentration, open_positions)
+    except Exception as exc:  # noqa: BLE001 - advisory risk must never block an alert
+        print(
+            f"  risk pipeline error for {ticker}, alerting without it: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
 def _emit_active_signal(signal: dict, df: object = None) -> None:
     """Handle a signal that passed ticker-active AND pair-enabled.
 
     The ONE hard gate runs first: if a known earnings report falls inside the
     trade's hold window, suppress the alert and do NOT open the trade. Otherwise
-    score advisory sentiment AND compute the Phase 6 indicator families (only
-    now — after all alert-gating checks pass, so news/LLM and indicator work
-    happen solely for signals that will alert) and fire the enriched alert.
+    score advisory sentiment, compute the Phase 6 indicator families, and derive
+    the Phase 7 risk recommendation (only now — after all alert-gating checks
+    pass, so news/LLM, indicator, and risk work happen solely for signals that
+    will alert) and fire the enriched alert.
     """
     if _should_check_earnings(signal):
         try:
@@ -270,7 +304,11 @@ def _emit_active_signal(signal: dict, df: object = None) -> None:
     indicator_ctx = (
         _compute_signal_indicators(signal, df) if df is not None else None
     )
-    send_notification(signal, sentiment=sentiment_result, indicators=indicator_ctx)
+    risk_assessment = _compute_signal_risk(signal, indicator_ctx)
+    send_notification(
+        signal, sentiment=sentiment_result, indicators=indicator_ctx,
+        risk=risk_assessment,
+    )
 
 
 def _load_secrets() -> None:
@@ -621,7 +659,7 @@ def _normalize_signal_type(raw: str) -> str:
 
 def log_signal(
     signal: dict, track_mode: str = "active", sentiment: object = None,
-    indicators: object = None,
+    indicators: object = None, risk: object = None,
 ) -> int | None:
     """Translate a legacy-shape ``signal`` dict into a ``Signal`` row and open
     a corresponding ``Trade`` record (Phase 1.3).
@@ -637,6 +675,10 @@ def log_signal(
     ``indicators`` (Phase 6) is an optional advisory ``IndicatorContext`` — the
     five indicator families snapshotted at fire time, persisted the same way.
     ``None`` leaves the ind_* columns empty (shadow/crypto trades).
+
+    ``risk`` (Phase 7) is an optional advisory ``RiskAssessment`` — recommended
+    size + portfolio verdicts snapshotted at fire time, persisted the same way.
+    ``None`` leaves the risk_* columns empty (shadow/crypto trades).
 
     Returns the inserted (or deduped) signal id, or ``None`` if the entry is a
     risk-warning alert (``direction = "⚠️ WARNING"``) that the legacy code
@@ -737,6 +779,17 @@ def log_signal(
                 ind_obv=getattr(indicators, "obv", None),
                 ind_correlation=getattr(indicators, "correlation", None),
                 ind_concentration=getattr(indicators, "concentration", None),
+                risk_recommended_size=getattr(risk, "recommended_size", None),
+                risk_stop_distance=getattr(risk, "stop_distance", None),
+                risk_dollar_risk=getattr(risk, "dollar_risk", None),
+                risk_pct=getattr(risk, "risk_pct", None),
+                risk_position_pct=getattr(risk, "position_pct", None),
+                risk_capped=bool(getattr(risk, "capped", False)),
+                risk_total_pct=getattr(risk, "total_risk_pct", None),
+                risk_portfolio_verdict=getattr(risk, "portfolio_verdict", None),
+                risk_position_verdict=getattr(risk, "position_verdict", None),
+                risk_cluster_pct=getattr(risk, "cluster_risk_pct", None),
+                risk_cluster_verdict=getattr(risk, "cluster_verdict", None),
             )
         )
 
@@ -1407,6 +1460,35 @@ def detect_crypto_signals(ticker, df):
 # NOTIFICATIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _risk_alert_lines(risk_obj: object) -> str:
+    """Render the advisory risk block for an alert (plain ASCII), or '' when absent.
+
+    Shows the recommended size + risk %, a capped marker, and any
+    'would-exceed-*' portfolio advisories. Purely informational — nothing here
+    changes whether or what the alert fires.
+    """
+    if risk_obj is None:
+        return ""
+    size = getattr(risk_obj, "recommended_size", None)
+    if not isinstance(size, (int, float)):
+        return f"Risk:        size unavailable ({getattr(risk_obj, 'reason', '')})\n"
+    risk_pct = getattr(risk_obj, "risk_pct", None)
+    pct_txt = f" ({risk_pct:.2f}% risk)" if isinstance(risk_pct, (int, float)) else ""
+    capped = "  [capped to max position]" if getattr(risk_obj, "capped", False) else ""
+    lines = f"Risk:        ~{size:.2f} units{pct_txt}{capped}\n"
+    advisories = [
+        v for v in (
+            getattr(risk_obj, "portfolio_verdict", ""),
+            getattr(risk_obj, "position_verdict", ""),
+            getattr(risk_obj, "cluster_verdict", ""),
+        )
+        if isinstance(v, str) and v.startswith("would-exceed")
+    ]
+    if advisories:
+        lines += f"Risk advisory: {', '.join(advisories)}\n"
+    return lines
+
+
 def _sentiment_alert_lines(sentiment: object) -> str:
     """Render the advisory sentiment block for an alert, or '' when absent."""
     if sentiment is None:
@@ -1423,6 +1505,7 @@ def _sentiment_alert_lines(sentiment: object) -> str:
 
 def send_notification(
     signal, *, track_mode="active", alert=True, sentiment=None, indicators=None,
+    risk=None,
 ):
     """Persist the signal/trade and (unless suppressed) fire the alert.
 
@@ -1439,10 +1522,15 @@ def send_notification(
     Phase 6: ``indicators`` is an optional advisory ``IndicatorContext`` — the
     five indicator families snapshotted at fire time, persisted on the trade
     row. Like sentiment, it NEVER suppresses anything.
+
+    Phase 7: ``risk`` is an optional advisory ``RiskAssessment`` — the
+    recommended size + portfolio verdicts, persisted on the trade row and shown
+    in the alert. Advisory/notional only; it NEVER suppresses anything.
     """
     try:
         log_signal(
-            signal, track_mode=track_mode, sentiment=sentiment, indicators=indicators,
+            signal, track_mode=track_mode, sentiment=sentiment,
+            indicators=indicators, risk=risk,
         )
     except Exception as e:
         # DB write failure for the signal/trade row. Route to stderr so a
@@ -1471,6 +1559,7 @@ def send_notification(
         f"Hold Time:   {signal['hold_days']}\n"
         f"Confidence:  {signal['confidence']}\n"
         f"{_sentiment_alert_lines(sentiment)}"
+        f"{_risk_alert_lines(risk)}"
         f"Time:        {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
     )
 
@@ -1500,6 +1589,26 @@ def send_notification(
                      + ("  ⚠️ heavy news" if getattr(sentiment, "heavy_news", False) else ""),
             "inline": True,
         })
+    if risk is not None:
+        _rsize = getattr(risk, "recommended_size", None)
+        if isinstance(_rsize, (int, float)):
+            _rpct = getattr(risk, "risk_pct", None)
+            _rpct_txt = f" ({_rpct:.2f}%)" if isinstance(_rpct, (int, float)) else ""
+            _cap = "  [capped]" if getattr(risk, "capped", False) else ""
+            _adv = [
+                v for v in (
+                    getattr(risk, "portfolio_verdict", ""),
+                    getattr(risk, "position_verdict", ""),
+                    getattr(risk, "cluster_verdict", ""),
+                )
+                if isinstance(v, str) and v.startswith("would-exceed")
+            ]
+            _risk_val = f"~{_rsize:.2f} units{_rpct_txt}{_cap}"
+            if _adv:
+                _risk_val += "  ⚠️ " + ", ".join(_adv)
+        else:
+            _risk_val = f"size unavailable ({getattr(risk, 'reason', '')})"
+        embed_fields.append({"name": "Risk", "value": _risk_val, "inline": True})
     embed_fields.append(
         {"name": "Time", "value": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "inline": True}
     )

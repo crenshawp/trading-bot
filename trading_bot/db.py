@@ -41,10 +41,11 @@ from trading_bot.models import (
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
+# Version 14 (Phase 7) — adds trades.risk_* advisory risk-recommendation columns.
 # Version 13 (Phase 6) — adds trades.ind_* advisory indicator-family columns.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -480,6 +481,34 @@ def _migrate_to_v13(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE trades ADD COLUMN {column} {coltype}")
 
 
+def _migrate_to_v14(conn: sqlite3.Connection) -> None:
+    """Phase 7 migration step: add advisory risk-recommendation columns to trades.
+
+    All nullable (``risk_capped`` defaults 0): a trade opened before Phase 7, or
+    any shadow/crypto trade that isn't risk-assessed, leaves them NULL/0. The
+    sizing + portfolio verdicts sit next to the eventual resolved outcome for
+    later (Phase 9) evaluation — advisory metadata, never a gate. Mirrors the
+    Phase 5/6 column adds (v12/v13).
+    """
+    cur = conn.execute("PRAGMA table_info(trades)")
+    cols = {str(row[1]) for row in cur.fetchall()}
+    for column, coltype in (
+        ("risk_recommended_size", "REAL"),
+        ("risk_stop_distance", "REAL"),
+        ("risk_dollar_risk", "REAL"),
+        ("risk_pct", "REAL"),
+        ("risk_position_pct", "REAL"),
+        ("risk_capped", "INTEGER NOT NULL DEFAULT 0"),
+        ("risk_total_pct", "REAL"),
+        ("risk_portfolio_verdict", "TEXT"),
+        ("risk_position_verdict", "TEXT"),
+        ("risk_cluster_pct", "REAL"),
+        ("risk_cluster_verdict", "TEXT"),
+    ):
+        if column not in cols:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {column} {coltype}")
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -497,6 +526,7 @@ def init_db() -> None:
         _migrate_to_v11(conn)
         _migrate_to_v12(conn)
         _migrate_to_v13(conn)
+        _migrate_to_v14(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -715,9 +745,14 @@ def insert_trade(trade: Trade) -> int:
             vix_level, vix_band, context_score, track_mode,
             sentiment_score, sentiment_label, heavy_news, headline_count,
             ind_atr, ind_realized_vol, ind_vol_regime, ind_rsi, ind_adx,
-            ind_obv, ind_correlation, ind_concentration
+            ind_obv, ind_correlation, ind_concentration,
+            risk_recommended_size, risk_stop_distance, risk_dollar_risk,
+            risk_pct, risk_position_pct, risk_capped, risk_total_pct,
+            risk_portfolio_verdict, risk_position_verdict, risk_cluster_pct,
+            risk_cluster_verdict
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                  ?, ?, ?, ?, ?, ?, ?, ?)
+                  ?, ?, ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = (
         trade.signal_id,
@@ -745,6 +780,17 @@ def insert_trade(trade: Trade) -> int:
         trade.ind_obv,
         trade.ind_correlation,
         trade.ind_concentration,
+        trade.risk_recommended_size,
+        trade.risk_stop_distance,
+        trade.risk_dollar_risk,
+        trade.risk_pct,
+        trade.risk_position_pct,
+        int(trade.risk_capped),
+        trade.risk_total_pct,
+        trade.risk_portfolio_verdict,
+        trade.risk_position_verdict,
+        trade.risk_cluster_pct,
+        trade.risk_cluster_verdict,
     )
     conn = get_connection()
     try:
@@ -849,6 +895,35 @@ def _row_to_trade(row: sqlite3.Row) -> Trade:
         ind_correlation=row["ind_correlation"] if "ind_correlation" in keys else None,
         ind_concentration=(
             row["ind_concentration"] if "ind_concentration" in keys else None
+        ),
+        risk_recommended_size=(
+            row["risk_recommended_size"] if "risk_recommended_size" in keys else None
+        ),
+        risk_stop_distance=(
+            row["risk_stop_distance"] if "risk_stop_distance" in keys else None
+        ),
+        risk_dollar_risk=(
+            row["risk_dollar_risk"] if "risk_dollar_risk" in keys else None
+        ),
+        risk_pct=row["risk_pct"] if "risk_pct" in keys else None,
+        risk_position_pct=(
+            row["risk_position_pct"] if "risk_position_pct" in keys else None
+        ),
+        risk_capped=(
+            bool(row["risk_capped"]) if "risk_capped" in keys else False
+        ),
+        risk_total_pct=row["risk_total_pct"] if "risk_total_pct" in keys else None,
+        risk_portfolio_verdict=(
+            row["risk_portfolio_verdict"] if "risk_portfolio_verdict" in keys else None
+        ),
+        risk_position_verdict=(
+            row["risk_position_verdict"] if "risk_position_verdict" in keys else None
+        ),
+        risk_cluster_pct=(
+            row["risk_cluster_pct"] if "risk_cluster_pct" in keys else None
+        ),
+        risk_cluster_verdict=(
+            row["risk_cluster_verdict"] if "risk_cluster_verdict" in keys else None
         ),
         id=int(row["id"]),
     )
