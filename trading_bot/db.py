@@ -1920,6 +1920,70 @@ def get_recent_trade_indicators(limit: int = 20) -> list[dict[str, Any]]:
     ]
 
 
+def get_recent_trade_risk(limit: int = 20) -> list[dict[str, Any]]:
+    """Recent fired signals that carry an advisory risk recommendation (Phase 7).
+
+    Joins trades -> signals, newest first, restricted to risk-assessed rows
+    (``risk_portfolio_verdict`` populated — the active alerting stock signals;
+    crypto/shadow leave it NULL). Each row carries the signal identity, the
+    sizing + portfolio verdicts, and the eventual outcome so the recommendation
+    sits next to the result — the per-signal risk report view.
+    """
+    sql = (
+        "SELECT signals.ticker AS ticker, "
+        "       signals.signal_type AS signal_type, "
+        "       signals.direction AS direction, "
+        "       trades.opened_at AS opened_at, "
+        "       trades.outcome AS outcome, "
+        "       trades.track_mode AS track_mode, "
+        "       trades.risk_recommended_size AS risk_recommended_size, "
+        "       trades.risk_pct AS risk_pct, "
+        "       trades.risk_position_pct AS risk_position_pct, "
+        "       trades.risk_capped AS risk_capped, "
+        "       trades.risk_total_pct AS risk_total_pct, "
+        "       trades.risk_portfolio_verdict AS risk_portfolio_verdict, "
+        "       trades.risk_position_verdict AS risk_position_verdict, "
+        "       trades.risk_cluster_pct AS risk_cluster_pct, "
+        "       trades.risk_cluster_verdict AS risk_cluster_verdict "
+        "FROM trades JOIN signals ON signals.id = trades.signal_id "
+        "WHERE trades.risk_portfolio_verdict IS NOT NULL "
+        "ORDER BY trades.opened_at DESC LIMIT ?"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, (limit,)).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "ticker": str(r["ticker"]),
+            "signal_type": str(r["signal_type"]),
+            "direction": str(r["direction"]),
+            "opened_at": str(r["opened_at"]),
+            "outcome": r["outcome"],
+            "track_mode": str(r["track_mode"]),
+            "risk_recommended_size": r["risk_recommended_size"],
+            "risk_pct": r["risk_pct"],
+            "risk_position_pct": r["risk_position_pct"],
+            "risk_capped": bool(r["risk_capped"]),
+            "risk_total_pct": r["risk_total_pct"],
+            "risk_portfolio_verdict": str(r["risk_portfolio_verdict"]),
+            "risk_position_verdict": (
+                str(r["risk_position_verdict"])
+                if r["risk_position_verdict"] is not None
+                else None
+            ),
+            "risk_cluster_pct": r["risk_cluster_pct"],
+            "risk_cluster_verdict": (
+                str(r["risk_cluster_verdict"])
+                if r["risk_cluster_verdict"] is not None
+                else None
+            ),
+        }
+        for r in rows
+    ]
+
+
 def get_traded_signal_pairs() -> list[tuple[str, str]]:
     """Distinct (ticker, signal_type) pairs that have at least one trade.
 

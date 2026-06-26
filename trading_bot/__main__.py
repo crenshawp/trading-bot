@@ -1152,6 +1152,90 @@ def cmd_indicators_status(limit: int = 20) -> None:
         )
 
 
+# ---- risk CLI (Phase 7) ----
+
+
+def cmd_risk_status(limit: int = 20) -> None:
+    """Recent fired signals with their advisory risk recommendation.
+
+    Shows the recommended size (a trailing ``*`` marks a position capped at the
+    per-position limit), the risk %, and the three portfolio verdicts next to
+    the eventual outcome. Advisory only — nothing here was enforced.
+    """
+    def _n(value: object, spec: str) -> str:
+        return format(value, spec) if isinstance(value, (int, float)) else "-"
+
+    rows = db.get_recent_trade_risk(limit=limit)
+    print("RISK STATUS  (recent signals with advisory sizing + portfolio verdicts)")
+    print("-" * 112)
+    if not rows:
+        print("  (no risk-assessed signals yet)")
+        return
+    print(
+        f"  {'Opened':<20} {'Ticker':<7} {'Signal':<18} {'Size':>9} {'Risk%':>6}  "
+        f"{'Portfolio':<22} {'Position':<22} {'Cluster':<20} {'Outcome':<8}"
+    )
+    for r in rows:
+        size = r["risk_recommended_size"]
+        size_txt = (
+            f"{size:,.2f}" + ("*" if r["risk_capped"] else "")
+            if isinstance(size, (int, float)) else "-"
+        )
+        print(
+            f"  {r['opened_at'][:19].replace('T', ' '):<20} {r['ticker']:<7} "
+            f"{r['signal_type']:<18} {size_txt:>9} {_n(r['risk_pct'], '.2f'):>6}  "
+            f"{r['risk_portfolio_verdict']:<22} "
+            f"{(r['risk_position_verdict'] or '-'):<22} "
+            f"{(r['risk_cluster_verdict'] or '-'):<20} "
+            f"{str(r['outcome'] or 'open'):<8}"
+        )
+    print("\n  * size capped at the per-position limit")
+
+
+def cmd_risk_exposure() -> None:
+    """Current open-trade exposure vs the configured advisory limits.
+
+    Sums the recorded risk across currently-OPEN active trades (pre-Phase-7
+    trades carry no risk and are skipped) and compares it to the notional
+    portfolio / cluster / position limits. Advisory only — nothing is enforced.
+    """
+    open_active = [t for t in db.get_open_trades() if t.track_mode == "active"]
+    n_sized = sum(1 for t in open_active if t.risk_pct is not None)
+    total_risk = sum(t.risk_pct for t in open_active if t.risk_pct is not None)
+    cluster_risk = sum(
+        t.risk_pct for t in open_active
+        if t.risk_pct is not None and t.ind_concentration == "concentrated"
+    )
+    largest_pos = max(
+        (t.risk_position_pct for t in open_active if t.risk_position_pct is not None),
+        default=0.0,
+    )
+
+    def _verdict(value: float, limit: float) -> str:
+        return "OVER" if value > limit else "ok"
+
+    print("RISK EXPOSURE  (open ACTIVE trades vs advisory limits)")
+    print("-" * 64)
+    print(f"  Notional account:      ${config.NOTIONAL_ACCOUNT:,.2f}")
+    print(f"  Open active trades:     {len(open_active)}  ({n_sized} risk-sized)")
+    print(
+        f"  Total open risk:        {total_risk:.2f}%  / "
+        f"{config.MAX_PORTFOLIO_RISK_PCT:.1f}% limit  "
+        f"[{_verdict(total_risk, config.MAX_PORTFOLIO_RISK_PCT)}]"
+    )
+    print(
+        f"  Concentrated cluster:   {cluster_risk:.2f}%  / "
+        f"{config.MAX_CORRELATED_CLUSTER_PCT:.1f}% limit  "
+        f"[{_verdict(cluster_risk, config.MAX_CORRELATED_CLUSTER_PCT)}]"
+    )
+    print(
+        f"  Largest position:       {largest_pos:.2f}%  / "
+        f"{config.MAX_POSITION_PCT:.1f}% limit  "
+        f"[{_verdict(largest_pos, config.MAX_POSITION_PCT)}]"
+    )
+    print("\n  Advisory only - nothing is enforced; no capital is at risk.")
+
+
 # ---- predictions CLI (Phase 2.2b) ----
 
 # Seeded defaults — duplicated from scanner._PRED_DEFAULTS so the CLI can
@@ -1577,6 +1661,16 @@ def main() -> None:
         help="How many recent indicator-scored signals to show (default 20)",
     )
 
+    # risk (Phase 7)
+    risk_parser = sub.add_parser("risk")
+    risk_sub = risk_parser.add_subparsers(dest="risk_cmd", required=True)
+    risk_status_p = risk_sub.add_parser("status")
+    risk_status_p.add_argument(
+        "--limit", type=int, default=20,
+        help="How many recent risk-assessed signals to show (default 20)",
+    )
+    risk_sub.add_parser("exposure")
+
     # predictions (Phase 2.2b)
     pred_parser = sub.add_parser("predictions")
     pred_sub = pred_parser.add_subparsers(dest="predictions_cmd", required=True)
@@ -1722,6 +1816,11 @@ def main() -> None:
     elif args.command == "indicators":
         if args.indicators_cmd == "status":
             cmd_indicators_status(limit=args.limit)
+    elif args.command == "risk":
+        if args.risk_cmd == "status":
+            cmd_risk_status(limit=args.limit)
+        elif args.risk_cmd == "exposure":
+            cmd_risk_exposure()
     elif args.command == "predictions":
         if args.predictions_cmd == "enable":
             cmd_predictions_enable()

@@ -677,6 +677,70 @@ def test_cli_indicators_status_empty(
     assert "no indicator-scored signals yet" in capsys.readouterr().out
 
 
+# ───────────────────── Phase 7 risk subcommand ─────────────────────
+
+
+def test_cli_risk_status(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rows = [{
+        "ticker": "GOOGL", "signal_type": "ema21_pullback", "direction": "call",
+        "opened_at": "2026-06-01T10:00:00", "outcome": "win", "track_mode": "active",
+        "risk_recommended_size": 20.0, "risk_pct": 0.6, "risk_position_pct": 20.0,
+        "risk_capped": True, "risk_total_pct": 4.5,
+        "risk_portfolio_verdict": "ok",
+        "risk_position_verdict": "would-exceed-position",
+        "risk_cluster_pct": 3.0, "risk_cluster_verdict": "ok",
+    }]
+    monkeypatch.setattr("trading_bot.db.get_recent_trade_risk", lambda **_kw: rows)
+    _run(["risk", "status"])
+    out = capsys.readouterr().out
+    assert "RISK STATUS" in out
+    assert "GOOGL" in out
+    assert "20.00*" in out                      # capped marker
+    assert "0.60" in out                        # risk %
+    assert "would-exceed-position" in out
+
+
+def test_cli_risk_status_empty(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("trading_bot.db.get_recent_trade_risk", lambda **_kw: [])
+    _run(["risk", "status"])
+    assert "no risk-assessed signals yet" in capsys.readouterr().out
+
+
+def test_cli_risk_exposure(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from types import SimpleNamespace
+    trades = [
+        SimpleNamespace(track_mode="active", risk_pct=2.0,
+                        ind_concentration="concentrated", risk_position_pct=20.0),
+        SimpleNamespace(track_mode="active", risk_pct=3.0,
+                        ind_concentration="diversified", risk_position_pct=15.0),
+        SimpleNamespace(track_mode="shadow", risk_pct=99.0,        # excluded (shadow)
+                        ind_concentration="concentrated", risk_position_pct=99.0),
+        SimpleNamespace(track_mode="active", risk_pct=None,        # pre-Phase-7, skipped
+                        ind_concentration="unknown", risk_position_pct=None),
+    ]
+    monkeypatch.setattr("trading_bot.db.get_open_trades", lambda: trades)
+    _run(["risk", "exposure"])
+    out = capsys.readouterr().out
+    assert "RISK EXPOSURE" in out
+    assert "3  (2 risk-sized)" in out           # 3 active (shadow excluded), 2 sized
+    assert "5.00%" in out                       # total: 2 + 3 (None skipped)
+    assert "Concentrated cluster" in out
+    assert "2.00%" in out                       # only the concentrated active position
+    assert "20.00%" in out                      # largest position
+
+
 # ───────────────────── Phase 2.1 regime + by-regime subcommands ─────────────────────
 
 

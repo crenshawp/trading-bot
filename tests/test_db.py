@@ -251,3 +251,36 @@ def test_get_recent_trade_indicators_newest_first_and_limit(tmp_db: Path) -> Non
         ))
     rows = db.get_recent_trade_indicators(limit=2)
     assert [r["ticker"] for r in rows] == ["CCC", "BBB"]   # newest first, capped at 2
+
+
+# ---- risk recommendation context (Phase 7) ----
+
+
+def test_get_recent_trade_risk_only_returns_assessed_rows(tmp_db: Path) -> None:
+    # A risk-assessed (active stock) trade...
+    sid = db.insert_signal(_make_signal(ticker="GOOGL"))
+    db.insert_trade(Trade(
+        signal_id=sid, opened_at=datetime(2026, 6, 1, 10, 0), outcome="win",
+        risk_recommended_size=20.0, risk_pct=0.6, risk_position_pct=20.0,
+        risk_capped=True, risk_total_pct=4.5, risk_portfolio_verdict="ok",
+        risk_position_verdict="would-exceed-position",
+        risk_cluster_pct=3.0, risk_cluster_verdict="ok",
+    ))
+    # ...and a crypto/shadow trade with no risk recommendation (verdict NULL).
+    sid2 = db.insert_signal(
+        _make_signal(ticker="BTC-USD", asset_class="crypto", direction="long")
+    )
+    db.insert_trade(Trade(
+        signal_id=sid2, opened_at=datetime(2026, 6, 1, 11, 0), outcome="loss",
+    ))
+
+    rows = db.get_recent_trade_risk()
+    assert len(rows) == 1                       # NULL-verdict row excluded
+    r = rows[0]
+    assert r["ticker"] == "GOOGL"
+    assert r["risk_recommended_size"] == pytest.approx(20.0)
+    assert r["risk_pct"] == pytest.approx(0.6)
+    assert r["risk_capped"] is True
+    assert r["risk_portfolio_verdict"] == "ok"
+    assert r["risk_position_verdict"] == "would-exceed-position"
+    assert r["outcome"] == "win"
