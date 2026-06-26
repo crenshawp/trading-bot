@@ -10,6 +10,7 @@ forward testing — testing it now would be brittle and out of scope
 
 import sqlite3
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -18,6 +19,7 @@ import keyring
 import pytest
 
 from trading_bot import db, scanner
+from trading_bot.models import Signal, Trade
 
 _SERVICE = "trading_bot"
 
@@ -898,3 +900,192 @@ def test_scan_persists_real_indicator_values_end_to_end(
     assert row["ind_obv"] is not None
     # Only one active name -> correlation can't be computed -> unknown.
     assert row["ind_concentration"] == "unknown"
+
+
+# ─────────────── risk recommendation attach point (Phase 7) ───────────────
+
+
+def test_risk_skipped_for_benched_ticker(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db.add_to_active_watchlist("MSFT", "seed")
+    db.set_watchlist_status("MSFT", "benched")
+    _stub_stock_pipeline(monkeypatch, entries=[("MSFT", "benched")])
+    computed: list[str] = []
+    monkeypatch.setattr(
+        scanner, "_compute_signal_risk",
+        lambda s, ctx: computed.append(s["ticker"]),
+    )
+    monkeypatch.setattr(scanner, "send_notification", lambda s, **kw: None)
+
+    scanner.scan_stocks()
+
+    # Benched -> never reaches _emit_active_signal, so no risk work.
+    assert computed == []
+
+
+def test_risk_skipped_for_muted_pair(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db.add_to_active_watchlist("MSFT", "seed")
+    db.set_signal_pair_status("MSFT", "ema21_pullback", "muted")
+    _stub_two_setup_pipeline(monkeypatch, entries=[("MSFT", "active")])
+    monkeypatch.setattr(
+        "trading_bot.earnings.is_in_blackout", lambda *a, **k: (False, "ok"),
+    )
+    monkeypatch.setattr(scanner, "_score_signal_sentiment", lambda s: None)
+    monkeypatch.setattr(scanner, "_compute_signal_indicators", lambda s, df: None)
+    computed: list[str] = []
+    monkeypatch.setattr(
+        scanner, "_compute_signal_risk",
+        lambda s, ctx: computed.append(s["setup"]),
+    )
+    monkeypatch.setattr(scanner, "send_notification", lambda s, **kw: None)
+
+    scanner.scan_stocks()
+
+    # Only the enabled pair triggers risk work; the muted one is skipped.
+    assert computed == ["Trend Continuation"]
+
+
+def test_risk_computed_for_active_enabled_signal(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db.add_to_active_watchlist("MSFT", "seed")
+    _stub_stock_pipeline(monkeypatch, entries=[("MSFT", "active")])
+    _offline_alert_externals(monkeypatch)
+    monkeypatch.setattr(scanner, "_compute_signal_indicators", lambda s, df: None)
+    computed: list[str] = []
+    monkeypatch.setattr(
+        scanner, "_compute_signal_risk",
+        lambda s, ctx: computed.append(s["ticker"]),
+    )
+    monkeypatch.setattr(scanner, "send_notification", lambda s, **kw: None)
+
+    scanner.scan_stocks()
+
+    assert computed == ["MSFT"]
+
+
+def test_risk_assessment_persisted_on_trade_row(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trading_bot.risk import RiskAssessment
+
+    _offline_context(monkeypatch)
+    monkeypatch.setattr("trading_bot.scanner.requests.post", lambda url, **_k: None)
+    monkeypatch.setattr(scanner, "DRY_RUN", False)
+
+    assessment = RiskAssessment(
+        recommended_size=20.0, stop_distance=3.0, dollar_risk=60.0, risk_pct=0.6,
+        position_pct=20.0, capped=True, total_risk_pct=4.5,
+        portfolio_verdict="ok", position_verdict="would-exceed-position",
+        cluster_risk_pct=3.0, cluster_verdict="ok", ok=False, reason="ok",
+    )
+    scanner.send_notification(_stock_signal("GOOGL"), risk=assessment)
+
+    conn = db.get_connection()
+    try:
+        row = conn.execute(
+            "SELECT risk_recommended_size, risk_pct, risk_position_pct, risk_capped, "
+            "risk_total_pct, risk_portfolio_verdict, risk_position_verdict, "
+            "risk_cluster_pct, risk_cluster_verdict FROM trades"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["risk_recommended_size"] == pytest.approx(20.0)
+    assert row["risk_pct"] == pytest.approx(0.6)
+    assert row["risk_capped"] == 1
+    assert row["risk_total_pct"] == pytest.approx(4.5)
+    assert row["risk_portfolio_verdict"] == "ok"
+    assert row["risk_position_verdict"] == "would-exceed-position"
+    assert row["risk_cluster_verdict"] == "ok"
+
+
+def test_risk_alert_includes_sizing_and_advisory(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot.risk import RiskAssessment
+
+    _offline_context(monkeypatch)
+    monkeypatch.setattr(scanner, "DRY_RUN", True)
+
+    assessment = RiskAssessment(
+        recommended_size=20.0, risk_pct=0.6, capped=True, ok=False,
+        portfolio_verdict="would-exceed-portfolio", position_verdict="ok",
+        cluster_verdict="ok", reason="ok",
+    )
+    scanner.send_notification(_stock_signal("GOOGL"), risk=assessment)
+
+    out = capsys.readouterr().out
+    assert "Risk:" in out
+    assert "20.00 units" in out
+    assert "capped" in out
+    assert "would-exceed-portfolio" in out
+
+
+def _make_seed_signal() -> Signal:
+    """A minimal persisted Signal to hang a pre-existing open trade on."""
+    return Signal(
+        timestamp=datetime(2026, 5, 1, 9, 31), ticker="META", asset_class="stock",
+        signal_type="ema21_pullback", direction="call", entry_price=500.0,
+    )
+
+
+def test_scan_persists_real_risk_and_counts_open_book_end_to_end(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pandas as pd
+
+    # Pre-seed an OPEN active trade carrying 2.0% recorded risk (no total yet).
+    seed_sid = db.insert_signal(_make_seed_signal())
+    db.insert_trade(Trade(
+        signal_id=seed_sid, opened_at=datetime(2026, 5, 1), outcome="open",
+        track_mode="active", risk_pct=2.0, ind_concentration="concentrated",
+    ))
+
+    db.add_to_active_watchlist("GOOGL", "seed")
+    closes = [100.0 + i + (2.0 if i % 2 else 0.0) for i in range(40)]
+    frame = pd.DataFrame(
+        {
+            "Open": closes,
+            "High": [c + 2.0 for c in closes],
+            "Low": [c - 2.0 for c in closes],
+            "Close": closes,
+            "Volume": [1_000_000] * 40,
+        },
+        index=pd.date_range("2026-01-01", periods=40, freq="D"),
+    )
+    _offline_context(monkeypatch)
+    monkeypatch.setattr(scanner, "is_market_open", lambda: True)
+    monkeypatch.setattr(
+        scanner, "_active_stock_watchlist_entries", lambda: [("GOOGL", "active")],
+    )
+    monkeypatch.setattr(scanner, "get_stock_data", lambda t: frame)
+    monkeypatch.setattr(scanner, "add_stock_indicators", lambda d: d)
+    monkeypatch.setattr(
+        scanner, "detect_stock_signals", lambda t, _d: [_stock_signal("GOOGL")],
+    )
+    monkeypatch.setattr(
+        "trading_bot.earnings.is_in_blackout", lambda *a, **k: (False, "ok"),
+    )
+    monkeypatch.setattr(scanner, "_score_signal_sentiment", lambda s: None)
+    monkeypatch.setattr(scanner, "DRY_RUN", True)  # no network; log_signal still runs
+
+    scanner.scan_stocks()
+
+    # Only the candidate carries a portfolio total; it must include the pre-seeded
+    # 2.0% open risk plus its own recommended risk.
+    conn = db.get_connection()
+    try:
+        row = conn.execute(
+            "SELECT risk_recommended_size, risk_pct, risk_total_pct FROM trades "
+            "WHERE risk_total_pct IS NOT NULL"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["risk_recommended_size"] is not None       # sized off the real ATR
+    assert row["risk_pct"] is not None
+    assert row["risk_total_pct"] == pytest.approx(2.0 + row["risk_pct"])
