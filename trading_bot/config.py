@@ -86,3 +86,21 @@ CORR_RETURN_WINDOW: int = 20        # trailing daily returns used per ticker
 CORR_MIN_NAMES: int = 2             # need at least this many peers to correlate
 CORR_CONCENTRATED_AT: float = 0.6   # avg pairwise corr >= this -> 'concentrated'
 CORR_DIVERSIFIED_AT: float = 0.3    # avg pairwise corr <  this -> 'diversified'
+
+# ──────────────────────────────────────────────────────────────────────────
+# Risk management (Phase 7) — ADVISORY, NOTIONAL ONLY
+# ──────────────────────────────────────────────────────────────────────────
+# The operator is NOT trading; there is no real capital. Position sizes and
+# portfolio-risk verdicts are computed against this NOTIONAL account and
+# RECORDED next to the eventual trade outcome so later phases can judge whether
+# the rules were sound. Nothing here sizes, blocks, or shrinks a real position —
+# every number is a recommendation, never an instruction.
+NOTIONAL_ACCOUNT: float = 10_000.0        # notional account size, in dollars
+RISK_PER_TRADE_PCT: float = 1.0           # % of notional risked on one trade
+MAX_PORTFOLIO_RISK_PCT: float = 6.0       # advisory cap on summed open risk %
+MAX_POSITION_PCT: float = 20.0            # advisory per-position notional cap %
+MAX_CORRELATED_CLUSTER_PCT: float = 25.0  # advisory cap on a correlated cluster %
+# Stop distance for volatility-normalized sizing = ATR * this multiple. 1.5
+# matches the scanner's actual stop (sl = price - atr*1.5), so the advisory
+# size lines up with the stop the trade is really tracked against.
+RISK_ATR_STOP_MULTIPLE: float = 1.5
