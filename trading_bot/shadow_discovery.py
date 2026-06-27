@@ -24,7 +24,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from trading_bot import config, db
+from trading_bot import config, db, readiness
 from trading_bot.discovery_universe import SHADOW_UNIVERSE
 
 # How far back resolved shadow outcomes count toward a promotion decision.
@@ -118,12 +118,26 @@ def evaluate_shadow_universe(
     """Evaluate every shadow-universe ticker not on the active watchlist.
 
     For each candidate, compute its recent resolved-shadow standing and, unless
-    ``dry_run``, promote the eligible ones (``source='shadow'``) and persist the
-    full run to ``shadow_evaluations``. Per-ticker errors are logged and that
-    ticker is skipped with NO promotion — never a silent failure. Returns the
-    evaluations (ordered as the shadow universe, candidates only).
+    ``dry_run`` (or the capability is not yet ready), promote the eligible ones
+    (``source='shadow'``) and persist the full run to ``shadow_evaluations``.
+    Per-ticker errors are logged and that ticker is skipped with NO promotion —
+    never a silent failure. Returns the evaluations (ordered as the shadow
+    universe, candidates only).
+
+    Phase 10: promotion is ACTIVE iff ``readiness.is_ready('shadow_promotion')``
+    — below the centralized threshold it is dormant (candidates still evaluated,
+    nothing promoted). Behavior preserved: the per-ticker sample gate already
+    blocks promotion below threshold.
     """
     run_ts = now if now is not None else datetime.now(UTC)
+    ready = readiness.is_ready("shadow_promotion")
+    effective_dry_run = dry_run or not ready
+    if not dry_run and not ready:
+        print(
+            "  shadow_promotion dormant: below readiness threshold "
+            "(nothing promoted)",
+            file=sys.stderr,
+        )
 
     try:
         # The FULL watchlist — active AND benched. get_active_watchlist is
@@ -154,7 +168,7 @@ def evaluate_shadow_universe(
             continue
 
         promoted = False
-        if ev.eligible and not dry_run:
+        if ev.eligible and not effective_dry_run:
             try:
                 # Second layer of the guard: add_to_active_watchlist is a no-op
                 # (returns False) if the ticker is somehow already present.
@@ -167,7 +181,7 @@ def evaluate_shadow_universe(
                 promoted = False
         evaluations.append(dataclasses.replace(ev, promoted=promoted))
 
-    if not dry_run:
+    if not effective_dry_run:
         try:
             db.insert_shadow_evaluations(
                 run_ts.isoformat(), [_eval_to_row(e) for e in evaluations]

@@ -185,3 +185,35 @@ def test_dry_run_changes_nothing(
     statuses = {e["ticker"]: e["status"] for e in db.get_watchlist_entries()}
     assert statuses["BAD"] == "active"                    # but not applied
     assert db.get_watchlist_transitions() == []
+
+
+# ───────────────────────── readiness gate (Phase 10) ─────────────────────────
+
+
+def test_dormant_when_capability_not_ready(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(config, "SM_MIN_ACTIVE", 0)
+    _add("BAD", "active")
+    _seed("BAD", wins=2, losses=8)  # 10 trades -> per-ticker gate passes, would demote
+    monkeypatch.setattr("trading_bot.readiness.is_ready", lambda _name: False)
+
+    run = watchlist_state.evaluate_watchlist(now=NOW)
+    assert _by_ticker(run)["BAD"].decision == "demote"    # decision still visible
+    statuses = {e["ticker"]: e["status"] for e in db.get_watchlist_entries()}
+    assert statuses["BAD"] == "active"                     # but NOT applied (dormant)
+    assert db.get_watchlist_transitions() == []
+    assert "dormant" in capsys.readouterr().err
+
+
+def test_acts_when_capability_ready(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config, "SM_MIN_ACTIVE", 0)
+    _add("BAD", "active")
+    _seed("BAD", wins=2, losses=8)
+    monkeypatch.setattr("trading_bot.readiness.is_ready", lambda _name: True)
+
+    watchlist_state.evaluate_watchlist(now=NOW)
+    statuses = {e["ticker"]: e["status"] for e in db.get_watchlist_entries()}
+    assert statuses["BAD"] == "benched"                    # applied when ready

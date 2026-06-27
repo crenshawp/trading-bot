@@ -22,7 +22,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from trading_bot import config, db
+from trading_bot import config, db, readiness
 
 
 @dataclass(frozen=True)
@@ -161,13 +161,26 @@ def evaluate_signal_pairs(
     """Evaluate every traded pair and (unless dry_run) apply enable/mute flips.
 
     Computes each pair's windowed expectancy across all track_modes, proposes
-    mute/enable/hold with hysteresis, then — when not a dry run — upserts the
-    new status and records each transition to ``signal_pair_transitions``.
-    Pairs are evaluated regardless of their ticker's active/benched status.
-    Per-pair errors yield a hold (no transition) and are logged; nothing is
-    ever removed; there is no min-floor.
+    mute/enable/hold with hysteresis, then — when not a dry run AND the
+    capability is ready — upserts the new status and records each transition to
+    ``signal_pair_transitions``. Pairs are evaluated regardless of their
+    ticker's active/benched status. Per-pair errors yield a hold (no transition)
+    and are logged; nothing is ever removed; there is no min-floor.
+
+    Phase 10: the capability is ACTIVE iff ``readiness.is_ready`` — below the
+    centralized threshold it is dormant (evaluations still computed, no
+    transition applied). Behavior preserved: the per-pair sample gate already
+    holds everything below threshold.
     """
     run_ts = now if now is not None else datetime.now(UTC)
+    ready = readiness.is_ready("pair_gating")
+    effective_dry_run = dry_run or not ready
+    if not dry_run and not ready:
+        print(
+            "  pair_gating dormant: below readiness threshold "
+            "(no transitions applied)",
+            file=sys.stderr,
+        )
 
     try:
         pairs = db.get_traded_signal_pairs()
@@ -208,7 +221,7 @@ def evaluate_signal_pairs(
         )
         evaluations.append(ev)
 
-        if ev.decision in ("mute", "enable") and not dry_run:
+        if ev.decision in ("mute", "enable") and not effective_dry_run:
             try:
                 db.set_signal_pair_status(
                     ev.ticker, ev.signal_type, ev.new_status, changed_at=run_ts

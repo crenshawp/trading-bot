@@ -183,3 +183,28 @@ def test_window_excludes_old_outcomes(tmp_db: Path) -> None:
         "GOOGL", "ema21_pullback", now=NOW
     )
     assert closed == 0
+
+
+# ───────────────────────── readiness gate (Phase 10) ─────────────────────────
+
+
+def test_pair_dormant_when_capability_not_ready(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _seed("GOOGL", "ema21_pullback", wins=2, losses=8)  # 10 -> per-pair gate passes
+    monkeypatch.setattr("trading_bot.readiness.is_ready", lambda _name: False)
+
+    run = signal_pairs.evaluate_signal_pairs(now=NOW)
+    assert _by_pair(run)[("GOOGL", "ema21_pullback")].decision == "mute"  # visible
+    assert db.get_signal_pair_status("GOOGL", "ema21_pullback") == "enabled"  # not applied
+    assert "dormant" in capsys.readouterr().err
+
+
+def test_pair_acts_when_capability_ready(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed("GOOGL", "ema21_pullback", wins=2, losses=8)
+    monkeypatch.setattr("trading_bot.readiness.is_ready", lambda _name: True)
+
+    signal_pairs.evaluate_signal_pairs(now=NOW)
+    assert db.get_signal_pair_status("GOOGL", "ema21_pullback") == "muted"  # applied

@@ -244,3 +244,33 @@ def test_reporting_excludes_shadow_by_default(tmp_db: Path) -> None:
     )
     assert active_decided == 1
     assert shadow_decided == 1
+
+
+# ───────────────────────── readiness gate (Phase 10) ─────────────────────────
+
+
+def test_shadow_dormant_when_capability_not_ready(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(shadow_discovery, "SHADOW_UNIVERSE", ["AAA"])
+    _seed("AAA", wins=8, losses=2, win_pnl=2.0, loss_pnl=1.0)   # eligible (10 shadow)
+    monkeypatch.setattr("trading_bot.readiness.is_ready", lambda _name: False)
+
+    evals = shadow_discovery.evaluate_shadow_universe(now=NOW)
+    by_ticker = {e.ticker: e for e in evals}
+    assert by_ticker["AAA"].eligible is True        # standing still computed
+    assert by_ticker["AAA"].promoted is False       # but NOT promoted (dormant)
+    assert "AAA" not in db.get_active_watchlist()
+    assert db.get_shadow_evaluations() == []        # dormant -> no persist (like dry-run)
+    assert "dormant" in capsys.readouterr().err
+
+
+def test_shadow_acts_when_capability_ready(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(shadow_discovery, "SHADOW_UNIVERSE", ["AAA"])
+    _seed("AAA", wins=8, losses=2, win_pnl=2.0, loss_pnl=1.0)
+    monkeypatch.setattr("trading_bot.readiness.is_ready", lambda _name: True)
+
+    shadow_discovery.evaluate_shadow_universe(now=NOW)
+    assert "AAA" in db.get_active_watchlist()        # promoted when ready

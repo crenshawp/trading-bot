@@ -25,7 +25,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from trading_bot import config, db
+from trading_bot import config, db, readiness
 
 
 @dataclass(frozen=True)
@@ -179,11 +179,24 @@ def evaluate_watchlist(
 
     Computes each ticker's windowed expectancy, proposes demote/recover/hold
     with hysteresis, applies the MIN_ACTIVE floor to demotions, then — when not
-    a dry run — flips statuses and records each transition to
-    ``watchlist_transitions``. Per-ticker errors yield a hold (no transition)
-    and are logged; nothing is ever removed.
+    a dry run AND the capability is ready — flips statuses and records each
+    transition to ``watchlist_transitions``. Per-ticker errors yield a hold (no
+    transition) and are logged; nothing is ever removed.
+
+    Phase 10: the capability is ACTIVE iff ``readiness.is_ready`` — below the
+    centralized threshold it is dormant (evaluations still computed for
+    visibility, but no transition applied). Behavior is preserved: below the
+    threshold the per-ticker sample gate already holds everything.
     """
     run_ts = now if now is not None else datetime.now(UTC)
+    ready = readiness.is_ready("watchlist_rotation")
+    effective_dry_run = dry_run or not ready
+    if not dry_run and not ready:
+        print(
+            "  watchlist_rotation dormant: below readiness threshold "
+            "(no transitions applied)",
+            file=sys.stderr,
+        )
 
     try:
         entries = db.get_watchlist_entries()
@@ -222,7 +235,7 @@ def evaluate_watchlist(
             reason=p.reason,
         )
         evaluations.append(ev)
-        if ev.decision in ("demote", "recover") and not dry_run:
+        if ev.decision in ("demote", "recover") and not effective_dry_run:
             try:
                 db.set_watchlist_status(ev.ticker, ev.new_status, changed_at=run_ts)
                 db.insert_watchlist_transition(
