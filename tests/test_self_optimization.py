@@ -315,6 +315,26 @@ def test_feature_with_no_data_notes_insufficient() -> None:
     assert "need >= 2 buckets" in sent.note
 
 
+def test_multiple_comparisons_small_sample_makes_all_features_not_actionable() -> None:
+    # A tiny sample touching every feature with clearly-different buckets. Even
+    # though the buckets differ, NO feature clears the floor -> all flagged not
+    # actionable. This is the guard against manufacturing a false positive by
+    # testing many features against a still-small outcome set.
+    rows = [
+        _frow(sentiment_label="bullish", ind_vol_regime="low", ind_rsi=30.0,
+              ind_adx=10.0, ind_obv=5.0, ind_concentration="concentrated",
+              risk_portfolio_verdict="ok", outcome="win", pnl_pct=2.0),
+        _frow(sentiment_label="bearish", ind_vol_regime="high", ind_rsi=70.0,
+              ind_adx=50.0, ind_obv=-5.0, ind_concentration="diversified",
+              risk_portfolio_verdict="would-exceed-portfolio",
+              outcome="loss", pnl_pct=-1.0),
+    ]
+    evals = so.compute_feature_evaluations(rows)        # default floor n>=30
+    assert len(evals) == 7
+    assert all(not e.actionable for e in evals)
+    assert all(not b.actionable for e in evals for b in e.buckets)
+
+
 def test_evaluate_features_reads_from_db(tmp_db: Path) -> None:
     _seed_resolved(tmp_db, ticker="GOOGL", outcome="win", pnl=2.0,
                    sentiment_label="bullish")
