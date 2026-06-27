@@ -803,6 +803,61 @@ def test_cli_optimize_run_rejects_inverted_window(
     assert "must exceed" in capsys.readouterr().err
 
 
+# ───────────────────── Phase 10 readiness subcommand ─────────────────────
+
+
+def _seed_resolved_active(n: int) -> None:
+    from datetime import datetime, timedelta
+
+    from trading_bot import db
+    from trading_bot.models import Signal, Trade
+    for i in range(n):
+        ts = datetime(2026, 1, 1, 9, 0) + timedelta(minutes=i)
+        sid = db.insert_signal(Signal(
+            timestamp=ts, ticker=f"C{i}", asset_class="stock",
+            signal_type="ema21_pullback", direction="call", entry_price=100.0,
+        ))
+        db.insert_trade(Trade(
+            signal_id=sid, opened_at=ts, closed_at=ts + timedelta(days=1),
+            outcome="win", pnl_pct=2.0, track_mode="active",
+        ))
+
+
+def test_cli_readiness_status_lists_every_capability(
+    tmp_db: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _run(["readiness", "status"])
+    out = capsys.readouterr().out
+    assert "READINESS STATUS" in out
+    for name in ("watchlist_rotation", "pair_gating", "shadow_promotion",
+                 "self_optimization", "ml_pattern_recognition",
+                 "ml_predictive_sizing"):
+        assert name in out
+    assert "warming" in out          # nothing seeded -> all warming
+    assert "ml" in out               # ML kind shown
+
+
+def test_cli_readiness_check_evaluates_persists_and_prints(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _seed_resolved_active(10)         # crosses watchlist_rotation + pair_gating (10)
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "trading_bot.readiness._pushover_notify",
+        lambda t, m: bool(sent.append((t, m))) or True,
+    )
+    _run(["readiness", "check"])
+    out = capsys.readouterr().out
+    assert "Announced (first crossing): watchlist_rotation" in out
+    assert "READINESS STATUS" in out
+    assert "ready" in out
+    # the one-time notification fired through the (mocked) Pushover path
+    assert any("watchlist_rotation" in m for _, m in sent)
+
+
 # ───────────────────── Phase 2.1 regime + by-regime subcommands ─────────────────────
 
 

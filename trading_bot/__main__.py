@@ -15,6 +15,7 @@ from trading_bot import (
     outcomes,
     performance,
     predictions,
+    readiness,
     regime,
     secrets,
     self_optimization,
@@ -1281,6 +1282,48 @@ def cmd_optimize_report() -> None:
     print(self_optimization.render_report(payload))
 
 
+# ---- readiness CLI (Phase 10) ----
+
+
+def cmd_readiness_status() -> None:
+    """Every capability: kind, n vs threshold, status, announced, and — for the
+    deterministic ones — whether it is currently ACTIVE (ready == active). ML
+    capabilities show '-' for active: crossing summons a build, never auto-acts.
+    """
+    print("READINESS STATUS")
+    print("-" * 96)
+    print(
+        f"  {'Capability':<24} {'Kind':<13} {'n / threshold':>14} "
+        f"{'Status':<9} {'Announced':<10} {'Active':<7}"
+    )
+    for cap in readiness.REGISTRY:
+        count = readiness.resolved_count(cap.name)
+        ready = readiness.is_ready(cap.name)
+        state = db.get_readiness_state(cap.name)
+        announced = bool(state["announced"]) if state else False
+        status = "ready" if ready else "warming"
+        active = ("yes" if ready else "no") if cap.kind == "deterministic" else "-"
+        print(
+            f"  {cap.name:<24} {cap.kind:<13} "
+            f"{f'{count} / {cap.threshold}':>14} {status:<9} "
+            f"{('yes' if announced else 'no'):<10} {active:<7}"
+        )
+    print("\n  Deterministic: ready == active (auto-activates). "
+          "ML: ready == ready-to-build (summons a human, never self-trains).")
+
+
+def cmd_readiness_check() -> None:
+    """Run one readiness evaluation pass on demand (same path as the scan loop),
+    then print the status table. Fires any first-crossing notifications."""
+    results = readiness.evaluate_readiness()
+    newly = [r.capability for r in results if r.newly_announced]
+    if newly:
+        print(f"Announced (first crossing): {', '.join(newly)}\n")
+    else:
+        print("No new crossings this pass.\n")
+    cmd_readiness_status()
+
+
 # ---- predictions CLI (Phase 2.2b) ----
 
 # Seeded defaults — duplicated from scanner._PRED_DEFAULTS so the CLI can
@@ -1732,6 +1775,14 @@ def main() -> None:
     )
     optimize_sub.add_parser("report")
 
+    # readiness (Phase 10)
+    readiness_parser = sub.add_parser("readiness")
+    readiness_sub = readiness_parser.add_subparsers(
+        dest="readiness_cmd", required=True
+    )
+    readiness_sub.add_parser("status")
+    readiness_sub.add_parser("check")
+
     # predictions (Phase 2.2b)
     pred_parser = sub.add_parser("predictions")
     pred_sub = pred_parser.add_subparsers(dest="predictions_cmd", required=True)
@@ -1890,6 +1941,11 @@ def main() -> None:
             )
         elif args.optimize_cmd == "report":
             cmd_optimize_report()
+    elif args.command == "readiness":
+        if args.readiness_cmd == "status":
+            cmd_readiness_status()
+        elif args.readiness_cmd == "check":
+            cmd_readiness_check()
     elif args.command == "predictions":
         if args.predictions_cmd == "enable":
             cmd_predictions_enable()
