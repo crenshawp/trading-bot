@@ -22,13 +22,13 @@ def _run(argv: list[str]) -> None:
 def test_cli_db_init_prints_version(tmp_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _run(["db", "init"])
     out = capsys.readouterr().out
-    assert "Schema version: 14" in out
+    assert "Schema version: 15" in out
 
 
 def test_cli_db_status_shows_counts(tmp_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _run(["db", "status"])
     out = capsys.readouterr().out
-    assert "Schema version: 14" in out
+    assert "Schema version: 15" in out
     assert "signals" in out
     assert "trades" in out
     assert "daily_performance" in out
@@ -739,6 +739,46 @@ def test_cli_risk_exposure(
     assert "Concentrated cluster" in out
     assert "2.00%" in out                       # only the concentrated active position
     assert "20.00%" in out                      # largest position
+
+
+# ───────────────────── Phase 9 optimize subcommand ─────────────────────
+
+
+def test_cli_optimize_report_empty(
+    tmp_db: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _run(["optimize", "report"])
+    assert "No self-optimization runs yet" in capsys.readouterr().out
+
+
+def test_cli_optimize_report_populated(
+    tmp_db: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    from trading_bot import db
+    payload = {
+        "run_timestamp": "2026-07-01T00:00:00",
+        "degrade_window_days": 30, "baseline_window_days": 90,
+        "degradations": [{
+            "scope": "overall", "verdict": "stable", "delta": 0.0,
+            "baseline_expectancy": 1.0, "baseline_n": 30,
+            "recent_expectancy": 1.0, "recent_n": 30, "note": "within delta",
+        }],
+        "features": [{
+            "feature": "sentiment", "actionable": False, "note": "n<floor",
+            "buckets": [{"label": "bullish", "n": 5, "win_rate": 60.0,
+                         "expectancy": 1.2, "actionable": False}],
+        }],
+    }
+    db.insert_optimization_run("2026-07-01T00:00:00", 30, 90, json.dumps(payload))
+    _run(["optimize", "report"])
+    out = capsys.readouterr().out
+    assert "SELF-OPTIMIZATION REPORT" in out
+    assert "overall" in out and "stable" in out
+    assert "sentiment" in out and "bullish" in out
 
 
 # ───────────────────── Phase 2.1 regime + by-regime subcommands ─────────────────────

@@ -25,8 +25,9 @@ to the live gating subsystems — no divergent math.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
 
@@ -386,3 +387,81 @@ def compute_feature_evaluations(
 def evaluate_features() -> list[FeatureEvaluation]:
     """Evaluate every feature over ALL resolved active trades (max sample)."""
     return compute_feature_evaluations(resolved_context_rows())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAYLOAD + REPORT — serialize findings, persist a run, render it
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def build_payload(
+    degradations: Sequence[DegradationFinding],
+    features: Sequence[FeatureEvaluation],
+    *,
+    run_timestamp: str,
+    degrade_window_days: int,
+    baseline_window_days: int,
+) -> dict[str, Any]:
+    """A JSON-serializable payload of one run's findings (for persist + report)."""
+    return {
+        "run_timestamp": run_timestamp,
+        "degrade_window_days": degrade_window_days,
+        "baseline_window_days": baseline_window_days,
+        "degradations": [asdict(f) for f in degradations],
+        "features": [asdict(f) for f in features],
+    }
+
+
+def persist_run(payload: Mapping[str, Any]) -> int:
+    """Write a run payload to the optimization_runs history table. Returns the id."""
+    return db.insert_optimization_run(
+        str(payload["run_timestamp"]),
+        int(payload["degrade_window_days"]),
+        int(payload["baseline_window_days"]),
+        json.dumps(payload),
+    )
+
+
+def _fmt(value: object, spec: str) -> str:
+    return format(value, spec) if isinstance(value, (int, float)) else "-"
+
+
+def render_report(payload: Mapping[str, Any]) -> str:
+    """Render a run payload (degradation then feature evaluations) to text.
+
+    Reads the plain dict so a persisted run replays verbatim. Every line carries
+    its sample size and actionability label; the header restates that this is
+    flags-only.
+    """
+    lines = [
+        f"SELF-OPTIMIZATION REPORT  {payload['run_timestamp']}",
+        f"  windows: recent {payload['degrade_window_days']}d vs "
+        f"baseline {payload['baseline_window_days']}d  "
+        f"(actionable floor n>={config.SO_MIN_SAMPLE})",
+        "  FLAGS ONLY - nothing here changes the bot's behavior.",
+        "",
+        "DEGRADATION",
+    ]
+    degradations = payload.get("degradations", [])
+    if not degradations:
+        lines.append("  (no resolved trades in the window)")
+    for d in degradations:
+        lines.append(
+            f"  {d['scope']:<26} {d['verdict']:<22} "
+            f"delta={_fmt(d['delta'], '+.2f'):<6}  {d['note']}"
+        )
+
+    lines += ["", "FEATURE EVALUATION"]
+    for feat in payload.get("features", []):
+        flag = "actionable" if feat["actionable"] else "not actionable"
+        lines.append(f"  {feat['feature']}  [{flag}]  {feat['note']}")
+        if not feat["buckets"]:
+            lines.append("    (no resolved trades carry this feature)")
+        for b in feat["buckets"]:
+            tag = "" if b["actionable"] else "  (n<floor)"
+            lines.append(
+                f"    {b['label']:<18} "
+                f"win_rate={_fmt(b['win_rate'], '.0f') + '%':<5} "
+                f"expectancy={_fmt(b['expectancy'], '+.2f'):<7} n={b['n']}{tag}"
+            )
+    return "\n".join(lines)

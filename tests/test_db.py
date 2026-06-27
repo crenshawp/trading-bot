@@ -30,11 +30,11 @@ def _make_signal(**overrides: Any) -> Signal:
 def test_init_db_is_idempotent(tmp_db: Path) -> None:
     db.init_db()  # tmp_db already called init_db once; second call must not error
     db.init_db()
-    assert db.schema_version() == 14
+    assert db.schema_version() == 15
 
 
 def test_schema_version_is_1_after_init(tmp_db: Path) -> None:
-    assert db.schema_version() == 14
+    assert db.schema_version() == 15
 
 
 # ---- signals ----
@@ -198,6 +198,7 @@ def test_get_table_counts_zero_on_fresh_db(tmp_db: Path) -> None:
         "discovery_results": 0, "shadow_evaluations": 0,
         "watchlist_transitions": 0,
         "signal_pair_status": 0, "signal_pair_transitions": 0,
+        "optimization_runs": 0,
     }
 
 
@@ -284,3 +285,23 @@ def test_get_recent_trade_risk_only_returns_assessed_rows(tmp_db: Path) -> None:
     assert r["risk_portfolio_verdict"] == "ok"
     assert r["risk_position_verdict"] == "would-exceed-position"
     assert r["outcome"] == "win"
+
+
+# ---- self-optimization runs (Phase 9) ----
+
+
+def test_optimization_runs_round_trip_newest_first(tmp_db: Path) -> None:
+    db.insert_optimization_run("2026-01-01T00:00:00", 30, 90, '{"a": 1}')
+    db.insert_optimization_run("2026-02-01T00:00:00", 30, 90, '{"b": 2}')
+    runs = db.get_optimization_runs()
+    assert [r["run_timestamp"] for r in runs] == [
+        "2026-02-01T00:00:00", "2026-01-01T00:00:00",
+    ]
+    latest = db.get_latest_optimization_run()
+    assert latest is not None
+    assert latest["run_timestamp"] == "2026-02-01T00:00:00"
+    assert latest["findings_json"] == '{"b": 2}'
+
+
+def test_get_latest_optimization_run_none_when_empty(tmp_db: Path) -> None:
+    assert db.get_latest_optimization_run() is None

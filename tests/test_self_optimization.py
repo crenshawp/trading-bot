@@ -7,6 +7,7 @@ math is identical to the live gating subsystems.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -321,3 +322,44 @@ def test_evaluate_features_reads_from_db(tmp_db: Path) -> None:
                    sentiment_label="bearish")
     sent = _feature(so.evaluate_features(), "sentiment")
     assert {b.label for b in sent.buckets} == {"bullish", "bearish"}
+
+
+# ───────────────────────── payload / persist / render ───────────────────────────
+
+
+def test_build_persist_and_render_round_trip(tmp_db: Path) -> None:
+    degradations = so.compute_degradation(
+        _rows(30, 2.0), _rows(30, 1.0), min_sample=30, meaningful_delta=0.15,
+    )
+    features = so.compute_feature_evaluations(
+        [_frow(sentiment_label="bullish", outcome="win", pnl_pct=2.0)], min_sample=1,
+    )
+    payload = so.build_payload(
+        degradations, features, run_timestamp="2026-07-01T00:00:00",
+        degrade_window_days=30, baseline_window_days=90,
+    )
+    run_id = so.persist_run(payload)
+    assert run_id >= 1
+
+    latest = db.get_latest_optimization_run()
+    assert latest is not None
+    assert latest["degrade_window_days"] == 30
+    stored = json.loads(latest["findings_json"])
+    assert stored["run_timestamp"] == "2026-07-01T00:00:00"
+
+    text = so.render_report(stored)            # renders from the persisted dict
+    assert "SELF-OPTIMIZATION REPORT" in text
+    assert "FLAGS ONLY" in text
+    assert "DEGRADATION" in text
+    assert "degraded" in text                  # the overall finding
+    assert "FEATURE EVALUATION" in text
+    assert "sentiment" in text
+
+
+def test_render_report_handles_empty_findings() -> None:
+    payload = so.build_payload(
+        [], [], run_timestamp="2026-07-01T00:00:00",
+        degrade_window_days=30, baseline_window_days=90,
+    )
+    text = so.render_report(payload)
+    assert "no resolved trades in the window" in text

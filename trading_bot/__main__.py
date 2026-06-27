@@ -2,6 +2,7 @@
 
 import argparse
 import getpass
+import json
 import sys
 from datetime import date
 
@@ -16,6 +17,7 @@ from trading_bot import (
     predictions,
     regime,
     secrets,
+    self_optimization,
     settings,
     shadow_discovery,
     signal_pairs,
@@ -1236,6 +1238,23 @@ def cmd_risk_exposure() -> None:
     print("\n  Advisory only - nothing is enforced; no capital is at risk.")
 
 
+# ---- self-optimization CLI (Phase 9) ----
+
+
+def cmd_optimize_report() -> None:
+    """Print the most recent persisted self-optimization run.
+
+    Read-only history view — it replays the last ``optimize run`` verbatim from
+    the optimization_runs table. Flags only; nothing here changes behavior.
+    """
+    run = db.get_latest_optimization_run()
+    if run is None:
+        print("No self-optimization runs yet. Run `optimize run` first.")
+        return
+    payload = json.loads(run["findings_json"])
+    print(self_optimization.render_report(payload))
+
+
 # ---- predictions CLI (Phase 2.2b) ----
 
 # Seeded defaults — duplicated from scanner._PRED_DEFAULTS so the CLI can
@@ -1671,6 +1690,13 @@ def main() -> None:
     )
     risk_sub.add_parser("exposure")
 
+    # optimize (Phase 9)
+    optimize_parser = sub.add_parser("optimize")
+    optimize_sub = optimize_parser.add_subparsers(
+        dest="optimize_cmd", required=True
+    )
+    optimize_sub.add_parser("report")
+
     # predictions (Phase 2.2b)
     pred_parser = sub.add_parser("predictions")
     pred_sub = pred_parser.add_subparsers(dest="predictions_cmd", required=True)
@@ -1821,6 +1847,9 @@ def main() -> None:
             cmd_risk_status(limit=args.limit)
         elif args.risk_cmd == "exposure":
             cmd_risk_exposure()
+    elif args.command == "optimize":
+        if args.optimize_cmd == "report":
+            cmd_optimize_report()
     elif args.command == "predictions":
         if args.predictions_cmd == "enable":
             cmd_predictions_enable()

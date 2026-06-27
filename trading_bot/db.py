@@ -41,11 +41,12 @@ from trading_bot.models import (
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
+# Version 15 (Phase 9) — adds the optimization_runs history table.
 # Version 14 (Phase 7) — adds trades.risk_* advisory risk-recommendation columns.
 # Version 13 (Phase 6) — adds trades.ind_* advisory indicator-family columns.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -256,6 +257,20 @@ CREATE TABLE IF NOT EXISTS signal_pair_transitions (
 
 CREATE INDEX IF NOT EXISTS idx_signal_pair_transitions_pair
     ON signal_pair_transitions (ticker, signal_type);
+
+-- Phase 9: history of self-optimization runs. Each row is one operator-triggered
+-- run; findings_json holds the full degradation + feature-evaluation payload so
+-- the report can replay a past run verbatim. FLAGS ONLY — nothing acts on these.
+CREATE TABLE IF NOT EXISTS optimization_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_timestamp TEXT NOT NULL,
+    degrade_window_days INTEGER NOT NULL,
+    baseline_window_days INTEGER NOT NULL,
+    findings_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_optimization_runs_ts
+    ON optimization_runs (run_timestamp);
 """
 
 # Whitelist for update_trade — never interpolate user input into SQL column names.
@@ -275,7 +290,7 @@ _TABLE_NAMES: tuple[str, ...] = (
     "regime_snapshots", "vix_snapshots",
     "predictions", "settings", "active_watchlist", "discovery_results",
     "shadow_evaluations", "watchlist_transitions",
-    "signal_pair_status", "signal_pair_transitions",
+    "signal_pair_status", "signal_pair_transitions", "optimization_runs",
 )
 
 # Whitelist for update_prediction — resolution flow + Phase 2.3 context backfill.
@@ -509,6 +524,15 @@ def _migrate_to_v14(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE trades ADD COLUMN {column} {coltype}")
 
 
+def _migrate_to_v15(_conn: sqlite3.Connection) -> None:
+    """Phase 9 migration step.
+
+    Nothing to ALTER — the new ``optimization_runs`` table is created by the
+    ``CREATE TABLE IF NOT EXISTS`` block above. Documented hook only.
+    """
+    return None
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -527,6 +551,7 @@ def init_db() -> None:
         _migrate_to_v12(conn)
         _migrate_to_v13(conn)
         _migrate_to_v14(conn)
+        _migrate_to_v15(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -2183,6 +2208,60 @@ def get_resolved_context_outcomes(
         }
         for r in rows
     ]
+
+
+def insert_optimization_run(
+    run_timestamp: str,
+    degrade_window_days: int,
+    baseline_window_days: int,
+    findings_json: str,
+) -> int:
+    """Persist one self-optimization run's findings (Phase 9). Returns the id."""
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "INSERT INTO optimization_runs "
+            "(run_timestamp, degrade_window_days, baseline_window_days, findings_json) "
+            "VALUES (?, ?, ?, ?)",
+            (run_timestamp, degrade_window_days, baseline_window_days, findings_json),
+        )
+        conn.commit()
+        new_id = cur.lastrowid
+        if new_id is None:
+            raise RuntimeError("INSERT did not return a row id")
+        return new_id
+    finally:
+        conn.close()
+
+
+def get_optimization_runs(limit: int = 10) -> list[dict[str, Any]]:
+    """Recent self-optimization runs, newest first."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, run_timestamp, degrade_window_days, baseline_window_days, "
+            "       findings_json "
+            "FROM optimization_runs ORDER BY run_timestamp DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "id": int(r["id"]),
+            "run_timestamp": str(r["run_timestamp"]),
+            "degrade_window_days": int(r["degrade_window_days"]),
+            "baseline_window_days": int(r["baseline_window_days"]),
+            "findings_json": str(r["findings_json"]),
+        }
+        for r in rows
+    ]
+
+
+def get_latest_optimization_run() -> dict[str, Any] | None:
+    """The most recent self-optimization run, or None if none have run."""
+    runs = get_optimization_runs(limit=1)
+    return runs[0] if runs else None
 
 
 def insert_shadow_evaluations(
