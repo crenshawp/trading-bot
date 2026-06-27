@@ -121,3 +121,18 @@ SO_BASELINE_WINDOW_DAYS: int = 90  # the older BASELINE window end (must exceed 
 # recent window below baseline required to flag degradation. Paired with the
 # sample floor so a normal cold streak (small n) never trips an alarm.
 SO_MEANINGFUL_DELTA: float = 0.15
+
+# ──────────────────────────────────────────────────────────────────────────
+# Unified readiness gate (Phase 10)
+# ──────────────────────────────────────────────────────────────────────────
+# The ONE authority over every capability's data-sufficiency. Deterministic
+# thresholds are the EXISTING Phase 3/4/9 minimums, centralized here UNCHANGED:
+# SM_MIN_CLOSED_SIGNALS, SP_MIN_CLOSED_SIGNALS, MIN_SHADOW_SIGNALS, SO_MIN_SAMPLE.
+# MIN_SHADOW_SIGNALS lives here (moved from shadow_discovery, value unchanged) so
+# the readiness registry can read it without an import cycle; shadow_discovery
+# re-exports it for back-compat.
+MIN_SHADOW_SIGNALS: int = 10
+# ML build-readiness gates — deliberately LARGE counts befitting model training.
+# Crossing one only SUMMONS a human build; no model trains or deploys itself.
+ML_PATTERN_MIN_SAMPLE: int = 500    # ml_pattern_recognition: ready-to-build gate
+ML_SIZING_MIN_SAMPLE: int = 750     # ml_predictive_sizing: ready-to-build gate

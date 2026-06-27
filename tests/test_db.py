@@ -1,7 +1,7 @@
 """Tests for trading_bot.db — schema, CRUD, validation, and dedupe."""
 
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,11 +30,11 @@ def _make_signal(**overrides: Any) -> Signal:
 def test_init_db_is_idempotent(tmp_db: Path) -> None:
     db.init_db()  # tmp_db already called init_db once; second call must not error
     db.init_db()
-    assert db.schema_version() == 15
+    assert db.schema_version() == 16
 
 
 def test_schema_version_is_1_after_init(tmp_db: Path) -> None:
-    assert db.schema_version() == 15
+    assert db.schema_version() == 16
 
 
 # ---- signals ----
@@ -198,7 +198,7 @@ def test_get_table_counts_zero_on_fresh_db(tmp_db: Path) -> None:
         "discovery_results": 0, "shadow_evaluations": 0,
         "watchlist_transitions": 0,
         "signal_pair_status": 0, "signal_pair_transitions": 0,
-        "optimization_runs": 0,
+        "optimization_runs": 0, "readiness_state": 0,
     }
 
 
@@ -305,3 +305,55 @@ def test_optimization_runs_round_trip_newest_first(tmp_db: Path) -> None:
 
 def test_get_latest_optimization_run_none_when_empty(tmp_db: Path) -> None:
     assert db.get_latest_optimization_run() is None
+
+
+# ---- readiness ledger + resolved counts (Phase 10) ----
+
+
+def _resolved(track_mode: str, outcome: str, pnl: float | None, idx: int) -> None:
+    ts = datetime(2026, 1, 1, 9, 0) + timedelta(minutes=idx)
+    sid = db.insert_signal(Signal(
+        timestamp=ts, ticker=f"R{idx}", asset_class="stock",
+        signal_type="ema21_pullback", direction="call", entry_price=100.0,
+    ))
+    db.insert_trade(Trade(
+        signal_id=sid, opened_at=ts, closed_at=ts + timedelta(days=1),
+        outcome=outcome, pnl_pct=pnl, track_mode=track_mode,
+    ))
+
+
+def test_count_resolved_trades_by_track_mode(tmp_db: Path) -> None:
+    _resolved("active", "win", 2.0, 0)
+    _resolved("active", "loss", -1.0, 1)
+    _resolved("active", "expired", None, 2)   # excluded
+    _resolved("active", "open", None, 3)      # excluded (open)
+    _resolved("shadow", "win", 1.0, 4)
+    assert db.count_resolved_trades() == 3              # all win/loss
+    assert db.count_resolved_trades(track_mode="active") == 2
+    assert db.count_resolved_trades(track_mode="shadow") == 1
+
+
+def test_readiness_state_round_trip(tmp_db: Path) -> None:
+    assert db.get_readiness_state("watchlist_rotation") is None
+    db.upsert_readiness_state(
+        "watchlist_rotation", status="ready", n_at_crossing=10,
+        crossed_at="2026-06-01T00:00:00", announced=True,
+    )
+    row = db.get_readiness_state("watchlist_rotation")
+    assert row is not None
+    assert row["status"] == "ready"
+    assert row["n_at_crossing"] == 10
+    assert row["announced"] is True
+    # upsert overwrites
+    db.upsert_readiness_state(
+        "watchlist_rotation", status="ready", n_at_crossing=10,
+        crossed_at="2026-06-01T00:00:00", announced=False,
+    )
+    assert db.get_readiness_state("watchlist_rotation")["announced"] is False
+
+
+def test_upsert_readiness_state_rejects_bad_status(tmp_db: Path) -> None:
+    with pytest.raises(ValueError, match="status"):
+        db.upsert_readiness_state(
+            "x", status="bogus", n_at_crossing=None, crossed_at=None, announced=False,
+        )

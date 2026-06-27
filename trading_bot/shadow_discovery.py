@@ -24,14 +24,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from trading_bot import db
+from trading_bot import config, db
 from trading_bot.discovery_universe import SHADOW_UNIVERSE
 
 # How far back resolved shadow outcomes count toward a promotion decision.
 RECENT_WINDOW_DAYS = 60
 # Minimum resolved (win/loss) shadow signals before a name can be promoted —
-# filters tiny-sample noise.
-MIN_SHADOW_SIGNALS = 10
+# filters tiny-sample noise. Centralized in config for the Phase 10 readiness
+# registry; re-exported here unchanged for back-compat.
+MIN_SHADOW_SIGNALS = config.MIN_SHADOW_SIGNALS
 # Minimum per-trade expectancy (mean resolved pnl %, points) to promote. A
 # small positive bar: live-shadow is permissive, kickout prunes later.
 PROMOTE_EXPECTANCY = 0.05

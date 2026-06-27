@@ -41,12 +41,13 @@ from trading_bot.models import (
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
+# Version 16 (Phase 10) — adds the readiness_state ledger.
 # Version 15 (Phase 9) — adds the optimization_runs history table.
 # Version 14 (Phase 7) — adds trades.risk_* advisory risk-recommendation columns.
 # Version 13 (Phase 6) — adds trades.ind_* advisory indicator-family columns.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -271,6 +272,17 @@ CREATE TABLE IF NOT EXISTS optimization_runs (
 
 CREATE INDEX IF NOT EXISTS idx_optimization_runs_ts
     ON optimization_runs (run_timestamp);
+
+-- Phase 10: the unified readiness ledger. One row per capability; 'announced'
+-- makes the first-crossing notification a ONE-TIME edge event (set True only on
+-- a successful send, so a failed send retries next cycle).
+CREATE TABLE IF NOT EXISTS readiness_state (
+    capability TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'warming' CHECK (status IN ('warming','ready')),
+    n_at_crossing INTEGER,
+    crossed_at TEXT,
+    announced INTEGER NOT NULL DEFAULT 0
+);
 """
 
 # Whitelist for update_trade — never interpolate user input into SQL column names.
@@ -291,6 +303,7 @@ _TABLE_NAMES: tuple[str, ...] = (
     "predictions", "settings", "active_watchlist", "discovery_results",
     "shadow_evaluations", "watchlist_transitions",
     "signal_pair_status", "signal_pair_transitions", "optimization_runs",
+    "readiness_state",
 )
 
 # Whitelist for update_prediction — resolution flow + Phase 2.3 context backfill.
@@ -533,6 +546,15 @@ def _migrate_to_v15(_conn: sqlite3.Connection) -> None:
     return None
 
 
+def _migrate_to_v16(_conn: sqlite3.Connection) -> None:
+    """Phase 10 migration step.
+
+    Nothing to ALTER — the new ``readiness_state`` table is created by the
+    ``CREATE TABLE IF NOT EXISTS`` block above. Documented hook only.
+    """
+    return None
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -552,6 +574,7 @@ def init_db() -> None:
         _migrate_to_v13(conn)
         _migrate_to_v14(conn)
         _migrate_to_v15(conn)
+        _migrate_to_v16(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -2262,6 +2285,80 @@ def get_latest_optimization_run() -> dict[str, Any] | None:
     """The most recent self-optimization run, or None if none have run."""
     runs = get_optimization_runs(limit=1)
     return runs[0] if runs else None
+
+
+def count_resolved_trades(track_mode: str | None = None) -> int:
+    """Cumulative count of RESOLVED (win/loss) trades (Phase 10 readiness).
+
+    The canonical resolved definition (``outcome IN ('win','loss')`` — expired
+    and open excluded). ``track_mode`` narrows to one mode, or ``None`` spans
+    all. Not windowed: readiness measures ACCUMULATED data against a threshold.
+    """
+    clause = ""
+    params: list[Any] = []
+    if track_mode is not None:
+        clause = " AND track_mode = ?"
+        params.append(track_mode)
+    sql = (  # noqa: S608 - fixed fragment + bound param
+        f"SELECT COUNT(*) AS c FROM trades WHERE outcome IN ('win','loss'){clause}"
+    )
+    conn = get_connection()
+    try:
+        row = conn.execute(sql, params).fetchone()
+    finally:
+        conn.close()
+    return int(row["c"]) if row is not None else 0
+
+
+def get_readiness_state(capability: str) -> dict[str, Any] | None:
+    """Return one capability's readiness ledger row, or None if never recorded."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT capability, status, n_at_crossing, crossed_at, announced "
+            "FROM readiness_state WHERE capability = ?",
+            (capability,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return {
+        "capability": str(row["capability"]),
+        "status": str(row["status"]),
+        "n_at_crossing": row["n_at_crossing"],
+        "crossed_at": row["crossed_at"],
+        "announced": bool(row["announced"]),
+    }
+
+
+def upsert_readiness_state(
+    capability: str,
+    *,
+    status: str,
+    n_at_crossing: int | None,
+    crossed_at: str | None,
+    announced: bool,
+) -> None:
+    """Insert or update a capability's readiness ledger row."""
+    if status not in ("warming", "ready"):
+        raise ValueError(f"Invalid readiness status '{status}'")
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO readiness_state "
+            "(capability, status, n_at_crossing, crossed_at, announced) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(capability) DO UPDATE SET "
+            "  status = excluded.status, "
+            "  n_at_crossing = excluded.n_at_crossing, "
+            "  crossed_at = excluded.crossed_at, "
+            "  announced = excluded.announced",
+            (capability, status, n_at_crossing, crossed_at, int(announced)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def insert_shadow_evaluations(
