@@ -36,6 +36,7 @@ from trading_bot import (
     outcomes,
     performance,
     predictions,
+    readiness,
     regime,
     risk,
     settings,
@@ -1169,6 +1170,24 @@ def _run_daily_vix_snapshot() -> None:
         print(f"  vix snapshot error: {exc}", file=sys.stderr)
 
 
+def _run_readiness_evaluation() -> None:
+    """Phase 10: evaluate every capability's readiness and fire any first-crossing
+    notifications. Runs in the scan loop so deterministic capabilities
+    auto-activate (and ML capabilities summon a build) automatically as resolved
+    data accumulates. Swallow-all so a transient failure never kills the loop."""
+    try:
+        results = readiness.evaluate_readiness()
+        newly = [r.capability for r in results if r.newly_announced]
+        if newly:
+            print(
+                f"[{datetime.now().strftime('%H:%M:%S')}] readiness: announced "
+                f"{', '.join(newly)}"
+            )
+    except Exception as exc:
+        import sys
+        print(f"  readiness evaluation error: {exc}", file=sys.stderr)
+
+
 def _run_daily_perf_update() -> None:
     """Materialize yesterday's daily_performance row. Swallow-all on failure
     so a transient DB error doesn't kill the scheduling loop."""
@@ -1843,6 +1862,9 @@ def main() -> None:
     _run_shadow_scan()
     scan_crypto()
     send_morning_report()
+    # Evaluate readiness once at boot so a capability already over threshold is
+    # announced promptly (idempotent — the one-time flag prevents re-notifying).
+    _run_readiness_evaluation()
 
     # Stock scan — once per day at 9:31am EST
     schedule.every().day.at("09:31").do(scan_stocks)
@@ -1860,6 +1882,11 @@ def main() -> None:
     # Resolve open trades every hour (Phase 1.3) — lightweight, only touches
     # trades with outcome IS NULL or 'open' and skips already-closed ones.
     schedule.every(1).hours.do(_run_outcome_resolver)
+
+    # Evaluate capability readiness every hour, right after the resolver so the
+    # resolved counts are fresh — auto-activates deterministic capabilities and
+    # summons ML builds on first crossing, notifying exactly once (Phase 10).
+    schedule.every(1).hours.do(_run_readiness_evaluation)
 
     # Materialize yesterday's daily_performance row daily at 00:30 UTC
     # (~20:30 ET, well after market close and the hourly resolver). Phase 1.4.
