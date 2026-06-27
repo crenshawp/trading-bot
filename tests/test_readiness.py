@@ -81,6 +81,18 @@ def test_resolved_count_by_scope(tmp_db: Path) -> None:
     assert readiness.resolved_count("shadow_promotion") == 4
 
 
+def test_resolved_count_matches_existing_resolved_definition(tmp_db: Path) -> None:
+    # The readiness count uses the SAME resolved definition (win/loss, expired/
+    # open excluded) the gating subsystems use — cross-checked against the Phase 9
+    # resolved-context query for the active scope.
+    from trading_bot import self_optimization as so
+    idx = _seed_resolved(3, outcome="win", track_mode="active")
+    idx = _seed_resolved(2, outcome="loss", pnl=-1.0, track_mode="active", start=idx)
+    _seed_resolved(1, outcome="expired", pnl=None, track_mode="active", start=idx)
+    assert db.count_resolved_trades(track_mode="active") == len(so.resolved_context_rows())
+    assert db.count_resolved_trades(track_mode="active") == 5   # expired excluded
+
+
 # ───────────────────────── readiness crossing ───────────────────────────────────
 
 
