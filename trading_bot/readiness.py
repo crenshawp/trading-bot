@@ -76,6 +76,19 @@ REGISTRY: tuple[Capability, ...] = (
         "self_optimization", "deterministic", config.SO_MIN_SAMPLE,
         "active", "degradation + feature-evaluation actionability (Phase 9)",
     ),
+    # ML capabilities — build-readiness FLAGS ONLY. Crossing a threshold flips
+    # status to 'ready' and fires a build SUMMONS; it NEVER trains, infers, or
+    # deploys. There is intentionally NO model code anywhere — a human builds and
+    # validates the model in a future phase. The thresholds are deliberately
+    # large counts befitting model training.
+    Capability(
+        "ml_pattern_recognition", "ml", config.ML_PATTERN_MIN_SAMPLE,
+        "all", "pattern recognition model (future build - summon only)",
+    ),
+    Capability(
+        "ml_predictive_sizing", "ml", config.ML_SIZING_MIN_SAMPLE,
+        "all", "predictive position sizing model (future build - summon only)",
+    ),
 )
 
 

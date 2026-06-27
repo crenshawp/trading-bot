@@ -248,3 +248,50 @@ def test_pushover_notify_exception(
     monkeypatch.setattr("trading_bot.readiness.requests.post", boom)
     assert readiness._pushover_notify("t", "m") is False
     assert "error" in capsys.readouterr().err
+
+
+# ───────────────────────── ML capabilities (build-summon only) ───────────────────
+
+
+def test_ml_capabilities_registered_as_ready_flags() -> None:
+    caps = {c.name: c for c in readiness.REGISTRY}
+    assert caps["ml_pattern_recognition"].kind == "ml"
+    assert caps["ml_predictive_sizing"].kind == "ml"
+    assert caps["ml_pattern_recognition"].threshold == config.ML_PATTERN_MIN_SAMPLE
+    assert caps["ml_predictive_sizing"].threshold == config.ML_SIZING_MIN_SAMPLE
+
+
+def test_ml_thresholds_are_larger_than_deterministic() -> None:
+    caps = {c.name: c for c in readiness.REGISTRY}
+    det_max = max(
+        c.threshold for c in readiness.REGISTRY if c.kind == "deterministic"
+    )
+    assert caps["ml_pattern_recognition"].threshold > det_max
+    assert caps["ml_predictive_sizing"].threshold > det_max
+
+
+def test_ml_crossing_summons_a_build_and_never_acts(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Use a small-threshold ML capability so we don't seed hundreds of trades.
+    ml = readiness.Capability("ml_test", "ml", 2, "all", "test model")
+    monkeypatch.setattr(readiness, "REGISTRY", (ml,))
+    _seed_resolved(2)
+    rec = _Recorder()
+
+    results = readiness.evaluate_readiness(notifier=rec, now=NOW)
+    r = results[0]
+    assert r.kind == "ml"
+    assert r.status == "ready"
+    assert r.newly_announced is True
+    msg = rec.for_cap("ml_test")[0][1]
+    assert "to be built" in msg and "Awaiting the build" in msg   # build summons
+    assert "switched on automatically" not in msg                # NOT auto-activate
+    # The only side effect is the ledger flip + notification — no model, no action.
+    assert db.get_active_watchlist() == []
+
+
+def test_no_model_or_training_surface_exists() -> None:
+    # ML capabilities are pure readiness FLAGS — there is no model/training code.
+    for attr in ("train", "predict", "fit", "infer", "model", "build_model"):
+        assert not hasattr(readiness, attr)
