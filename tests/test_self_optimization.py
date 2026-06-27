@@ -212,3 +212,112 @@ def test_detect_degradation_splits_recent_and_baseline_windows(tmp_db: Path) -> 
     overall = _overall(findings)
     assert overall.recent_n == 1       # only REC
     assert overall.baseline_n == 1     # only BASE (OLD is before the baseline cut)
+
+
+# ───────────────────────── feature evaluation ───────────────────────────────────
+
+
+def _frow(**kw: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "outcome": "win", "pnl_pct": 1.0, "signal_type": "s", "ticker": "T",
+        "sentiment_label": None, "ind_vol_regime": None, "ind_rsi": None,
+        "ind_adx": None, "ind_obv": None, "ind_concentration": None,
+        "risk_portfolio_verdict": None,
+    }
+    base.update(kw)
+    return base
+
+
+def _feature(evals: list[so.FeatureEvaluation], name: str) -> so.FeatureEvaluation:
+    return next(e for e in evals if e.feature == name)
+
+
+def test_feature_evaluations_cover_all_seven_features() -> None:
+    names = [e.feature for e in so.compute_feature_evaluations([])]
+    assert names == [
+        "sentiment", "vol_regime", "rsi", "adx", "obv",
+        "concentration", "portfolio_verdict",
+    ]
+
+
+def test_sentiment_buckets_hand_computed() -> None:
+    rows = (
+        [_frow(sentiment_label="bearish", outcome="win", pnl_pct=2.0)]
+        + [_frow(sentiment_label="bearish", outcome="loss", pnl_pct=-1.0)] * 2
+        + [_frow(sentiment_label="bullish", outcome="win", pnl_pct=2.0)] * 2
+        + [_frow(sentiment_label="bullish", outcome="loss", pnl_pct=-1.0)]
+    )
+    sent = _feature(so.compute_feature_evaluations(rows, min_sample=3), "sentiment")
+    buckets = {b.label: b for b in sent.buckets}
+    assert "neutral" not in buckets                      # no neutral rows
+    assert buckets["bearish"].n == 3
+    assert buckets["bearish"].win_rate == pytest.approx(33.333, abs=1e-2)
+    assert buckets["bearish"].expectancy == pytest.approx(0.0)        # mean(2,-1,-1)
+    assert buckets["bullish"].win_rate == pytest.approx(66.667, abs=1e-2)
+    assert buckets["bullish"].expectancy == pytest.approx(1.0)        # mean(2,2,-1)
+    assert sent.actionable is True                       # both buckets n>=3
+    assert "bullish 67% (n=3) vs bearish 33% (n=3)" in sent.note
+
+
+def test_rsi_bands_assign_correctly_incl_boundaries() -> None:
+    rows = [
+        _frow(ind_rsi=30.0), _frow(ind_rsi=40.0), _frow(ind_rsi=60.0),
+        _frow(ind_rsi=61.0), _frow(ind_rsi=70.0),
+    ]
+    rsi = _feature(so.compute_feature_evaluations(rows, min_sample=1), "rsi")
+    counts = {b.label: b.n for b in rsi.buckets}
+    assert counts == {"low(<40)": 1, "mid(40-60)": 2, "high(>60)": 2}  # 40,60 -> mid
+
+
+def test_adx_bands_and_obv_sign_buckets() -> None:
+    rows = [
+        _frow(ind_adx=19.0, ind_obv=-5.0),
+        _frow(ind_adx=20.0, ind_obv=0.0),
+        _frow(ind_adx=41.0, ind_obv=5.0),
+    ]
+    evals = so.compute_feature_evaluations(rows, min_sample=1)
+    adx = {b.label: b.n for b in _feature(evals, "adx").buckets}
+    obv = {b.label: b.n for b in _feature(evals, "obv").buckets}
+    assert adx == {"weak(<20)": 1, "moderate(20-40)": 1, "strong(>40)": 1}
+    assert obv == {"negative": 1, "zero": 1, "positive": 1}
+
+
+def test_concentration_and_verdict_buckets_skip_unknown() -> None:
+    rows = [
+        _frow(ind_concentration="concentrated", risk_portfolio_verdict="ok"),
+        _frow(ind_concentration="diversified",
+              risk_portfolio_verdict="would-exceed-portfolio"),
+        _frow(ind_concentration="unknown", risk_portfolio_verdict="unknown"),
+    ]
+    evals = so.compute_feature_evaluations(rows, min_sample=1)
+    conc = {b.label for b in _feature(evals, "concentration").buckets}
+    verd = {b.label for b in _feature(evals, "portfolio_verdict").buckets}
+    assert conc == {"concentrated", "diversified"}          # 'unknown' skipped
+    assert verd == {"ok", "would-exceed-portfolio"}
+
+
+def test_feature_under_min_sample_is_not_actionable() -> None:
+    rows = (
+        [_frow(ind_vol_regime="low", outcome="win", pnl_pct=1.0)] * 2
+        + [_frow(ind_vol_regime="high", outcome="loss", pnl_pct=-1.0)] * 2
+    )
+    vr = _feature(so.compute_feature_evaluations(rows, min_sample=30), "vol_regime")
+    assert all(b.actionable is False for b in vr.buckets)   # each n=2 < 30
+    assert vr.actionable is False
+    assert "NOT actionable at n<30" in vr.note
+
+
+def test_feature_with_no_data_notes_insufficient() -> None:
+    sent = _feature(so.compute_feature_evaluations([]), "sentiment")
+    assert sent.buckets == []
+    assert sent.actionable is False
+    assert "need >= 2 buckets" in sent.note
+
+
+def test_evaluate_features_reads_from_db(tmp_db: Path) -> None:
+    _seed_resolved(tmp_db, ticker="GOOGL", outcome="win", pnl=2.0,
+                   sentiment_label="bullish")
+    _seed_resolved(tmp_db, ticker="META", outcome="loss", pnl=-1.0,
+                   sentiment_label="bearish")
+    sent = _feature(so.evaluate_features(), "sentiment")
+    assert {b.label for b in sent.buckets} == {"bullish", "bearish"}

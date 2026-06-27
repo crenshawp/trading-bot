@@ -211,3 +211,178 @@ def detect_degradation(
     recent_rows = resolved_context_rows(since=recent_cut)
     baseline_rows = resolved_context_rows(since=baseline_cut, until=recent_cut)
     return compute_degradation(baseline_rows, recent_rows)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FEATURE EVALUATION — does any stored advisory context predict outcomes?
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class FeatureBucket:
+    """One bucket of a feature with its resolved-outcome stats."""
+
+    label: str
+    n: int
+    win_rate: float | None
+    expectancy: float | None
+    actionable: bool             # n >= the sample floor
+
+
+@dataclass(frozen=True)
+class FeatureEvaluation:
+    """One feature's buckets + a plain-language read.
+
+    ``actionable`` is True only when at least two buckets each clear the sample
+    floor (so a comparison between them is not just noise). The ``note`` always
+    spells out the actionability caveat.
+    """
+
+    feature: str
+    buckets: list[FeatureBucket]
+    actionable: bool
+    note: str
+
+
+def _bucket_label(row: Mapping[str, Any], column: str, allowed: set[str]) -> str | None:
+    value = row.get(column)
+    return str(value) if value in allowed else None
+
+
+def _bucket_sentiment(row: Mapping[str, Any]) -> str | None:
+    return _bucket_label(row, "sentiment_label", {"bearish", "neutral", "bullish"})
+
+
+def _bucket_vol_regime(row: Mapping[str, Any]) -> str | None:
+    return _bucket_label(row, "ind_vol_regime", {"low", "normal", "high"})
+
+
+def _bucket_concentration(row: Mapping[str, Any]) -> str | None:
+    return _bucket_label(
+        row, "ind_concentration", {"concentrated", "moderate", "diversified"}
+    )
+
+
+def _bucket_portfolio_verdict(row: Mapping[str, Any]) -> str | None:
+    return _bucket_label(
+        row, "risk_portfolio_verdict", {"ok", "would-exceed-portfolio"}
+    )
+
+
+def _bucket_rsi(row: Mapping[str, Any]) -> str | None:
+    value = row.get("ind_rsi")
+    if value is None:
+        return None
+    if value < 40.0:
+        return "low(<40)"
+    if value <= 60.0:
+        return "mid(40-60)"
+    return "high(>60)"
+
+
+def _bucket_adx(row: Mapping[str, Any]) -> str | None:
+    value = row.get("ind_adx")
+    if value is None:
+        return None
+    if value < 20.0:
+        return "weak(<20)"
+    if value <= 40.0:
+        return "moderate(20-40)"
+    return "strong(>40)"
+
+
+def _bucket_obv(row: Mapping[str, Any]) -> str | None:
+    value = row.get("ind_obv")
+    if value is None:
+        return None
+    if value > 0.0:
+        return "positive"
+    if value < 0.0:
+        return "negative"
+    return "zero"
+
+
+# (feature name, bucketer, stable display order). RSI/ADX use textbook bands and
+# OBV its sign — interpretable, deterministic buckets rather than data-dependent
+# terciles, so the read is reproducible and hand-checkable.
+_FEATURES: list[tuple[str, Any, list[str]]] = [
+    ("sentiment", _bucket_sentiment, ["bearish", "neutral", "bullish"]),
+    ("vol_regime", _bucket_vol_regime, ["low", "normal", "high"]),
+    ("rsi", _bucket_rsi, ["low(<40)", "mid(40-60)", "high(>60)"]),
+    ("adx", _bucket_adx, ["weak(<20)", "moderate(20-40)", "strong(>40)"]),
+    ("obv", _bucket_obv, ["negative", "zero", "positive"]),
+    ("concentration", _bucket_concentration,
+     ["concentrated", "moderate", "diversified"]),
+    ("portfolio_verdict", _bucket_portfolio_verdict,
+     ["ok", "would-exceed-portfolio"]),
+]
+
+
+def _win_rate_key(bucket: FeatureBucket) -> float:
+    return bucket.win_rate if bucket.win_rate is not None else 0.0
+
+
+def _feature_note(buckets: list[FeatureBucket], *, min_sample: int) -> str:
+    rated = [b for b in buckets if b.win_rate is not None]
+    if len(rated) < 2:
+        return "insufficient sample - not actionable (need >= 2 buckets with outcomes)"
+    best = max(rated, key=_win_rate_key)
+    worst = min(rated, key=_win_rate_key)
+    spread = (
+        f"{best.label} {best.win_rate:.0f}% (n={best.n}) vs "
+        f"{worst.label} {worst.win_rate:.0f}% (n={worst.n})"
+    )
+    if best.actionable and worst.actionable:
+        return f"{spread} - both buckets clear n>={min_sample}"
+    return f"{spread} - suggestive, NOT actionable at n<{min_sample}"
+
+
+def _evaluate_feature(
+    feature: str,
+    rows: Sequence[Mapping[str, Any]],
+    bucketer: Any,
+    order: Sequence[str],
+    *,
+    min_sample: int,
+) -> FeatureEvaluation:
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for row in rows:
+        label = bucketer(row)
+        if label is not None:
+            grouped.setdefault(label, []).append(row)
+
+    buckets: list[FeatureBucket] = []
+    for label in order:
+        if label not in grouped:
+            continue
+        stat = stat_for(grouped[label])
+        buckets.append(FeatureBucket(
+            label, stat.n, stat.win_rate, stat.expectancy, stat.n >= min_sample,
+        ))
+
+    actionable = sum(1 for b in buckets if b.actionable) >= 2
+    return FeatureEvaluation(
+        feature, buckets, actionable, _feature_note(buckets, min_sample=min_sample),
+    )
+
+
+def compute_feature_evaluations(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    min_sample: int = config.SO_MIN_SAMPLE,
+) -> list[FeatureEvaluation]:
+    """Bucket resolved trades by each stored feature and compare outcome rates.
+
+    Pure — the caller supplies the rows. Buckets with no resolved trades are
+    omitted; any feature lacking two floor-clearing buckets is reported but
+    flagged not-actionable.
+    """
+    return [
+        _evaluate_feature(name, rows, bucketer, order, min_sample=min_sample)
+        for name, bucketer, order in _FEATURES
+    ]
+
+
+def evaluate_features() -> list[FeatureEvaluation]:
+    """Evaluate every feature over ALL resolved active trades (max sample)."""
+    return compute_feature_evaluations(resolved_context_rows())
