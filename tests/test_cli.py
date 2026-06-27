@@ -781,6 +781,28 @@ def test_cli_optimize_report_populated(
     assert "sentiment" in out and "bullish" in out
 
 
+def test_cli_optimize_run_computes_persists_and_prints(
+    tmp_db: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import db
+    _run(["optimize", "run", "--degrade-window", "30", "--baseline-window", "90"])
+    out = capsys.readouterr().out
+    assert "SELF-OPTIMIZATION REPORT" in out
+    assert "DEGRADATION" in out
+    assert "FEATURE EVALUATION" in out
+    assert db.get_latest_optimization_run() is not None     # the run was persisted
+
+
+def test_cli_optimize_run_rejects_inverted_window(
+    tmp_db: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        _run(["optimize", "run", "--degrade-window", "60", "--baseline-window", "30"])
+    assert "must exceed" in capsys.readouterr().err
+
+
 # ───────────────────── Phase 2.1 regime + by-regime subcommands ─────────────────────
 
 

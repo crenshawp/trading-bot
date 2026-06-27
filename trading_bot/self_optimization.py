@@ -465,3 +465,28 @@ def render_report(payload: Mapping[str, Any]) -> str:
                 f"expectancy={_fmt(b['expectancy'], '+.2f'):<7} n={b['n']}{tag}"
             )
     return "\n".join(lines)
+
+
+def run_optimization(
+    *,
+    now: datetime | None = None,
+    degrade_window_days: int | None = None,
+    baseline_window_days: int | None = None,
+) -> dict[str, Any]:
+    """Run degradation detection + feature evaluation and build a run payload.
+
+    Reads the db (resolved active trades) but does NOT persist — the caller
+    persists and renders. Flags only.
+    """
+    moment = now if now is not None else datetime.now(UTC)
+    dwd = degrade_window_days if degrade_window_days is not None else config.SO_DEGRADE_WINDOW_DAYS
+    bwd = baseline_window_days if baseline_window_days is not None else config.SO_BASELINE_WINDOW_DAYS
+
+    degradations = detect_degradation(
+        now=moment, degrade_window_days=dwd, baseline_window_days=bwd,
+    )
+    features = evaluate_features()
+    return build_payload(
+        degradations, features, run_timestamp=moment.isoformat(),
+        degrade_window_days=dwd, baseline_window_days=bwd,
+    )

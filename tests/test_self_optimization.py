@@ -363,3 +363,17 @@ def test_render_report_handles_empty_findings() -> None:
     )
     text = so.render_report(payload)
     assert "no resolved trades in the window" in text
+
+
+def test_run_optimization_builds_payload_from_db(tmp_db: Path) -> None:
+    _seed_resolved(tmp_db, ticker="GOOGL", outcome="win", pnl=2.0,
+                   sentiment_label="bullish", closed_at=datetime(2026, 6, 20, 16, 0))
+    payload = so.run_optimization(
+        now=datetime(2026, 7, 1), degrade_window_days=30, baseline_window_days=90,
+    )
+    assert payload["run_timestamp"] == "2026-07-01T00:00:00"
+    assert payload["degrade_window_days"] == 30
+    assert payload["baseline_window_days"] == 90
+    assert any(f["scope"] == "overall" for f in payload["degradations"])
+    sent = next(f for f in payload["features"] if f["feature"] == "sentiment")
+    assert any(b["label"] == "bullish" for b in sent["buckets"])

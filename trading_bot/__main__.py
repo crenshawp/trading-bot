@@ -1241,6 +1241,32 @@ def cmd_risk_exposure() -> None:
 # ---- self-optimization CLI (Phase 9) ----
 
 
+def cmd_optimize_run(
+    degrade_window: int | None = None, baseline_window: int | None = None,
+) -> None:
+    """Run degradation detection + feature evaluation, persist, and print.
+
+    Operator-triggered. Computes fresh findings over the resolved active book,
+    writes the run to history, and prints the full report. Flags only — nothing
+    here changes any threshold or pair/ticker status.
+    """
+    dwd = degrade_window if degrade_window is not None else config.SO_DEGRADE_WINDOW_DAYS
+    bwd = baseline_window if baseline_window is not None else config.SO_BASELINE_WINDOW_DAYS
+    if bwd <= dwd:
+        print(
+            f"baseline window ({bwd}d) must exceed the degrade window ({dwd}d) "
+            "so the baseline is an older, disjoint period.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    payload = self_optimization.run_optimization(
+        degrade_window_days=dwd, baseline_window_days=bwd,
+    )
+    self_optimization.persist_run(payload)
+    print(self_optimization.render_report(payload))
+
+
 def cmd_optimize_report() -> None:
     """Print the most recent persisted self-optimization run.
 
@@ -1695,6 +1721,15 @@ def main() -> None:
     optimize_sub = optimize_parser.add_subparsers(
         dest="optimize_cmd", required=True
     )
+    optimize_run_p = optimize_sub.add_parser("run")
+    optimize_run_p.add_argument(
+        "--degrade-window", type=int, default=None,
+        help=f"Recent window in days (default {config.SO_DEGRADE_WINDOW_DAYS})",
+    )
+    optimize_run_p.add_argument(
+        "--baseline-window", type=int, default=None,
+        help=f"Baseline window in days (default {config.SO_BASELINE_WINDOW_DAYS})",
+    )
     optimize_sub.add_parser("report")
 
     # predictions (Phase 2.2b)
@@ -1848,7 +1883,12 @@ def main() -> None:
         elif args.risk_cmd == "exposure":
             cmd_risk_exposure()
     elif args.command == "optimize":
-        if args.optimize_cmd == "report":
+        if args.optimize_cmd == "run":
+            cmd_optimize_run(
+                degrade_window=args.degrade_window,
+                baseline_window=args.baseline_window,
+            )
+        elif args.optimize_cmd == "report":
             cmd_optimize_report()
     elif args.command == "predictions":
         if args.predictions_cmd == "enable":
