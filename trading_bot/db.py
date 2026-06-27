@@ -2124,6 +2124,67 @@ def get_resolved_shadow_outcomes(
     return get_resolved_outcomes(ticker, since, track_mode="shadow")
 
 
+def get_resolved_context_outcomes(
+    since: datetime | None = None, until: datetime | None = None
+) -> list[dict[str, Any]]:
+    """Resolved ACTIVE trades with their stored advisory context (Phase 9).
+
+    Win/loss only (expired/open excluded — the same resolved definition the
+    gating subsystems use) and ``track_mode='active'`` (the live book that
+    carries the Phase 5-7 context). Optional ``closed_at`` window ``[since,
+    until)``. Each row carries the outcome + pnl plus the signal identity and
+    every stored-context column self-optimization buckets against, so degradation
+    slicing and feature evaluation both read from one query.
+    """
+    clauses = ""
+    params: list[Any] = []
+    if since is not None:
+        clauses += " AND trades.closed_at >= ?"
+        params.append(since.isoformat())
+    if until is not None:
+        clauses += " AND trades.closed_at < ?"
+        params.append(until.isoformat())
+    sql = (
+        "SELECT trades.outcome AS outcome, trades.pnl_pct AS pnl_pct, "
+        "       trades.closed_at AS closed_at, "
+        "       signals.ticker AS ticker, signals.signal_type AS signal_type, "
+        "       trades.sentiment_label AS sentiment_label, "
+        "       trades.ind_vol_regime AS ind_vol_regime, "
+        "       trades.ind_rsi AS ind_rsi, trades.ind_adx AS ind_adx, "
+        "       trades.ind_obv AS ind_obv, "
+        "       trades.ind_concentration AS ind_concentration, "
+        "       trades.risk_portfolio_verdict AS risk_portfolio_verdict "
+        "FROM trades JOIN signals ON signals.id = trades.signal_id "
+        "WHERE trades.track_mode = 'active' "
+        "  AND trades.outcome IN ('win','loss') "
+        "  AND trades.closed_at IS NOT NULL "
+        f"{clauses} "  # noqa: S608 - whitelisted fragments, params bound
+        "ORDER BY trades.closed_at ASC"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "outcome": str(r["outcome"]),
+            "pnl_pct": r["pnl_pct"],
+            "closed_at": str(r["closed_at"]),
+            "ticker": str(r["ticker"]),
+            "signal_type": str(r["signal_type"]),
+            "sentiment_label": r["sentiment_label"],
+            "ind_vol_regime": r["ind_vol_regime"],
+            "ind_rsi": r["ind_rsi"],
+            "ind_adx": r["ind_adx"],
+            "ind_obv": r["ind_obv"],
+            "ind_concentration": r["ind_concentration"],
+            "risk_portfolio_verdict": r["risk_portfolio_verdict"],
+        }
+        for r in rows
+    ]
+
+
 def insert_shadow_evaluations(
     run_timestamp: str, rows: Sequence[Mapping[str, Any]]
 ) -> int:

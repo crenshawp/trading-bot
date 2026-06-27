@@ -104,3 +104,20 @@ MAX_CORRELATED_CLUSTER_PCT: float = 25.0  # advisory cap on a correlated cluster
 # matches the scanner's actual stop (sl = price - atr*1.5), so the advisory
 # size lines up with the stop the trade is really tracked against.
 RISK_ATR_STOP_MULTIPLE: float = 1.5
+
+# ──────────────────────────────────────────────────────────────────────────
+# Self-optimization (Phase 9) — DEGRADATION DETECTION + FEATURE EVALUATION
+# ──────────────────────────────────────────────────────────────────────────
+# This layer FLAGS AND REPORTS ONLY — it never auto-tunes a threshold or changes
+# any pair/ticker/watchlist status. Every finding carries its sample size; any
+# claim below SO_MIN_SAMPLE is labeled "insufficient sample - not actionable",
+# because testing many features against a small outcome set manufactures false
+# positives (multiple comparisons). Acting on a finding is a deliberate, later,
+# sample-gated step — not this phase.
+SO_MIN_SAMPLE: int = 30            # min resolved (win/loss) trades for an actionable claim
+SO_DEGRADE_WINDOW_DAYS: int = 30   # the RECENT window degradation is measured over
+SO_BASELINE_WINDOW_DAYS: int = 90  # the older BASELINE window end (must exceed degrade)
+# Minimum drop in expectancy (mean resolved pnl %, in percentage points) of the
+# recent window below baseline required to flag degradation. Paired with the
+# sample floor so a normal cold streak (small n) never trips an alarm.
+SO_MEANINGFUL_DELTA: float = 0.15
