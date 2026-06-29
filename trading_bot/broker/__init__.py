@@ -6,6 +6,7 @@ higher layers see. Concrete adapters live alongside this module.
 
 from __future__ import annotations
 
+from trading_bot.broker.alpaca import ALPACA_PAPER_BASE_URL, AlpacaBroker
 from trading_bot.broker.base import (
     NEUTRAL_STATUSES,
     ORDER_TYPE_LIMIT,
@@ -34,6 +35,8 @@ from trading_bot.broker.base import (
 )
 
 __all__ = [
+    "ALPACA_PAPER_BASE_URL",
+    "AlpacaBroker",
     "NEUTRAL_STATUSES",
     "ORDER_TYPE_LIMIT",
     "ORDER_TYPE_MARKET",

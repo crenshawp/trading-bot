@@ -24,6 +24,10 @@ KNOWN_SECRETS: frozenset[str] = frozenset({
     # Phase 5: advisory LLM sentiment scoring. Optional — when unset, sentiment
     # fails soft to neutral and signals proceed unaffected.
     "ANTHROPIC_API_KEY",
+    # Phase 11: Alpaca PAPER-trading credentials. Optional — when unset, the
+    # broker layer fails soft (every read returns ok=False) and never trades.
+    "ALPACA_API_KEY",
+    "ALPACA_SECRET_KEY",
 })
 
 _SERVICE_NAME = "trading_bot"
