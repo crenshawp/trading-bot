@@ -20,6 +20,7 @@ fail soft (``reason='ALPACA credentials unset'``) and nothing is sent.
 from __future__ import annotations
 
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,6 +35,7 @@ from trading_bot.broker.base import (
     Broker,
     OrderResult,
     OrdersResult,
+    Position,
     PositionsResult,
 )
 
@@ -42,6 +44,31 @@ from trading_bot.broker.base import (
 ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets"
 
 _HTTP_TIMEOUT_SECONDS = 10
+
+
+def _to_float(value: Any) -> float | None:
+    """Coerce Alpaca's string-encoded numbers to float; None on absent/garbage."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _str_or_none(value: Any) -> str | None:
+    return str(value) if value is not None else None
+
+
+def _parse_position(d: Mapping[str, Any]) -> Position:
+    return Position(
+        symbol=str(d.get("symbol", "")),
+        qty=_to_float(d.get("qty")) or 0.0,
+        side=str(d.get("side", "long")),
+        avg_entry_price=_to_float(d.get("avg_entry_price")),
+        market_value=_to_float(d.get("market_value")),
+        unrealized_pl=_to_float(d.get("unrealized_pl")),
+    )
 
 
 @dataclass(frozen=True)
@@ -120,6 +147,14 @@ class AlpacaBroker(Broker):
         return _Response(ok=True, status_code=resp.status_code, body=body, error="")
 
     @staticmethod
+    def _succeeded(resp: _Response) -> bool:
+        """True iff a response arrived with a 2xx status code."""
+        return (
+            resp.ok and resp.status_code is not None
+            and 200 <= resp.status_code < 300
+        )
+
+    @staticmethod
     def _error_reason(resp: _Response) -> str:
         """Human-readable reason from a failed response, for logs / results."""
         if resp.status_code is None:
@@ -129,13 +164,40 @@ class AlpacaBroker(Broker):
             message = str(resp.body.get("message", ""))
         return message or f"HTTP {resp.status_code}"
 
+    def _log_unavailable(self, what: str, resp: _Response) -> str:
+        """Log a non-transport failure (transport ones are logged in _request)
+        and return the reason string."""
+        reason = self._error_reason(resp)
+        if resp.status_code is not None:  # transport/creds already logged once
+            print(f"  broker: {what} unavailable ({reason})", file=sys.stderr)
+        return reason
+
     # ── read path (Section 3) ────────────────────────────────────────────────
 
     def get_account(self) -> AccountInfo:
-        return AccountInfo(ok=False, reason="not implemented")
+        resp = self._request("GET", "/v2/account")
+        if not self._succeeded(resp):
+            return AccountInfo(ok=False, reason=self._log_unavailable("account", resp))
+        body: Mapping[str, Any] = resp.body if isinstance(resp.body, dict) else {}
+        return AccountInfo(
+            ok=True,
+            account_number=_str_or_none(body.get("account_number")),
+            buying_power=_to_float(body.get("buying_power")),
+            cash=_to_float(body.get("cash")),
+            equity=_to_float(body.get("equity")),
+            currency=str(body.get("currency", "USD")),
+            status=_str_or_none(body.get("status")),
+        )
 
     def get_positions(self) -> PositionsResult:
-        return PositionsResult(ok=False, reason="not implemented")
+        resp = self._request("GET", "/v2/positions")
+        if not self._succeeded(resp):
+            return PositionsResult(
+                ok=False, reason=self._log_unavailable("positions", resp),
+            )
+        rows = resp.body if isinstance(resp.body, list) else []
+        positions = [_parse_position(r) for r in rows if isinstance(r, dict)]
+        return PositionsResult(ok=True, positions=positions)
 
     # ── write path (Section 4) ───────────────────────────────────────────────
 

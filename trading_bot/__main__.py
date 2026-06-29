@@ -7,6 +7,7 @@ import sys
 from datetime import date
 
 from trading_bot import (
+    broker,
     config,
     context,
     db,
@@ -1324,6 +1325,51 @@ def cmd_readiness_check() -> None:
     cmd_readiness_status()
 
 
+# ---- broker CLI (Phase 11) ----
+
+
+def _fmt_money(value: float | None) -> str:
+    return f"${value:,.2f}" if isinstance(value, (int, float)) else "-"
+
+
+def cmd_broker_account() -> None:
+    """Inspect the live Alpaca PAPER account (buying power, cash, equity)."""
+    acct = broker.AlpacaBroker().get_account()
+    print("BROKER ACCOUNT  (Alpaca paper)")
+    print("-" * 48)
+    if not acct.ok:
+        print(f"  unavailable: {acct.reason}")
+        return
+    print(f"  Account:       {acct.account_number}")
+    print(f"  Status:        {acct.status}")
+    print(f"  Buying power:  {_fmt_money(acct.buying_power)}")
+    print(f"  Cash:          {_fmt_money(acct.cash)}")
+    print(f"  Equity:        {_fmt_money(acct.equity)}")
+    print(f"  Currency:      {acct.currency}")
+
+
+def cmd_broker_positions() -> None:
+    """List current open positions on the Alpaca PAPER account."""
+    res = broker.AlpacaBroker().get_positions()
+    print("BROKER POSITIONS  (Alpaca paper)")
+    print("-" * 64)
+    if not res.ok:
+        print(f"  unavailable: {res.reason}")
+        return
+    if not res.positions:
+        print("  (no open positions)")
+        return
+    print(
+        f"  {'Symbol':<8} {'Qty':>10}  {'Side':<6} {'Avg entry':>10}  "
+        f"{'Mkt value':>12}"
+    )
+    for p in res.positions:
+        print(
+            f"  {p.symbol:<8} {p.qty:>10.4f}  {p.side:<6} "
+            f"{_fmt_money(p.avg_entry_price):>10}  {_fmt_money(p.market_value):>12}"
+        )
+
+
 # ---- predictions CLI (Phase 2.2b) ----
 
 # Seeded defaults — duplicated from scanner._PRED_DEFAULTS so the CLI can
@@ -1783,6 +1829,12 @@ def main() -> None:
     readiness_sub.add_parser("status")
     readiness_sub.add_parser("check")
 
+    # broker (Phase 11) — Alpaca PAPER only
+    broker_parser = sub.add_parser("broker")
+    broker_sub = broker_parser.add_subparsers(dest="broker_cmd", required=True)
+    broker_sub.add_parser("account")
+    broker_sub.add_parser("positions")
+
     # predictions (Phase 2.2b)
     pred_parser = sub.add_parser("predictions")
     pred_sub = pred_parser.add_subparsers(dest="predictions_cmd", required=True)
@@ -1946,6 +1998,11 @@ def main() -> None:
             cmd_readiness_status()
         elif args.readiness_cmd == "check":
             cmd_readiness_check()
+    elif args.command == "broker":
+        if args.broker_cmd == "account":
+            cmd_broker_account()
+        elif args.broker_cmd == "positions":
+            cmd_broker_positions()
     elif args.command == "predictions":
         if args.predictions_cmd == "enable":
             cmd_predictions_enable()
