@@ -1370,6 +1370,40 @@ def cmd_broker_positions() -> None:
         )
 
 
+def cmd_broker_reconcile() -> None:
+    """Reconcile internal open trades against the Alpaca PAPER account.
+
+    Broker is authoritative. Divergences are REPORTED only — no trade record is
+    mutated (that wiring is a later phase).
+    """
+    report = broker.reconcile(broker.AlpacaBroker())
+    print("BROKER RECONCILIATION  (broker is authoritative)")
+    print("-" * 64)
+    if not report.ok:
+        print(f"  cannot reconcile: {report.note or 'broker unavailable'}")
+        return
+    print(
+        f"  Internal open (active): {len(report.internal_symbols)}  "
+        f"{report.internal_symbols or '[]'}"
+    )
+    print(
+        f"  Broker positions:       {len(report.broker_symbols)}  "
+        f"{report.broker_symbols or '[]'}"
+    )
+    if report.broker_open_orders is not None:
+        print(f"  Broker open orders:     {report.broker_open_orders}")
+    print()
+    if not report.divergences:
+        print("  No divergences. Internal records match the broker.")
+        return
+    print(
+        f"  Divergences ({len(report.divergences)}) "
+        "— reported only, never auto-resolved:"
+    )
+    for d in report.divergences:
+        print(f"    [{d.kind}] {d.symbol or '-'}: {d.detail}")
+
+
 # ---- predictions CLI (Phase 2.2b) ----
 
 # Seeded defaults — duplicated from scanner._PRED_DEFAULTS so the CLI can
@@ -1834,6 +1868,7 @@ def main() -> None:
     broker_sub = broker_parser.add_subparsers(dest="broker_cmd", required=True)
     broker_sub.add_parser("account")
     broker_sub.add_parser("positions")
+    broker_sub.add_parser("reconcile")
 
     # predictions (Phase 2.2b)
     pred_parser = sub.add_parser("predictions")
@@ -2003,6 +2038,8 @@ def main() -> None:
             cmd_broker_account()
         elif args.broker_cmd == "positions":
             cmd_broker_positions()
+        elif args.broker_cmd == "reconcile":
+            cmd_broker_reconcile()
     elif args.command == "predictions":
         if args.predictions_cmd == "enable":
             cmd_predictions_enable()

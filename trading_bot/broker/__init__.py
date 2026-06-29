@@ -33,13 +33,22 @@ from trading_bot.broker.base import (
     Position,
     PositionsResult,
 )
+from trading_bot.broker.reconcile import (
+    Divergence,
+    ReconciliationReport,
+    compare_positions,
+    internal_open_positions,
+    reconcile,
+)
 
 __all__ = [
     "ALPACA_PAPER_BASE_URL",
     "AlpacaBroker",
+    "Divergence",
     "NEUTRAL_STATUSES",
     "ORDER_TYPE_LIMIT",
     "ORDER_TYPE_MARKET",
+    "ReconciliationReport",
     "SIDE_BUY",
     "SIDE_SELL",
     "STATUS_CANCELED",
@@ -61,4 +70,7 @@ __all__ = [
     "OrdersResult",
     "Position",
     "PositionsResult",
+    "compare_positions",
+    "internal_open_positions",
+    "reconcile",
 ]
