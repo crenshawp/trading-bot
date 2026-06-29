@@ -19,6 +19,7 @@ fail soft (``reason='ALPACA credentials unset'``) and nothing is sent.
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -29,8 +30,17 @@ import requests
 from trading_bot import secrets
 from trading_bot.broker.base import (
     ORDER_TYPE_LIMIT,
+    STATUS_CANCELED,
     STATUS_ERROR,
+    STATUS_FILLED,
+    STATUS_NEW,
+    STATUS_PARTIALLY_FILLED,
+    STATUS_REJECTED,
+    STATUS_UNKNOWN,
     TIF_DAY,
+    VALID_ORDER_TYPES,
+    VALID_SIDES,
+    VALID_TIF,
     AccountInfo,
     Broker,
     OrderResult,
@@ -44,6 +54,36 @@ from trading_bot.broker.base import (
 ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets"
 
 _HTTP_TIMEOUT_SECONDS = 10
+
+# Alpaca order lifecycle states → the neutral status set. Anything unmapped
+# becomes STATUS_UNKNOWN (a new Alpaca state we have not classified), never an
+# error — the call still succeeded.
+_NEUTRAL_STATUS_MAP: dict[str, str] = {
+    "new": STATUS_NEW,
+    "accepted": STATUS_NEW,
+    "pending_new": STATUS_NEW,
+    "accepted_for_bidding": STATUS_NEW,
+    "held": STATUS_NEW,
+    "calculated": STATUS_NEW,
+    "partially_filled": STATUS_PARTIALLY_FILLED,
+    "filled": STATUS_FILLED,
+    "done_for_day": STATUS_CANCELED,
+    "canceled": STATUS_CANCELED,
+    "expired": STATUS_CANCELED,
+    "replaced": STATUS_CANCELED,
+    "pending_cancel": STATUS_CANCELED,
+    "pending_replace": STATUS_CANCELED,
+    "stopped": STATUS_CANCELED,
+    "suspended": STATUS_CANCELED,
+    "rejected": STATUS_REJECTED,
+}
+
+
+def map_status(raw: str | None) -> str:
+    """Map an Alpaca order status onto the neutral set (STATUS_UNKNOWN if new)."""
+    if raw is None:
+        return STATUS_UNKNOWN
+    return _NEUTRAL_STATUS_MAP.get(raw.lower(), STATUS_UNKNOWN)
 
 
 def _to_float(value: Any) -> float | None:
@@ -69,6 +109,57 @@ def _parse_position(d: Mapping[str, Any]) -> Position:
         market_value=_to_float(d.get("market_value")),
         unrealized_pl=_to_float(d.get("unrealized_pl")),
     )
+
+
+def _parse_order(d: Mapping[str, Any]) -> OrderResult:
+    """Map an Alpaca order object onto the neutral ``OrderResult`` (``ok=True``
+    — the record was read successfully; its lifecycle is carried by ``status``)."""
+    raw_status = _str_or_none(d.get("status"))
+    return OrderResult(
+        ok=True,
+        status=map_status(raw_status),
+        order_id=_str_or_none(d.get("id")),
+        client_order_id=_str_or_none(d.get("client_order_id")),
+        symbol=_str_or_none(d.get("symbol")),
+        qty=_to_float(d.get("qty")),
+        filled_qty=_to_float(d.get("filled_qty")) or 0.0,
+        filled_avg_price=_to_float(d.get("filled_avg_price")),
+        side=_str_or_none(d.get("side")),
+        order_type=_str_or_none(d.get("type")),
+        time_in_force=_str_or_none(d.get("time_in_force")),
+        limit_price=_to_float(d.get("limit_price")),
+        submitted_at=_str_or_none(d.get("submitted_at")),
+        raw_status=raw_status,
+    )
+
+
+def _validate_order(
+    symbol: str, qty: float, side: str, order_type: str,
+    limit_price: float | None, time_in_force: str,
+) -> OrderResult | None:
+    """Local pre-flight validation. Returns a structured rejection (so nothing
+    is sent) or None when the order is well-formed. Catches the obvious
+    mistakes — bad side/type/tif, non-positive qty, a LIMIT order with no price
+    (the design forbids naive market orders, so LIMIT needs a price)."""
+
+    def reject(reason: str) -> OrderResult:
+        return OrderResult(
+            ok=False, status=STATUS_REJECTED, symbol=symbol, side=side,
+            order_type=order_type, qty=qty, limit_price=limit_price,
+            time_in_force=time_in_force, reason=reason,
+        )
+
+    if side not in VALID_SIDES:
+        return reject(f"invalid side {side!r}")
+    if order_type not in VALID_ORDER_TYPES:
+        return reject(f"invalid order_type {order_type!r}")
+    if time_in_force not in VALID_TIF:
+        return reject(f"invalid time_in_force {time_in_force!r}")
+    if qty <= 0:
+        return reject("qty must be positive")
+    if order_type == ORDER_TYPE_LIMIT and limit_price is None:
+        return reject("limit order requires a limit_price")
+    return None
 
 
 @dataclass(frozen=True)
@@ -212,13 +303,98 @@ class AlpacaBroker(Broker):
         time_in_force: str = TIF_DAY,
         client_order_id: str | None = None,
     ) -> OrderResult:
-        return OrderResult(ok=False, status=STATUS_ERROR, reason="not implemented")
+        # Log intent BEFORE anything is sent, so there is always a record of
+        # what was attempted even if the send fails.
+        print(
+            f"  broker: submit intent side={side} qty={qty} {symbol} "
+            f"type={order_type} limit={limit_price} tif={time_in_force}",
+            file=sys.stderr,
+        )
+        rejection = _validate_order(
+            symbol, qty, side, order_type, limit_price, time_in_force,
+        )
+        if rejection is not None:
+            print(
+                f"  broker: submit rejected locally ({rejection.reason})",
+                file=sys.stderr,
+            )
+            return rejection
+
+        body: dict[str, Any] = {
+            "symbol": symbol, "qty": str(qty), "side": side,
+            "type": order_type, "time_in_force": time_in_force,
+        }
+        if limit_price is not None:
+            body["limit_price"] = str(limit_price)
+        if client_order_id is not None:
+            body["client_order_id"] = client_order_id
+
+        resp = self._request("POST", "/v2/orders", json_body=body)
+        result = self._submit_result(resp, symbol)
+        print(
+            f"  broker: submit result status={result.status} "
+            f"order_id={result.order_id} reason={result.reason!r}",
+            file=sys.stderr,
+        )
+        return result
+
+    def _submit_result(self, resp: _Response, symbol: str) -> OrderResult:
+        """Map a submission response to an OrderResult. A 4xx is a broker
+        REJECTION (insufficient buying power, market closed, invalid symbol);
+        a 5xx / transport failure is an ERROR. Never raises."""
+        if not resp.ok:
+            return OrderResult(
+                ok=False, status=STATUS_ERROR, symbol=symbol,
+                reason=resp.error or "unavailable",
+            )
+        if self._succeeded(resp):
+            body = resp.body if isinstance(resp.body, dict) else {}
+            parsed = _parse_order(body)
+            if parsed.status == STATUS_REJECTED:
+                # A rejected order can arrive inside a 2xx body; surface its own
+                # message rather than the (misleading) "HTTP 200".
+                message = str(body.get("message", "")) if body else ""
+                return dataclasses.replace(
+                    parsed, ok=False, reason=message or "rejected",
+                )
+            return parsed
+        reason = self._error_reason(resp)
+        code = resp.status_code or 0
+        status = STATUS_REJECTED if 400 <= code < 500 else STATUS_ERROR
+        return OrderResult(
+            ok=False, status=status, symbol=symbol, reason=reason,
+        )
 
     def get_order(self, order_id: str) -> OrderResult:
-        return OrderResult(ok=False, status=STATUS_ERROR, reason="not implemented")
+        resp = self._request("GET", f"/v2/orders/{order_id}")
+        if not self._succeeded(resp):
+            reason = self._log_unavailable("order", resp)
+            return OrderResult(
+                ok=False, status=STATUS_ERROR, order_id=order_id, reason=reason,
+            )
+        body = resp.body if isinstance(resp.body, dict) else {}
+        parsed = _parse_order(body)
+        if parsed.order_id is None:
+            parsed = dataclasses.replace(parsed, order_id=order_id)
+        return parsed
 
     def cancel_order(self, order_id: str) -> OrderResult:
-        return OrderResult(ok=False, status=STATUS_ERROR, reason="not implemented")
+        # Alpaca returns 204 No Content on a successful cancel.
+        resp = self._request("DELETE", f"/v2/orders/{order_id}")
+        if not self._succeeded(resp):
+            reason = self._log_unavailable("cancel", resp)
+            return OrderResult(
+                ok=False, status=STATUS_ERROR, order_id=order_id, reason=reason,
+            )
+        return OrderResult(
+            ok=True, status=STATUS_CANCELED, order_id=order_id,
+            raw_status="canceled",
+        )
 
     def list_orders(self, status: str = "open") -> OrdersResult:
-        return OrdersResult(ok=False, reason="not implemented")
+        resp = self._request("GET", "/v2/orders", params={"status": status})
+        if not self._succeeded(resp):
+            return OrdersResult(ok=False, reason=self._log_unavailable("orders", resp))
+        rows = resp.body if isinstance(resp.body, list) else []
+        orders = [_parse_order(r) for r in rows if isinstance(r, dict)]
+        return OrdersResult(ok=True, orders=orders)
