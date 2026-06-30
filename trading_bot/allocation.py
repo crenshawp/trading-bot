@@ -343,3 +343,106 @@ def filter_reason(candidate: Candidate, pool_capital: float) -> str | None:
     if size.dollar_risk < config.MIN_DOLLAR_RISK:
         return "below_floor"
     return None
+
+
+# ── Stage 2/3: rank, then allocate top-down within each pool ─────────────────
+
+_ALLOC_EPS = 1e-9   # float tolerance so an exact-fit position still places
+
+
+def rank_candidates(eligible: list[tuple[Candidate, str]]) -> list[RankedCandidate]:
+    """Score every eligible ``(candidate, pool)`` and rank globally by composite
+    confidence (desc), tie-broken by expectancy (desc) then ticker (asc). Ranks
+    are 1-based and assigned across ALL pools; allocation then walks each pool in
+    this order."""
+    scored = [(c, pool, composite_confidence(c)) for c, pool in eligible]
+    scored.sort(
+        key=lambda t: (
+            -t[2].score,
+            -(t[0].expectancy if t[0].expectancy is not None else -1e9),
+            t[0].ticker,
+        )
+    )
+    return [
+        RankedCandidate(candidate=c, pool=pool, score=cs.score, tier=cs.tier, rank=i)
+        for i, (c, pool, cs) in enumerate(scored, start=1)
+    ]
+
+
+def allocate(
+    ranked: list[RankedCandidate],
+    pool_caps: dict[str, tuple[float, float]],
+) -> tuple[list[PlannedOrder], list[SkippedSignal], list[PoolAccounting]]:
+    """Assign capital top-down by rank WITHIN each pool. Returns the planned
+    orders (rank-ordered), the skipped list, and per-pool accounting.
+
+    Each pool starts with ``(capital, cash)``. A candidate is sized via Phase 7
+    against the pool's CAPITAL (so risk fraction and the per-position cap scale to
+    the pool). It is placed only if both hold:
+
+    * the tier deployment ceiling — ``capital × 50%`` for HIGH, ``× 30%`` for
+      NORMAL — is not exceeded by the running deployed total, AND
+    * the position cost fits the pool's remaining cash.
+
+    A candidate that cannot be placed is SKIPPED (``capital-exhausted: …``),
+    NEVER undersized — shrinking a position would break the Phase 7 risk math.
+    """
+    orders: list[PlannedOrder] = []
+    skipped: list[SkippedSignal] = []
+    pools_acct: list[PoolAccounting] = []
+
+    for pool in config.POOLS:
+        capital, cash = pool_caps.get(pool, (0.0, 0.0))
+        deployed = 0.0
+        cash_remaining = cash
+        placed = 0
+
+        for rc in [r for r in ranked if r.pool == pool]:   # already rank-ordered
+            c = rc.candidate
+            size = risk.position_size(c.entry, c.atr, account=capital)
+            pv = size.position_value
+            dollar_risk = size.dollar_risk
+            qty = size.recommended_size
+            if not size.ok or pv is None or dollar_risk is None or qty is None:
+                skipped.append(SkippedSignal(
+                    c.ticker, c.signal_type, pool, "allocate", "unsizeable",
+                ))
+                continue
+
+            cap_frac = (
+                config.POOL_DEPLOY_CAP_HIGH if rc.tier == TIER_HIGH
+                else config.POOL_DEPLOY_CAP_NORMAL
+            )
+            ceiling = capital * cap_frac
+            if deployed + pv > ceiling + _ALLOC_EPS:
+                skipped.append(SkippedSignal(
+                    c.ticker, c.signal_type, pool, "allocate",
+                    f"capital-exhausted: {rc.tier} deploy cap "
+                    f"({cap_frac:.0%} of pool)",
+                ))
+                continue
+            if pv > cash_remaining + _ALLOC_EPS:
+                skipped.append(SkippedSignal(
+                    c.ticker, c.signal_type, pool, "allocate",
+                    "capital-exhausted: pool cash",
+                ))
+                continue
+
+            orders.append(PlannedOrder(
+                rank=rc.rank, pool=pool, tier=rc.tier, ticker=c.ticker,
+                signal_type=c.signal_type,
+                side="buy" if _is_long(c.direction) else "sell",
+                qty=qty, entry=c.entry, est_cost=pv, dollar_risk=dollar_risk,
+                score=rc.score,
+            ))
+            deployed += pv
+            cash_remaining -= pv
+            placed += 1
+
+        pools_acct.append(PoolAccounting(
+            pool=pool, capital=capital, cash=cash, deployed=deployed,
+            cash_remaining=cash_remaining, orders=placed,
+        ))
+
+    orders.sort(key=lambda o: o.rank)
+    return orders, skipped, pools_acct
