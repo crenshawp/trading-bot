@@ -29,6 +29,7 @@ yields an empty plan with a logged reason; it never raises.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 
 from trading_bot import config, risk
@@ -446,3 +447,75 @@ def allocate(
 
     orders.sort(key=lambda o: o.rank)
     return orders, skipped, pools_acct
+
+
+# ── Stage 4: emit the plan (NO EXECUTION) ────────────────────────────────────
+
+
+def build_plan(
+    candidates: list[Candidate],
+    account: AccountInfo,
+    *,
+    split: dict[str, float] | None = None,
+) -> AllocationResult:
+    """Run the four-stage pipeline and EMIT an :class:`AllocationResult`.
+
+    FILTER → RANK → ALLOCATE → PLAN. The returned plan is a pure data structure;
+    this function NEVER calls ``broker.submit_order`` or otherwise executes —
+    wiring the plan to the broker is deliberately deferred to a later phase until
+    the allocation logic is proven (a test asserts zero submissions occur in this
+    path).
+
+    Fail-soft: if the paper account cannot be read (``account.ok`` False or no
+    usable balances), an empty plan is returned with ``ok=False`` and a logged
+    reason; every candidate is recorded as skipped (``account-unavailable``) so
+    nothing is silently lost.
+    """
+    caps = pool_capitals(account, split=split)
+    if caps is None:
+        reason = account.reason or "account unavailable"
+        print(
+            f"  allocate: account unavailable - empty plan ({reason})",
+            file=sys.stderr,
+        )
+        skipped = [
+            SkippedSignal(
+                c.ticker, c.signal_type, route_pool(c), "account",
+                "account-unavailable",
+            )
+            for c in candidates
+        ]
+        return AllocationResult(
+            ok=False, plan=ExecutionPlan(), skipped=skipped, pools=[],
+            note=f"account unavailable: {reason}",
+        )
+
+    # Stage 1 — FILTER (hard eligibility gates, with logged drop reasons).
+    eligible: list[tuple[Candidate, str]] = []
+    skipped = []
+    for c in candidates:
+        pool = route_pool(c)
+        drop_reason = filter_reason(c, caps[pool][0])
+        if drop_reason is not None:
+            print(
+                f"  allocate: drop {c.ticker}/{c.signal_type} ({drop_reason})",
+                file=sys.stderr,
+            )
+            skipped.append(
+                SkippedSignal(c.ticker, c.signal_type, pool, "filter", drop_reason)
+            )
+        else:
+            eligible.append((c, pool))
+
+    # Stage 2 — RANK by composite confidence.
+    ranked = rank_candidates(eligible)
+
+    # Stage 3 — ALLOCATE top-down within each pool.
+    orders, alloc_skipped, pools_acct = allocate(ranked, caps)
+    skipped.extend(alloc_skipped)
+
+    # Stage 4 — PLAN. Return the data structure; execute NOTHING.
+    return AllocationResult(
+        ok=True, plan=ExecutionPlan(orders=orders), skipped=skipped,
+        pools=pools_acct, note="",
+    )
