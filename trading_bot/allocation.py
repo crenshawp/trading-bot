@@ -519,3 +519,51 @@ def build_plan(
         ok=True, plan=ExecutionPlan(orders=orders), skipped=skipped,
         pools=pools_acct, note="",
     )
+
+
+def sample_candidates() -> list[Candidate]:
+    """A small, DOCUMENTED illustrative candidate set for plan inspection.
+
+    Phase 12 does not persist the live "currently firing" signal set, so the
+    ``allocate plan`` CLI runs the pipeline against this representative sample
+    (clearly labelled in the output) while reading the REAL paper account. It
+    spans both pools, several tiers, and an ineligible name so the plan and the
+    skipped list both have content. Replacing this with a live signal gatherer is
+    a later phase.
+    """
+    return [
+        Candidate(
+            ticker="META", signal_type="ema21_pullback", direction="call",
+            asset_class="stock", entry=480.0, atr=8.0, expectancy=0.9,
+            adx=27.0, rsi=52.0, obv=1_200_000.0, vol_regime="low",
+            sentiment_score=0.4,
+        ),
+        Candidate(
+            ticker="GOOGL", signal_type="ema21_pullback", direction="call",
+            asset_class="stock", entry=175.0, atr=3.0, expectancy=0.3,
+            adx=22.0, rsi=55.0, obv=500_000.0, vol_regime="normal",
+            sentiment_score=0.1,
+        ),
+        Candidate(
+            ticker="BLK", signal_type="ema21_pullback", direction="call",
+            asset_class="stock", entry=820.0, atr=12.0, expectancy=-0.2,
+            adx=15.0, rsi=68.0, obv=-200_000.0, vol_regime="high",
+            sentiment_score=-0.3,
+        ),
+        Candidate(
+            ticker="NVDA", signal_type="ema21_pullback", direction="call",
+            asset_class="stock", entry=120.0, atr=4.0, ticker_active=False,
+        ),
+        Candidate(
+            ticker="BTC-USD", signal_type="momentum_breakout", direction="long",
+            asset_class="crypto", entry=64_000.0, atr=1_500.0, expectancy=0.6,
+            adx=24.0, rsi=58.0, obv=30_000.0, vol_regime="normal",
+            sentiment_score=0.2,
+        ),
+        Candidate(
+            ticker="ETH-USD", signal_type="oversold_reversal", direction="long",
+            asset_class="crypto", entry=3_400.0, atr=90.0, expectancy=0.5,
+            adx=21.0, rsi=35.0, obv=10_000.0, vol_regime="low",
+            sentiment_score=0.0,
+        ),
+    ]

@@ -7,6 +7,7 @@ import sys
 from datetime import date
 
 from trading_bot import (
+    allocation,
     broker,
     config,
     context,
@@ -1404,6 +1405,64 @@ def cmd_broker_reconcile() -> None:
         print(f"    [{d.kind}] {d.symbol or '-'}: {d.detail}")
 
 
+# ---- allocate CLI (Phase 12) — PLAN ONLY, executes nothing ----
+
+
+def cmd_allocate_plan() -> None:
+    """Run the four-stage allocator against live PAPER account state and print
+    the inspectable execution plan. EXECUTES NOTHING — no order is submitted."""
+    account = broker.AlpacaBroker().get_account()
+    candidates = allocation.sample_candidates()
+    result = allocation.build_plan(candidates, account)
+
+    print("ALLOCATION PLAN  (Phase 12 - PLAN ONLY, executes nothing)")
+    print("-" * 84)
+    print(f"  Candidates: {len(candidates)} (illustrative SAMPLE set)")
+    if not result.ok:
+        print(f"  {result.note}")
+
+    print()
+    print("  Pools:")
+    for p in result.pools:
+        print(
+            f"    {p.pool:<10} capital={_fmt_money(p.capital):>12} "
+            f"cash={_fmt_money(p.cash):>12} deployed={_fmt_money(p.deployed):>12} "
+            f"orders={p.orders}"
+        )
+
+    print()
+    print(
+        f"  Plan: {len(result.plan.orders)} orders, "
+        f"est cost {_fmt_money(result.plan.total_est_cost)}, "
+        f"$risk {_fmt_money(result.plan.total_dollar_risk)}"
+    )
+    if not result.plan.orders:
+        print("    (no orders)")
+    else:
+        print(
+            f"    {'#':>2} {'Pool':<10} {'Tier':<6} {'Ticker':<8} {'Signal':<18} "
+            f"{'Side':<4} {'Qty':>11} {'Est cost':>12} {'$risk':>8} {'Score':>6}"
+        )
+        for o in result.plan.orders:
+            print(
+                f"    {o.rank:>2} {o.pool:<10} {o.tier:<6} {o.ticker:<8} "
+                f"{o.signal_type:<18} {o.side:<4} {o.qty:>11.4f} "
+                f"{_fmt_money(o.est_cost):>12} {_fmt_money(o.dollar_risk):>8} "
+                f"{o.score:>6.3f}"
+            )
+
+    print()
+    print(f"  Skipped ({len(result.skipped)}):")
+    if not result.skipped:
+        print("    (none)")
+    else:
+        for s in result.skipped:
+            print(f"    {s.ticker:<8} {s.signal_type:<18} [{s.stage}] {s.reason}")
+
+    print()
+    print("  NOTE: this is a PLAN only - no orders were submitted.")
+
+
 # ---- predictions CLI (Phase 2.2b) ----
 
 # Seeded defaults — duplicated from scanner._PRED_DEFAULTS so the CLI can
@@ -1870,6 +1929,11 @@ def main() -> None:
     broker_sub.add_parser("positions")
     broker_sub.add_parser("reconcile")
 
+    # allocate (Phase 12) — PLAN ONLY, executes nothing
+    allocate_parser = sub.add_parser("allocate")
+    allocate_sub = allocate_parser.add_subparsers(dest="allocate_cmd", required=True)
+    allocate_sub.add_parser("plan")
+
     # predictions (Phase 2.2b)
     pred_parser = sub.add_parser("predictions")
     pred_sub = pred_parser.add_subparsers(dest="predictions_cmd", required=True)
@@ -2040,6 +2104,9 @@ def main() -> None:
             cmd_broker_positions()
         elif args.broker_cmd == "reconcile":
             cmd_broker_reconcile()
+    elif args.command == "allocate":
+        if args.allocate_cmd == "plan":
+            cmd_allocate_plan()
     elif args.command == "predictions":
         if args.predictions_cmd == "enable":
             cmd_predictions_enable()
