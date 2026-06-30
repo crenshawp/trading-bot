@@ -31,8 +31,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from trading_bot import config
+from trading_bot import config, risk
 from trading_bot.broker.base import AccountInfo
+
+TIER_HIGH = "HIGH"
+TIER_NORMAL = "NORMAL"
 
 
 @dataclass(frozen=True)
@@ -214,3 +217,129 @@ def pool_capitals(
         pool: (cap_base * weights.get(pool, 0.0), cash_base * weights.get(pool, 0.0))
         for pool in config.POOLS
     }
+
+
+# ── Stage 2 inputs: composite confidence (documented, auditable, tunable) ────
+
+
+def _is_long(direction: str) -> bool:
+    return direction in ("call", "long")
+
+
+# vol_regime → confidence contribution: low vol is a cleaner signal than high.
+_VOL_TERMS: dict[str, float] = {"low": 1.0, "normal": 0.0, "high": -1.0, "unknown": 0.0}
+
+
+def indicator_agreement(candidate: Candidate) -> int:
+    """Phase 6 indicator-family AGREEMENT count in ``{0,1,2,3}``.
+
+    Counts how many of three independent directional families CONFIRM the trade,
+    oriented by side (vol_regime is excluded — it is its own composite factor, so
+    counting it here would double-weight it):
+
+    * trend strength — ADX ≥ ``CONF_ADX_TREND_MIN`` (a trustworthy trend exists;
+      direction-agnostic);
+    * momentum — RSI is not stretched against the trade (long: below overbought;
+      short: above oversold);
+    * volume flow — OBV confirms the side (long: positive; short: negative).
+
+    A family whose reading is missing simply does not contribute.
+    """
+    agree = 0
+    long = _is_long(candidate.direction)
+    if candidate.adx is not None and candidate.adx >= config.CONF_ADX_TREND_MIN:
+        agree += 1
+    if candidate.rsi is not None and (
+        (long and candidate.rsi < config.CONF_RSI_OVERBOUGHT)
+        or (not long and candidate.rsi > config.CONF_RSI_OVERSOLD)
+    ):
+        agree += 1
+    if candidate.obv is not None and (
+        (long and candidate.obv > 0.0) or (not long and candidate.obv < 0.0)
+    ):
+        agree += 1
+    return agree
+
+
+def composite_confidence(candidate: Candidate) -> ConfidenceScore:
+    """The single documented composite-confidence function.
+
+    ``score = W_E·e + W_A·a + W_S·s + W_V·v`` with documented weights summing to
+    1.0 (per-pair expectancy PRIMARY):
+
+    * ``e`` — expectancy term: ``clamp(expectancy / CONF_EXPECTANCY_REF, -1, 1)``
+      (None → 0). Primary factor, weight ``CONF_WEIGHT_EXPECTANCY``.
+    * ``a`` — indicator agreement (0-3) scaled to ``[0,1]`` (``agreement/3``),
+      weight ``CONF_WEIGHT_AGREEMENT``.
+    * ``s`` — sentiment in ``[-1,1]`` (None → 0), SIGN-FLIPPED for short signals
+      (bullish news is unfavorable to a short), weight ``CONF_WEIGHT_SENTIMENT``.
+    * ``v`` — vol_regime term (low +1 / normal 0 / high -1 / unknown 0), weight
+      ``CONF_WEIGHT_VOL``.
+
+    Tier is HIGH only when the STRONGEST factors clear their bars AND the total
+    clears the score gate: ``expectancy ≥ CONF_HIGH_EXPECTANCY`` AND
+    ``agreement ≥ CONF_HIGH_AGREEMENT`` AND ``score ≥ CONF_HIGH_SCORE``; else
+    NORMAL. Pure and fully hand-computable — no magic.
+    """
+    expectancy = candidate.expectancy
+    if expectancy is None:
+        e_term = 0.0
+    else:
+        e_term = max(-1.0, min(1.0, expectancy / config.CONF_EXPECTANCY_REF))
+
+    agreement = indicator_agreement(candidate)
+    a_term = agreement / 3.0
+
+    sentiment = 0.0 if candidate.sentiment_score is None else candidate.sentiment_score
+    s_term = sentiment if _is_long(candidate.direction) else -sentiment
+
+    v_term = _VOL_TERMS.get(candidate.vol_regime, 0.0)
+
+    score = (
+        config.CONF_WEIGHT_EXPECTANCY * e_term
+        + config.CONF_WEIGHT_AGREEMENT * a_term
+        + config.CONF_WEIGHT_SENTIMENT * s_term
+        + config.CONF_WEIGHT_VOL * v_term
+    )
+
+    is_high = (
+        expectancy is not None
+        and expectancy >= config.CONF_HIGH_EXPECTANCY
+        and agreement >= config.CONF_HIGH_AGREEMENT
+        and score >= config.CONF_HIGH_SCORE
+    )
+    return ConfidenceScore(
+        score=score,
+        tier=TIER_HIGH if is_high else TIER_NORMAL,
+        expectancy_term=e_term,
+        agreement=agreement,
+        agreement_term=a_term,
+        sentiment_term=s_term,
+        vol_term=v_term,
+    )
+
+
+# ── Stage 1: hard eligibility filter ─────────────────────────────────────────
+
+
+def filter_reason(candidate: Candidate, pool_capital: float) -> str | None:
+    """Return a drop reason if ``candidate`` is ineligible, else None.
+
+    Hard gates, in order: ticker must be active, its (ticker, signal) pair must
+    be enabled, no earnings blackout, and the volatility-normalized size must put
+    at least ``MIN_DOLLAR_RISK`` at risk against the pool's capital (a signal with
+    no usable ATR is ``unsizeable``; one whose risk falls below the floor is
+    ``below_floor``). Never raises — sizing is fail-soft.
+    """
+    if not candidate.ticker_active:
+        return "ticker_inactive"
+    if not candidate.pair_enabled:
+        return "pair_muted"
+    if candidate.earnings_blackout:
+        return "earnings_blackout"
+    size = risk.position_size(candidate.entry, candidate.atr, account=pool_capital)
+    if not size.ok or size.dollar_risk is None:
+        return "unsizeable"
+    if size.dollar_risk < config.MIN_DOLLAR_RISK:
+        return "below_floor"
+    return None
