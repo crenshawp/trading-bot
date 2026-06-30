@@ -136,3 +136,51 @@ MIN_SHADOW_SIGNALS: int = 10
 # Crossing one only SUMMONS a human build; no model trains or deploys itself.
 ML_PATTERN_MIN_SAMPLE: int = 500    # ml_pattern_recognition: ready-to-build gate
 ML_SIZING_MIN_SAMPLE: int = 750     # ml_predictive_sizing: ready-to-build gate
+
+# ──────────────────────────────────────────────────────────────────────────
+# Capital allocation engine (Phase 12) — PLAN-ONLY, paper account state
+# ──────────────────────────────────────────────────────────────────────────
+# The allocator turns simultaneously-firing signals into an ordered execution
+# PLAN; it never executes. Deployment caps are on DEPLOYED CAPITAL per pool, by
+# confidence tier — HIGH-confidence signals may use up to 50% of a pool's
+# capital, all others up to 30%. Position COUNT is an emergent output, not a cap.
+POOL_DEPLOY_CAP_HIGH: float = 0.50      # HIGH-tier deployed-capital ceiling / pool
+POOL_DEPLOY_CAP_NORMAL: float = 0.30    # NORMAL-tier deployed-capital ceiling / pool
+# A position whose volatility-normalized size puts less than this many dollars at
+# risk is SKIPPED, never undersized (undersizing breaks the Phase 7 risk math).
+MIN_DOLLAR_RISK: float = 10.0
+
+# Three logical pools tracked independently against one paper account's capital.
+# LONG_TERM is reserved (buy-hold); no signal type routes to it yet this phase.
+POOL_SWING = "SWING"
+POOL_LONG_TERM = "LONG_TERM"
+POOL_CRYPTO = "CRYPTO"
+POOLS: tuple[str, ...] = (POOL_SWING, POOL_LONG_TERM, POOL_CRYPTO)
+# Notional split of the account's capital across the pools (sums to 1.0). The
+# default reserves the LONG_TERM slice for a later phase; tune freely.
+POOL_CAPITAL_SPLIT: dict[str, float] = {
+    POOL_SWING: 0.50, POOL_LONG_TERM: 0.30, POOL_CRYPTO: 0.20,
+}
+# Route a signal to its pool by signal_type (fallback: asset_class → stock=SWING,
+# crypto=CRYPTO). LONG_TERM has no automatic routing yet.
+SIGNAL_TYPE_TO_POOL: dict[str, str] = {
+    "ema21_pullback": POOL_SWING,
+    "oversold_reversal": POOL_CRYPTO,
+    "momentum_breakout": POOL_CRYPTO,
+}
+
+# Composite confidence weights (sum 1.0; per-pair expectancy is PRIMARY). The
+# formula lives in one documented function (allocation.composite_confidence) so
+# it stays auditable and tunable later (Phase 9/17), never magic.
+CONF_WEIGHT_EXPECTANCY: float = 0.50    # primary: per-pair windowed expectancy
+CONF_WEIGHT_AGREEMENT: float = 0.25     # Phase 6 indicator-family agreement (0-3)
+CONF_WEIGHT_SENTIMENT: float = 0.15     # Phase 5 advisory sentiment (-1..+1)
+CONF_WEIGHT_VOL: float = 0.10           # vol_regime (low cleaner than high)
+CONF_EXPECTANCY_REF: float = 1.0        # expectancy % mapping to a full 1.0 term
+CONF_ADX_TREND_MIN: float = 20.0        # ADX >= this == a trustworthy trend
+CONF_RSI_OVERBOUGHT: float = 70.0       # long not-confirmed above this
+CONF_RSI_OVERSOLD: float = 30.0         # short not-confirmed below this
+# HIGH tier requires the STRONGEST factors to clear these AND the score gate.
+CONF_HIGH_EXPECTANCY: float = 0.50
+CONF_HIGH_AGREEMENT: int = 2
+CONF_HIGH_SCORE: float = 0.50
