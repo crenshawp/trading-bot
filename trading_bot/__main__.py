@@ -1463,6 +1463,114 @@ def cmd_allocate_plan() -> None:
     print("  NOTE: this is a PLAN only - no orders were submitted.")
 
 
+# ---- options CLI (Phase 13) ----
+
+
+def _pass(flag: bool) -> str:
+    return "ok " if flag else "-- "
+
+
+def cmd_options_chain(ticker: str) -> None:
+    """Show the current option chain with per-contract delta / liquidity / DTE
+    floor pass-fail marks (the same gates the selector applies)."""
+    chain = broker.AlpacaOptionsClient().get_option_chain(ticker)
+    print(f"OPTIONS CHAIN  ({ticker}, Alpaca paper)")
+    print("-" * 104)
+    if not chain.ok:
+        print(f"  unavailable: {chain.reason}")
+        return
+    today = date.today()
+    print(
+        f"  {'Symbol':<22} {'Type':<4} {'Strike':>8} {'Expiry':<11} {'DTE':>4} "
+        f"{'Delta':>6} {'OI':>7} {'Spr%':>6}  {'dlt':<3} {'dte':<3} {'liq':<3}"
+    )
+    for c in chain.contracts:
+        try:
+            dte: int | None = (date.fromisoformat(c.expiry) - today).days
+        except ValueError:
+            dte = None
+        delta_ok = (
+            c.delta is not None
+            and config.TARGET_DELTA_LOW <= abs(c.delta) <= config.TARGET_DELTA_HIGH
+        )
+        dte_ok = dte is not None and dte >= config.MIN_DTE
+        liq_ok = (
+            c.open_interest is not None
+            and c.open_interest >= config.MIN_OPEN_INTEREST
+            and c.spread_pct is not None
+            and c.spread_pct <= config.MAX_SPREAD_PCT
+        )
+        print(
+            f"  {c.symbol:<22} {c.option_type:<4} {c.strike:>8.2f} {c.expiry:<11} "
+            f"{('-' if dte is None else dte):>4} "
+            f"{('-' if c.delta is None else f'{c.delta:+.2f}'):>6} "
+            f"{('-' if c.open_interest is None else c.open_interest):>7} "
+            f"{('-' if c.spread_pct is None else f'{c.spread_pct:.1f}'):>6}  "
+            f"{_pass(delta_ok)} {_pass(dte_ok)} {_pass(liq_ok)}"
+        )
+
+
+def _option_price_map(positions: list[object]) -> dict[str, float]:
+    """Best-effort current option mids by symbol (fail-soft, one chain/underlying)."""
+    price_map: dict[str, float] = {}
+    client = broker.AlpacaOptionsClient()
+    underlyings = sorted({str(getattr(p, "underlying")) for p in positions})  # noqa: B009
+    for underlying in underlyings:
+        chain = client.get_option_chain(underlying)
+        if not chain.ok:
+            continue
+        for c in chain.contracts:
+            if c.mid is not None:
+                price_map[c.symbol] = c.mid
+    return price_map
+
+
+def cmd_options_positions() -> None:
+    """Open option positions with current (best-effort) P&L, cost basis, and
+    TP/SL/deadline status. Contract-aware dollars — distinct from equity."""
+    positions = db.get_open_option_positions()
+    print("OPEN OPTION POSITIONS")
+    print("-" * 104)
+    if not positions:
+        print("  (none)")
+        return
+    prices = _option_price_map(list(positions))
+    today = date.today()
+    print(
+        f"  {'Symbol':<22} {'Und':<6} {'Ctr':>4} {'Entry':>7} {'Cur':>7} "
+        f"{'Cost':>10} {'P&L$':>10} {'TP':>7} {'SL':>7} {'DtDl':>5}"
+    )
+    total_cost = 0.0
+    total_pnl = 0.0
+    for p in positions:
+        entry = p.premium_entry
+        cost = (entry or 0.0) * p.multiplier * p.contracts
+        total_cost += cost
+        cur = prices.get(p.symbol)
+        pnl = (
+            (cur - entry) * p.multiplier * p.contracts
+            if cur is not None and entry is not None else None
+        )
+        if pnl is not None:
+            total_pnl += pnl
+        try:
+            dtd: int | None = (date.fromisoformat(p.expiry) - today).days
+        except ValueError:
+            dtd = None
+        print(
+            f"  {p.symbol:<22} {p.underlying:<6} {p.contracts:>4.0f} "
+            f"{_fmt_money(entry):>7} {_fmt_money(cur):>7} "
+            f"{_fmt_money(cost):>10} {_fmt_money(pnl):>10} "
+            f"{_fmt_money(p.tp):>7} {_fmt_money(p.sl):>7} "
+            f"{('-' if dtd is None else dtd):>5}"
+        )
+    print("-" * 104)
+    print(
+        f"  Open: {len(positions)}   cost basis {_fmt_money(total_cost)}   "
+        f"unrealized P&L {_fmt_money(total_pnl)}"
+    )
+
+
 # ---- predictions CLI (Phase 2.2b) ----
 
 # Seeded defaults — duplicated from scanner._PRED_DEFAULTS so the CLI can
@@ -1934,6 +2042,13 @@ def main() -> None:
     allocate_sub = allocate_parser.add_subparsers(dest="allocate_cmd", required=True)
     allocate_sub.add_parser("plan")
 
+    # options (Phase 13) — single-leg, PAPER
+    options_parser = sub.add_parser("options")
+    options_sub = options_parser.add_subparsers(dest="options_cmd", required=True)
+    opt_chain_p = options_sub.add_parser("chain")
+    opt_chain_p.add_argument("ticker", help="Underlying ticker, e.g. AAPL")
+    options_sub.add_parser("positions")
+
     # predictions (Phase 2.2b)
     pred_parser = sub.add_parser("predictions")
     pred_sub = pred_parser.add_subparsers(dest="predictions_cmd", required=True)
@@ -2107,6 +2222,11 @@ def main() -> None:
     elif args.command == "allocate":
         if args.allocate_cmd == "plan":
             cmd_allocate_plan()
+    elif args.command == "options":
+        if args.options_cmd == "chain":
+            cmd_options_chain(args.ticker)
+        elif args.options_cmd == "positions":
+            cmd_options_positions()
     elif args.command == "predictions":
         if args.predictions_cmd == "enable":
             cmd_predictions_enable()
