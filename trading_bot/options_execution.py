@@ -17,7 +17,9 @@ bracket/OTO for options, so exits are managed explicitly (Section 6).
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import date
 
 from trading_bot import config
@@ -26,6 +28,11 @@ from trading_bot.broker.options import (
     OPTION_TYPE_PUT,
     OptionContract,
 )
+
+VEHICLE_OPTION_FULL = "option_full"
+VEHICLE_OPTION_UNDERSIZED = "option_undersized"
+VEHICLE_SHARES = "shares"
+VEHICLE_NONE = "none"
 
 
 def _dte(expiry: str, ref_date: date) -> int | None:
@@ -89,3 +96,158 @@ def select_contract(
     if not qualifying:
         return None
     return min(qualifying, key=lambda t: abs(t[0] - centre))[1]
+
+
+# ── cost model (every calc routes through OPTION_MULTIPLIER) ──────────────────
+
+
+def _premium(contract: OptionContract) -> float | None:
+    """The per-share premium to size against: prefer mid, then ask, then bid."""
+    for price in (contract.mid, contract.ask, contract.bid):
+        if price is not None and price > 0.0:
+            return price
+    return None
+
+
+def cost_for_contract(contract: OptionContract, qty: float) -> float | None:
+    """Total premium outlay = ``premium × OPTION_MULTIPLIER × qty``.
+
+    EVERY options cost calculation routes through this so the 100-share
+    multiplier is applied in exactly one place — the single most common options
+    bug. Returns None when the contract has no usable premium.
+    """
+    premium = _premium(contract)
+    if premium is None:
+        return None
+    return premium * config.OPTION_MULTIPLIER * qty
+
+
+# ── execution hierarchy: full option → undersized option → shares ────────────
+
+
+@dataclass(frozen=True)
+class ExecutionDecision:
+    """The chosen execution vehicle for one allocated swing candidate.
+
+    ``vehicle`` is one of ``option_full`` / ``option_undersized`` / ``shares`` /
+    ``none``. ``side`` is the ORDER side (options are always bought — buy call /
+    buy put; the share fallback buys for a bullish signal, sells for a bearish
+    one). ``qty`` is whole contracts for options (never fractional) or fractional
+    shares for the fallback. ``dollar_risk`` is the premium at risk (== est_cost
+    for a long option; the share cost for the fallback)."""
+
+    vehicle: str
+    side: str
+    symbol: str
+    qty: float
+    est_cost: float
+    dollar_risk: float
+    contract: OptionContract | None
+    reason: str
+
+
+def _bullish(direction: str) -> bool:
+    return direction in ("call", "long")
+
+
+def _size_option(
+    contract: OptionContract | None,
+    allocated_capital: float,
+    vehicle: str,
+    min_dollar_risk: float,
+) -> ExecutionDecision | None:
+    """Size a selected contract to WHOLE contracts within the allocated capital.
+
+    Returns None (so the caller tries the next tier) when there is no contract,
+    no usable premium, not even one whole contract fits the capital, or the
+    resulting outlay is below the dollar-risk floor. NEVER a fractional contract.
+    """
+    if contract is None:
+        return None
+    premium = _premium(contract)
+    if premium is None:
+        return None
+    per_contract = premium * config.OPTION_MULTIPLIER
+    qty = int(allocated_capital // per_contract)   # floor to whole contracts
+    if qty < 1:
+        return None
+    est_cost = per_contract * qty
+    if est_cost < min_dollar_risk:
+        return None
+    return ExecutionDecision(
+        vehicle=vehicle, side="buy", symbol=contract.symbol, qty=float(qty),
+        est_cost=est_cost, dollar_risk=est_cost, contract=contract, reason="ok",
+    )
+
+
+def _shares_decision(
+    direction: str, underlying: str, underlying_price: float | None,
+    allocated_capital: float,
+) -> ExecutionDecision:
+    """Fractional-share fallback via the existing Phase 11 equity order path."""
+    side = "buy" if _bullish(direction) else "sell"
+    if underlying_price is None or underlying_price <= 0.0:
+        return ExecutionDecision(
+            vehicle=VEHICLE_NONE, side=side, symbol=underlying, qty=0.0,
+            est_cost=0.0, dollar_risk=0.0, contract=None,
+            reason="shares fallback unsizeable: no underlying price",
+        )
+    qty = allocated_capital / underlying_price      # fractional shares are fine
+    est_cost = qty * underlying_price
+    return ExecutionDecision(
+        vehicle=VEHICLE_SHARES, side=side, symbol=underlying, qty=qty,
+        est_cost=est_cost, dollar_risk=est_cost, contract=None, reason="ok",
+    )
+
+
+def choose_execution(
+    direction: str,
+    allocated_capital: float,
+    underlying: str,
+    underlying_price: float | None,
+    contracts: Sequence[OptionContract],
+    *,
+    ref_date: date,
+    options_available: bool = True,
+    min_dollar_risk: float = config.MIN_DOLLAR_RISK,
+) -> ExecutionDecision:
+    """Pick the execution vehicle for an allocated swing candidate.
+
+    Hierarchy: (1) a FULL-band option sized to whole contracts that fits the
+    capital; else (2) an UNDERSIZED option (delta band widened to the floor);
+    else (3) fractional shares. Options are skipped entirely (straight to shares)
+    when they are unavailable (not enabled, or an empty chain). Every fallback
+    step is logged with its reason.
+    """
+    if options_available and contracts:
+        full = select_contract(direction, contracts, ref_date=ref_date)
+        decision = _size_option(
+            full, allocated_capital, VEHICLE_OPTION_FULL, min_dollar_risk,
+        )
+        if decision is not None:
+            return decision
+        print(
+            f"  options: no full-band fit for {underlying} -> trying undersized",
+            file=sys.stderr,
+        )
+        under = select_contract(
+            direction, contracts, ref_date=ref_date,
+            delta_low=config.UNDERSIZED_DELTA_FLOOR,
+        )
+        decision = _size_option(
+            under, allocated_capital, VEHICLE_OPTION_UNDERSIZED, min_dollar_risk,
+        )
+        if decision is not None:
+            return decision
+        print(
+            f"  options: no undersized fit for {underlying} -> shares fallback",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"  options: unavailable for {underlying} -> shares fallback",
+            file=sys.stderr,
+        )
+    return _shares_decision(
+        direction, underlying, underlying_price, allocated_capital,
+    )
