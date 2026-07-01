@@ -100,6 +100,16 @@ def _str_or_none(value: Any) -> str | None:
     return str(value) if value is not None else None
 
 
+def _to_int(value: Any) -> int | None:
+    """Coerce a value to int; None on absent/garbage (options level, etc.)."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _parse_position(d: Mapping[str, Any]) -> Position:
     return Position(
         symbol=str(d.get("symbol", "")),
@@ -278,6 +288,7 @@ class AlpacaBroker(Broker):
             equity=_to_float(body.get("equity")),
             currency=str(body.get("currency", "USD")),
             status=_str_or_none(body.get("status")),
+            options_trading_level=_to_int(body.get("options_trading_level")),
         )
 
     def get_positions(self) -> PositionsResult:

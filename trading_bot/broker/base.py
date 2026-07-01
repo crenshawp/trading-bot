@@ -71,6 +71,9 @@ class AccountInfo:
     equity: float | None = None
     currency: str = "USD"
     status: str | None = None       # broker account status, e.g. 'ACTIVE'
+    # Phase 13: Alpaca options approval level (0 = options not enabled). None when
+    # the field was absent; the options layer fails soft to shares on 0/None.
+    options_trading_level: int | None = None
 
 
 @dataclass(frozen=True)

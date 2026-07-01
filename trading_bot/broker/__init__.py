@@ -34,9 +34,12 @@ from trading_bot.broker.base import (
     PositionsResult,
 )
 from trading_bot.broker.options import (
+    ALPACA_OPTIONS_DATA_BASE_URL,
     OPTION_TYPE_CALL,
     OPTION_TYPE_PUT,
     VALID_OPTION_TYPES,
+    AlpacaOptionsClient,
+    OptionChainResult,
     OptionContract,
     occ_symbol,
     parse_occ_symbol,
@@ -50,10 +53,13 @@ from trading_bot.broker.reconcile import (
 )
 
 __all__ = [
+    "ALPACA_OPTIONS_DATA_BASE_URL",
     "ALPACA_PAPER_BASE_URL",
     "AlpacaBroker",
+    "AlpacaOptionsClient",
     "Divergence",
     "NEUTRAL_STATUSES",
+    "OptionChainResult",
     "OPTION_TYPE_CALL",
     "OPTION_TYPE_PUT",
     "ORDER_TYPE_LIMIT",
