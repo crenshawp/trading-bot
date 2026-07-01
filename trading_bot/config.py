@@ -184,3 +184,22 @@ CONF_RSI_OVERSOLD: float = 30.0         # short not-confirmed below this
 CONF_HIGH_EXPECTANCY: float = 0.50
 CONF_HIGH_AGREEMENT: int = 2
 CONF_HIGH_SCORE: float = 0.50
+
+# ──────────────────────────────────────────────────────────────────────────
+# Options execution layer (Phase 13) — SWING, single-leg, PAPER
+# ──────────────────────────────────────────────────────────────────────────
+# One contract controls OPTION_MULTIPLIER shares of premium exposure. This is the
+# single most error-prone constant in options code: EVERY cost/sizing calculation
+# routes through it, and an explicit test guards against a 100x mistake.
+OPTION_MULTIPLIER: int = 100
+# Strike selection targets a delta band (absolute value; puts use the negatives).
+TARGET_DELTA_LOW: float = 0.65
+TARGET_DELTA_HIGH: float = 0.75
+# An UNDERSIZED option widens the band DOWN to this floor (cheaper, further OTM)
+# to fit the allocated capital — still a WHOLE contract, never a fractional one.
+UNDERSIZED_DELTA_FLOOR: float = 0.50
+# Never enter inside the final fortnight: minimum days-to-expiration at entry.
+MIN_DTE: int = 14
+# Liquidity floor — a contract failing EITHER gate is excluded regardless of delta.
+MIN_OPEN_INTEREST: int = 100
+MAX_SPREAD_PCT: float = 10.0        # max bid-ask spread as % of mid price

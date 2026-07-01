@@ -33,6 +33,14 @@ from trading_bot.broker.base import (
     Position,
     PositionsResult,
 )
+from trading_bot.broker.options import (
+    OPTION_TYPE_CALL,
+    OPTION_TYPE_PUT,
+    VALID_OPTION_TYPES,
+    OptionContract,
+    occ_symbol,
+    parse_occ_symbol,
+)
 from trading_bot.broker.reconcile import (
     Divergence,
     ReconciliationReport,
@@ -46,11 +54,15 @@ __all__ = [
     "AlpacaBroker",
     "Divergence",
     "NEUTRAL_STATUSES",
+    "OPTION_TYPE_CALL",
+    "OPTION_TYPE_PUT",
     "ORDER_TYPE_LIMIT",
     "ORDER_TYPE_MARKET",
+    "OptionContract",
     "ReconciliationReport",
     "SIDE_BUY",
     "SIDE_SELL",
+    "VALID_OPTION_TYPES",
     "STATUS_CANCELED",
     "STATUS_ERROR",
     "STATUS_FILLED",
@@ -72,5 +84,7 @@ __all__ = [
     "PositionsResult",
     "compare_positions",
     "internal_open_positions",
+    "occ_symbol",
+    "parse_occ_symbol",
     "reconcile",
 ]
