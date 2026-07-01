@@ -18,7 +18,7 @@ bracket/OTO for options, so exits are managed explicitly (Section 6).
 from __future__ import annotations
 
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 
@@ -335,3 +335,135 @@ def execute_decision(
             tp=tp, sl=sl, deadline=deadline,
         )
     return order, position_id
+
+
+# ── manual exit management (Alpaca has no bracket/OTO for options) ────────────
+#
+# Alpaca supports NO bracket/OTO orders for options, so the bot must manage exits
+# itself: on each scan cycle it checks every open option position's UNDERLYING
+# price against the signal's TP/SL levels (derived exactly as the equity
+# resolver's are) and the hold-window deadline, and submits a closing SELL when
+# any exit condition trips. This is the options analogue of the equity resolver.
+
+EXIT_TAKE_PROFIT = "take_profit"
+EXIT_STOP_LOSS = "stop_loss"
+EXIT_HOLD_DEADLINE = "hold_deadline"
+EXIT_HOLDING = "holding"
+
+
+@dataclass(frozen=True)
+class ExitDecision:
+    """Whether to close an option position now, and why."""
+
+    action: str      # 'close' | 'hold'
+    reason: str      # take_profit | stop_loss | hold_deadline | holding
+
+
+@dataclass(frozen=True)
+class ExitAction:
+    """What the watcher did for one position on this cycle."""
+
+    position: OptionPosition
+    action: str                      # 'close' | 'hold' | 'error'
+    reason: str
+    order: OrderResult | None = None
+    pnl_dollars: float | None = None
+
+
+def evaluate_option_exit(
+    option_type: str,
+    underlying_price: float | None,
+    tp: float | None,
+    sl: float | None,
+    now: datetime,
+    deadline: datetime | None,
+) -> ExitDecision:
+    """Pure exit decision from the UNDERLYING price vs the TP/SL levels + deadline.
+
+    A ``call`` is bullish (take-profit above, stop below); a ``put`` is bearish
+    (take-profit below, stop above) — the same orientation the equity resolver
+    uses. The stop is checked FIRST (conservative). With no TP/SL hit, the
+    hold-window deadline forces a close. Otherwise: hold. Never raises.
+    """
+    bullish = option_type == OPTION_TYPE_CALL
+    if underlying_price is not None and tp is not None and sl is not None:
+        sl_hit = underlying_price <= sl if bullish else underlying_price >= sl
+        tp_hit = underlying_price >= tp if bullish else underlying_price <= tp
+        if sl_hit:
+            return ExitDecision("close", EXIT_STOP_LOSS)
+        if tp_hit:
+            return ExitDecision("close", EXIT_TAKE_PROFIT)
+    if deadline is not None and now >= deadline:
+        return ExitDecision("close", EXIT_HOLD_DEADLINE)
+    return ExitDecision("hold", EXIT_HOLDING)
+
+
+def _option_pnl_dollars(
+    position: OptionPosition, exit_price: float | None,
+) -> float | None:
+    """Contract-aware realized PnL: ``(exit − entry) × multiplier × contracts``."""
+    if exit_price is None or position.premium_entry is None:
+        return None
+    return (
+        (exit_price - position.premium_entry)
+        * position.multiplier * position.contracts
+    )
+
+
+def watch_open_option_positions(
+    broker: Broker,
+    *,
+    underlying_price_fetch: Callable[[str], float | None],
+    option_price_fetch: Callable[[str], float | None],
+    now: datetime,
+    positions: Sequence[OptionPosition] | None = None,
+) -> list[ExitAction]:
+    """Check each open option position and close the ones that hit TP/SL/deadline.
+
+    For a closing position it submits a single-leg SELL LIMIT (marketable at the
+    current option price; falling back to the entry premium when the current
+    price is unavailable — the documented deadline fallback) with NO bracket
+    attributes, then records the outcome + contract-aware PnL. FAIL-SOFT: an
+    error on one position is logged and NEVER blocks the others.
+    """
+    book = positions if positions is not None else db.get_open_option_positions()
+    actions: list[ExitAction] = []
+    for pos in book:
+        try:
+            underlying_price = underlying_price_fetch(pos.underlying)
+            decision = evaluate_option_exit(
+                pos.option_type, underlying_price, pos.tp, pos.sl, now,
+                pos.deadline,
+            )
+            if decision.action == "hold":
+                actions.append(ExitAction(pos, "hold", decision.reason))
+                continue
+
+            exit_price = option_price_fetch(pos.symbol)
+            limit_price = exit_price if exit_price is not None else pos.premium_entry
+            order = broker.submit_order(
+                pos.symbol, pos.contracts, "sell",
+                order_type=ORDER_TYPE_LIMIT, limit_price=limit_price,
+                time_in_force=TIF_DAY,
+            )
+            outcome = (
+                "win" if decision.reason == EXIT_TAKE_PROFIT
+                else "loss" if decision.reason == EXIT_STOP_LOSS
+                else "expired"
+            )
+            pnl = _option_pnl_dollars(pos, exit_price)
+            if pos.id is not None:
+                db.update_option_position(
+                    pos.id, order_id=order.order_id, outcome=outcome,
+                    closed_at=now, exit_price=exit_price, pnl_dollars=pnl,
+                )
+            actions.append(
+                ExitAction(pos, "close", decision.reason, order=order, pnl_dollars=pnl)
+            )
+        except Exception as exc:  # noqa: BLE001 - one position must never block others
+            print(
+                f"  options watcher error for {pos.symbol}: {exc}",
+                file=sys.stderr,
+            )
+            actions.append(ExitAction(pos, "error", str(exc)))
+    return actions
