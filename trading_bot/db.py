@@ -26,6 +26,7 @@ from trading_bot.models import (
     VALID_VIX_BANDS,
     VALID_WATCHLIST_STATUSES,
     DailyPerf,
+    OptionPosition,
     Prediction,
     Signal,
     Trade,
@@ -41,13 +42,14 @@ from trading_bot.models import (
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
+# Version 17 (Phase 13) — adds the option_positions table (single-leg options).
 # Version 16 (Phase 10) — adds the readiness_state ledger.
 # Version 15 (Phase 9) — adds the optimization_runs history table.
 # Version 14 (Phase 7) — adds trades.risk_* advisory risk-recommendation columns.
 # Version 13 (Phase 6) — adds trades.ind_* advisory indicator-family columns.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -283,6 +285,40 @@ CREATE TABLE IF NOT EXISTS readiness_state (
     crossed_at TEXT,
     announced INTEGER NOT NULL DEFAULT 0
 );
+
+-- Phase 13: single-leg option positions. Distinct from trades (equity): carries
+-- the OCC contract, entry greeks (advisory), the underlying TP/SL levels the
+-- manual exit watcher uses (no broker bracket exists for options), the hold
+-- deadline, and a contract-aware realized pnl_dollars (premium * multiplier).
+CREATE TABLE IF NOT EXISTS option_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id INTEGER,
+    order_id TEXT,
+    symbol TEXT NOT NULL,
+    underlying TEXT NOT NULL,
+    option_type TEXT NOT NULL CHECK (option_type IN ('call','put')),
+    strike REAL NOT NULL,
+    expiry TEXT NOT NULL,
+    contracts REAL NOT NULL,
+    multiplier INTEGER NOT NULL DEFAULT 100,
+    premium_entry REAL,
+    delta_entry REAL,
+    theta REAL,
+    vega REAL,
+    gamma REAL,
+    tp REAL,
+    sl REAL,
+    deadline TEXT,
+    opened_at TEXT NOT NULL,
+    closed_at TEXT,
+    exit_price REAL,
+    outcome TEXT CHECK (outcome IN ('win','loss','breakeven','open','expired')),
+    pnl_dollars REAL,
+    vehicle TEXT NOT NULL DEFAULT 'option_full'
+);
+
+CREATE INDEX IF NOT EXISTS idx_option_positions_open
+    ON option_positions(outcome);
 """
 
 # Whitelist for update_trade — never interpolate user input into SQL column names.
@@ -303,7 +339,11 @@ _TABLE_NAMES: tuple[str, ...] = (
     "predictions", "settings", "active_watchlist", "discovery_results",
     "shadow_evaluations", "watchlist_transitions",
     "signal_pair_status", "signal_pair_transitions", "optimization_runs",
-    "readiness_state",
+    "readiness_state", "option_positions",
+)
+
+_OPTION_POSITION_UPDATABLE_FIELDS: frozenset[str] = frozenset(
+    {"order_id", "closed_at", "exit_price", "outcome", "pnl_dollars"}
 )
 
 # Whitelist for update_prediction — resolution flow + Phase 2.3 context backfill.
@@ -555,6 +595,15 @@ def _migrate_to_v16(_conn: sqlite3.Connection) -> None:
     return None
 
 
+def _migrate_to_v17(_conn: sqlite3.Connection) -> None:
+    """Phase 13 migration step.
+
+    Nothing to ALTER — the new ``option_positions`` table is created by the
+    ``CREATE TABLE IF NOT EXISTS`` block above. Documented hook only.
+    """
+    return None
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -575,6 +624,7 @@ def init_db() -> None:
         _migrate_to_v14(conn)
         _migrate_to_v15(conn)
         _migrate_to_v16(conn)
+        _migrate_to_v17(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -2421,3 +2471,149 @@ def get_shadow_evaluations(limit: int = 100) -> list[dict[str, Any]]:
         }
         for r in rows
     ]
+
+
+# ---- option positions (Phase 13) ----
+
+
+def insert_option_position(pos: OptionPosition) -> int:
+    """Insert a single-leg option position and return its id."""
+    if pos.option_type not in ("call", "put"):
+        raise ValueError(f"Invalid option_type '{pos.option_type}'")
+    if pos.outcome is not None and pos.outcome not in VALID_OUTCOMES:
+        raise ValueError(
+            f"Invalid outcome '{pos.outcome}' "
+            f"(expected one of {sorted(VALID_OUTCOMES)})"
+        )
+    sql = """
+        INSERT INTO option_positions (
+            signal_id, order_id, symbol, underlying, option_type, strike, expiry,
+            contracts, multiplier, premium_entry, delta_entry, theta, vega, gamma,
+            tp, sl, deadline, opened_at, closed_at, exit_price, outcome,
+            pnl_dollars, vehicle
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    params = (
+        pos.signal_id,
+        pos.order_id,
+        pos.symbol,
+        pos.underlying,
+        pos.option_type,
+        pos.strike,
+        pos.expiry,
+        pos.contracts,
+        pos.multiplier,
+        pos.premium_entry,
+        pos.delta_entry,
+        pos.theta,
+        pos.vega,
+        pos.gamma,
+        pos.tp,
+        pos.sl,
+        pos.deadline.isoformat() if pos.deadline is not None else None,
+        pos.opened_at.isoformat(),
+        pos.closed_at.isoformat() if pos.closed_at is not None else None,
+        pos.exit_price,
+        pos.outcome,
+        pos.pnl_dollars,
+        pos.vehicle,
+    )
+    conn = get_connection()
+    try:
+        cur = conn.execute(sql, params)
+        conn.commit()
+        new_id = cur.lastrowid
+        if new_id is None:
+            raise RuntimeError("INSERT did not return a row id")
+        return new_id
+    finally:
+        conn.close()
+
+
+def _row_to_option_position(row: sqlite3.Row) -> OptionPosition:
+    return OptionPosition(
+        symbol=str(row["symbol"]),
+        underlying=str(row["underlying"]),
+        option_type=str(row["option_type"]),
+        strike=float(row["strike"]),
+        expiry=str(row["expiry"]),
+        contracts=float(row["contracts"]),
+        opened_at=datetime.fromisoformat(row["opened_at"]),
+        multiplier=int(row["multiplier"]),
+        signal_id=row["signal_id"],
+        order_id=row["order_id"],
+        premium_entry=row["premium_entry"],
+        delta_entry=row["delta_entry"],
+        theta=row["theta"],
+        vega=row["vega"],
+        gamma=row["gamma"],
+        tp=row["tp"],
+        sl=row["sl"],
+        deadline=(
+            datetime.fromisoformat(row["deadline"]) if row["deadline"] else None
+        ),
+        closed_at=(
+            datetime.fromisoformat(row["closed_at"]) if row["closed_at"] else None
+        ),
+        exit_price=row["exit_price"],
+        outcome=row["outcome"],
+        pnl_dollars=row["pnl_dollars"],
+        vehicle=str(row["vehicle"]),
+        id=int(row["id"]),
+    )
+
+
+def get_open_option_positions() -> list[OptionPosition]:
+    """Option positions with outcome NULL or 'open' — the exit watcher's book."""
+    sql = (
+        "SELECT * FROM option_positions "
+        "WHERE outcome IS NULL OR outcome = 'open' "
+        "ORDER BY opened_at ASC"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_option_position(r) for r in rows]
+
+
+def get_option_positions(limit: int = 100) -> list[OptionPosition]:
+    """Recent option positions, newest first (reporting / CLI)."""
+    sql = "SELECT * FROM option_positions ORDER BY opened_at DESC, id DESC LIMIT ?"
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, (limit,)).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_option_position(r) for r in rows]
+
+
+def update_option_position(position_id: int, **fields: Any) -> None:
+    """Whitelisted partial update — used by the exit watcher when closing."""
+    unknown = set(fields) - _OPTION_POSITION_UPDATABLE_FIELDS
+    if unknown:
+        raise ValueError(
+            f"Unknown option_position field(s): {sorted(unknown)} "
+            f"(allowed: {sorted(_OPTION_POSITION_UPDATABLE_FIELDS)})"
+        )
+    if not fields:
+        return
+    normalized: dict[str, Any] = {}
+    for key, value in fields.items():
+        normalized[key] = value.isoformat() if isinstance(value, datetime) else value
+    if (
+        "outcome" in normalized
+        and normalized["outcome"] is not None
+        and normalized["outcome"] not in VALID_OUTCOMES
+    ):
+        raise ValueError(f"Invalid outcome '{normalized['outcome']}'")
+    set_clause = ", ".join(f"{k} = ?" for k in normalized)  # keys are whitelisted
+    sql = f"UPDATE option_positions SET {set_clause} WHERE id = ?"  # noqa: S608
+    params = [*normalized.values(), position_id]
+    conn = get_connection()
+    try:
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()

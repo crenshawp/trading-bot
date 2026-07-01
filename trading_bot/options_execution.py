@@ -20,14 +20,16 @@ from __future__ import annotations
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
-from trading_bot import config
+from trading_bot import config, db
+from trading_bot.broker.base import ORDER_TYPE_LIMIT, TIF_DAY, Broker, OrderResult
 from trading_bot.broker.options import (
     OPTION_TYPE_CALL,
     OPTION_TYPE_PUT,
     OptionContract,
 )
+from trading_bot.models import OptionPosition
 
 VEHICLE_OPTION_FULL = "option_full"
 VEHICLE_OPTION_UNDERSIZED = "option_undersized"
@@ -251,3 +253,85 @@ def choose_execution(
     return _shares_decision(
         direction, underlying, underlying_price, allocated_capital,
     )
+
+
+# ── order submission (reuses the Phase 11 order path; NO bracket attributes) ──
+
+
+def _limit_price_for(decision: ExecutionDecision) -> float | None:
+    """The LIMIT buy/sell price: an option's ask (else mid), or the share price."""
+    if decision.contract is not None:
+        contract = decision.contract
+        if contract.ask is not None and contract.ask > 0.0:
+            return contract.ask
+        return contract.mid
+    if decision.qty:
+        return decision.est_cost / decision.qty
+    return None
+
+
+def submit_execution_order(
+    broker: Broker, decision: ExecutionDecision, *, time_in_force: str = TIF_DAY,
+) -> OrderResult:
+    """Submit the chosen vehicle via the EXISTING order path — a single-leg LIMIT
+    order with NO bracket/OTO attributes (Alpaca has none for options). Options
+    and the share fallback both go through ``Broker.submit_order``; the Phase 11
+    structured-rejection handling is reused verbatim."""
+    limit_price = _limit_price_for(decision)
+    return broker.submit_order(
+        decision.symbol, decision.qty, decision.side,
+        order_type=ORDER_TYPE_LIMIT, limit_price=limit_price,
+        time_in_force=time_in_force,
+    )
+
+
+def record_option_position(
+    decision: ExecutionDecision,
+    order: OrderResult,
+    *,
+    opened_at: datetime,
+    signal_id: int | None = None,
+    tp: float | None = None,
+    sl: float | None = None,
+    deadline: datetime | None = None,
+) -> int | None:
+    """Persist an option position from a filled/accepted decision. Returns the
+    row id, or None for a share fallback (no contract to record)."""
+    contract = decision.contract
+    if contract is None:
+        return None
+    pos = OptionPosition(
+        symbol=contract.symbol, underlying=contract.underlying,
+        option_type=contract.option_type, strike=contract.strike,
+        expiry=contract.expiry, contracts=decision.qty, opened_at=opened_at,
+        multiplier=config.OPTION_MULTIPLIER, signal_id=signal_id,
+        order_id=order.order_id, premium_entry=_premium(contract),
+        delta_entry=contract.delta, theta=contract.theta, vega=contract.vega,
+        gamma=contract.gamma, tp=tp, sl=sl, deadline=deadline, outcome="open",
+        vehicle=decision.vehicle,
+    )
+    return db.insert_option_position(pos)
+
+
+def execute_decision(
+    broker: Broker,
+    decision: ExecutionDecision,
+    *,
+    opened_at: datetime,
+    signal_id: int | None = None,
+    tp: float | None = None,
+    sl: float | None = None,
+    deadline: datetime | None = None,
+    time_in_force: str = TIF_DAY,
+) -> tuple[OrderResult, int | None]:
+    """Submit the decision and, for a successful OPTION order, persist the
+    position. Returns ``(order_result, option_position_id | None)``. A share
+    fallback submits via the same path but records no option position."""
+    order = submit_execution_order(broker, decision, time_in_force=time_in_force)
+    position_id: int | None = None
+    if order.ok and decision.contract is not None:
+        position_id = record_option_position(
+            decision, order, opened_at=opened_at, signal_id=signal_id,
+            tp=tp, sl=sl, deadline=deadline,
+        )
+    return order, position_id

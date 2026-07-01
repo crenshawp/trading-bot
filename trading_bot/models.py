@@ -122,6 +122,44 @@ VALID_PAIR_STATUSES: frozenset[str] = frozenset({"enabled", "muted"})
 
 
 @dataclass(frozen=True)
+class OptionPosition:
+    """An open/closed single-leg option position (Phase 13).
+
+    Distinct from ``Trade`` (which is equity, ``pnl_dollars`` always None): an
+    option carries a contract-aware dollar cost/PnL through the 100-share
+    ``multiplier``. ``tp``/``sl`` are the UNDERLYING price levels (from the
+    originating signal, derived exactly as the equity resolver's are); the manual
+    exit watcher closes the contract when the underlying crosses them or the
+    ``deadline`` passes. Greeks are advisory context, never gates.
+    """
+
+    symbol: str                     # OCC symbol
+    underlying: str
+    option_type: str                # 'call' | 'put'
+    strike: float
+    expiry: str                     # 'YYYY-MM-DD'
+    contracts: float                # whole contracts
+    opened_at: datetime
+    multiplier: int = 100
+    signal_id: int | None = None
+    order_id: str | None = None
+    premium_entry: float | None = None
+    delta_entry: float | None = None
+    theta: float | None = None
+    vega: float | None = None
+    gamma: float | None = None
+    tp: float | None = None          # underlying take-profit level
+    sl: float | None = None          # underlying stop-loss level
+    deadline: datetime | None = None
+    closed_at: datetime | None = None
+    exit_price: float | None = None
+    outcome: str | None = None       # 'win' | 'loss' | 'expired' | 'open'
+    pnl_dollars: float | None = None
+    vehicle: str = "option_full"     # option_full | option_undersized
+    id: int | None = None
+
+
+@dataclass(frozen=True)
 class Prediction:
     """A 15-min direction prediction (Phase 2.2b).
 
