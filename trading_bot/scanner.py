@@ -54,8 +54,8 @@ from trading_bot.secrets import get_required
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Stock watchlist — backtested, Tier 1 only
-STOCK_WATCHLIST = ["BLK", "GOOGL", "META", "GS", "NOW", "AMZN", "LLY", "TSLA","APPL", "MSFT", "NVDA", "TJX", "LRCX", "AMAT", "KLAC", "V", "XOM", "NFLX", "MA", "JNJ", "BRK.B", "GOOG", "ROST", "ANET", "MRK", "COST", "LIN", "FTNT", "WMT", "MU", "AMD", "AVGO", "CSCO", "ABBV", "PG", "HD", "PANW", "QCOM", "GE", "CAT", "KO", "WDC", "GEV", "GILD", "ETN", "TXN", "STX", "UTHR", "CRS", "MEDP", "CSL", "HEI", "TMO", "FFIV", "WMB", "MO", "VZ", "TMUS"]
-TREND_CONT_TICKERS = ["JPM", "GS", "GOOGL", "NOW", "SPY", "BLK", "AMZN","APPL", "MSFT", "NVDA", "TJX", "LRCX", "AMAT", "KLAC", "V", "XOM", "NFLX", "MA", "JNJ", "BRK.B", "GOOG", "ROST", "ANET", "MRK", "COST", "LIN", "FTNT", "WMT", "MU", "AMD", "AVGO", "CSCO", "ABBV", "PG", "HD", "PANW", "QCOM", "GE", "CAT", "KO", "WDC", "GEV", "GILD", "ETN", "TXN", "STX", "UTHR", "CRS", "MEDP", "CSL", "HEI", "TMO", "FFIV", "WMB", "MO", "VZ", "TMUS"]
+STOCK_WATCHLIST = ["BLK", "GOOGL", "META", "GS", "NOW", "AMZN", "LLY", "TSLA","AAPL", "MSFT", "NVDA", "TJX", "LRCX", "AMAT", "KLAC", "V", "XOM", "NFLX", "MA", "JNJ", "BRK.B", "GOOG", "ROST", "ANET", "MRK", "COST", "LIN", "FTNT", "WMT", "MU", "AMD", "AVGO", "CSCO", "ABBV", "PG", "HD", "PANW", "QCOM", "GE", "CAT", "KO", "WDC", "GEV", "GILD", "ETN", "TXN", "STX", "UTHR", "CRS", "MEDP", "CSL", "HEI", "TMO", "FFIV", "WMB", "MO", "VZ", "TMUS"]
+TREND_CONT_TICKERS = ["JPM", "GS", "GOOGL", "NOW", "SPY", "BLK", "AMZN","AAPL", "MSFT", "NVDA", "TJX", "LRCX", "AMAT", "KLAC", "V", "XOM", "NFLX", "MA", "JNJ", "BRK.B", "GOOG", "ROST", "ANET", "MRK", "COST", "LIN", "FTNT", "WMT", "MU", "AMD", "AVGO", "CSCO", "ABBV", "PG", "HD", "PANW", "QCOM", "GE", "CAT", "KO", "WDC", "GEV", "GILD", "ETN", "TXN", "STX", "UTHR", "CRS", "MEDP", "CSL", "HEI", "TMO", "FFIV", "WMB", "MO", "VZ", "TMUS"]
 NEWS_WATCHLIST = ["BLK", "GOOGL", "META", "GS", "NOW", "AMZN", "LLY", "TSLA", "PLTR", "NVDA", "AAPL"]
 
 # Crypto watchlist — backtested on hourly candles
@@ -66,6 +66,12 @@ CRYPTO_WATCHLIST = ["BTC-USD", "BNB-USD", "ETH-USD"]
 _SHADOW_THROTTLE_SECONDS = 0.5
 
 NOTIFY_METHOD    = "pushover"
+
+# One timeout for every legacy Discord/Pushover/NewsAPI call in this module.
+# Without it a single hung socket stalls the (single-threaded) schedule loop
+# indefinitely — violating the "never block signal capture" contract. The
+# newer modules (news_client, readiness, broker.*) already do this.
+_HTTP_TIMEOUT_SECONDS = 10
 
 # Credential placeholders — populated by _load_secrets() at startup, not
 # at import time, so this module can be imported by tests without keychain
@@ -387,8 +393,10 @@ def add_stock_indicators(df):
     df["EMA50"]     = calculate_ema(df["Close"], 50)
     df["ATR"]       = calculate_atr(df)
     df["ROC_Accel"] = calculate_roc_acceleration(df["Close"])
-    df["Slope"]     = calculate_regression_slope(df["Close"])
     df["Vol_MA20"]  = df["Volume"].rolling(20).mean()
+    # Slope was previously computed twice (identical call both times) — the
+    # regression is O(rows x period) so the duplicate doubled the most
+    # expensive indicator for no change in output.
     df["Slope"]       = calculate_regression_slope(df["Close"])
     df["Slope_Accel"] = df["Slope"].diff()
     df["High_20"]     = df["High"].rolling(20).max().shift(1)
@@ -415,21 +423,24 @@ def add_crypto_indicators(df):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_stock_data(ticker):
+    # Validate BEFORE touching .columns — the previous order dereferenced
+    # df.columns first, so the None/shape guard below it could never actually
+    # protect anything (a None return would have raised AttributeError first).
     df = yf.download(ticker, period="60d", interval="1d", progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.droplevel(1)
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.droplevel(1)
     df.dropna(inplace=True)
     return df
 
 
 def get_crypto_data(ticker):
     df = yf.download(ticker, period="60d", interval="1h", progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.droplevel(1)
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.droplevel(1)
     df.dropna(inplace=True)
     return df
 
@@ -493,9 +504,15 @@ def send_morning_report():
         if len(report) > 1900:
             chunks = [report[i:i+1900] for i in range(0, len(report), 1900)]
             for chunk in chunks:
-                requests.post(DISCORD_WEBHOOK_URL, json={"content": chunk})
+                requests.post(
+                    DISCORD_WEBHOOK_URL, json={"content": chunk},
+                    timeout=_HTTP_TIMEOUT_SECONDS,
+                )
         else:
-            requests.post(DISCORD_WEBHOOK_URL, json={"content": report})
+            requests.post(
+                DISCORD_WEBHOOK_URL, json={"content": report},
+                timeout=_HTTP_TIMEOUT_SECONDS,
+            )
         print("  Morning report sent")
     except Exception as e:
         print(f"  Morning report error: {e}")
@@ -511,7 +528,7 @@ def send_morning_report():
                 "user":    PUSHOVER_USER_KEY,
                 "title":   f"📰 Morning Report ({idx}/{len(chunks)})",
                 "message": chunk,
-            })
+            }, timeout=_HTTP_TIMEOUT_SECONDS)
         print(f"  Pushover report sent ({len(chunks)} parts)")
     except Exception as e:
         print(f"  Pushover report error: {e}")
@@ -579,7 +596,7 @@ def check_news_risk(ticker):
             f"&language=en"
             f"&apiKey={NEWSAPI_KEY}"
         )
-        response = requests.get(url)
+        response = requests.get(url, timeout=_HTTP_TIMEOUT_SECONDS)
         articles = response.json().get("articles", [])
         if not articles:
             return "UNKNOWN"
@@ -983,7 +1000,10 @@ def _send_prediction_notification(pred: object) -> None:
         return
 
     try:
-        resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+        resp = requests.post(
+            DISCORD_WEBHOOK_URL, json={"content": msg},
+            timeout=_HTTP_TIMEOUT_SECONDS,
+        )
         _warn_if_bad_status(resp, "prediction Discord")
     except Exception as exc:
         print(f"  prediction Discord error: {exc}", file=sys.stderr)
@@ -993,7 +1013,7 @@ def _send_prediction_notification(pred: object) -> None:
             "user":  PUSHOVER_USER_KEY,
             "title": f"Prediction: {ticker} {direction}",
             "message": msg,
-        })
+        }, timeout=_HTTP_TIMEOUT_SECONDS)
         _warn_if_bad_status(resp, "prediction Pushover")
     except Exception as exc:
         print(f"  prediction Pushover error: {exc}", file=sys.stderr)
@@ -1037,7 +1057,10 @@ def _send_resolution_notification(
         return
 
     try:
-        resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+        resp = requests.post(
+            DISCORD_WEBHOOK_URL, json={"content": msg},
+            timeout=_HTTP_TIMEOUT_SECONDS,
+        )
         _warn_if_bad_status(resp, "resolution Discord")
     except Exception as exc:
         print(f"  resolution Discord error: {exc}", file=sys.stderr)
@@ -1047,7 +1070,7 @@ def _send_resolution_notification(
             "user":  PUSHOVER_USER_KEY,
             "title": f"Resolved: {ticker} {outcome_label}",
             "message": msg,
-        })
+        }, timeout=_HTTP_TIMEOUT_SECONDS)
         _warn_if_bad_status(resp, "resolution Pushover")
     except Exception as exc:
         print(f"  resolution Pushover error: {exc}", file=sys.stderr)
@@ -1639,7 +1662,7 @@ def send_notification(
                 "color": 3066993,
                 "fields": embed_fields,
             }],
-        })
+        }, timeout=_HTTP_TIMEOUT_SECONDS)
         _warn_if_bad_status(resp, "Discord")
         print("  Discord notification sent")
     except Exception as e:
@@ -1651,7 +1674,7 @@ def send_notification(
             "user":    PUSHOVER_USER_KEY,
             "title":   f"Alert: {signal['ticker']} {signal['direction']}",
             "message": msg,
-        })
+        }, timeout=_HTTP_TIMEOUT_SECONDS)
         _warn_if_bad_status(resp, "Pushover")
         print("  Pushover notification sent")
     except Exception as e:
@@ -1819,6 +1842,29 @@ def scan_crypto():
 # RUN
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _never_raise(job_fn):
+    """Wrap a scheduled job so an uncaught exception can neither kill the
+    ``while True: schedule.run_pending()`` loop nor leave the job permanently
+    'due' (the ``schedule`` library only advances ``next_run`` after the job
+    returns, so an uncaught error would re-fire the failing job every second
+    forever). The error is logged to stderr and the next scheduled run tries
+    again — the same never-dark contract the ``_run_*`` wrappers already give
+    their jobs, extended to the ones that were registered bare."""
+    import functools
+
+    @functools.wraps(job_fn)
+    def wrapper():
+        try:
+            job_fn()
+        except Exception as exc:  # noqa: BLE001 - one job must never kill the loop
+            print(
+                f"  scheduled job {job_fn.__name__} error: {exc}",
+                file=sys.stderr,
+            )
+
+    return wrapper
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="tradingbot")
     parser.add_argument(
@@ -1854,30 +1900,33 @@ def main() -> None:
     print("Stock scan: once daily at market open")
     print("Crypto scan: every hour 24/7")
 
-    # Run both immediately on start
-    scan_stocks()
+    # Run both immediately on start. Guarded: a transient failure during the
+    # boot pass (e.g. one flaky yfinance/Discord call) must not crash the
+    # process before the schedules are even registered — that would put
+    # Railway into a restart loop instead of simply catching the next tick.
+    _never_raise(scan_stocks)()
     # Shadow scan AFTER the active scan so active alerting/logging is never
     # delayed or blocked by the 100-name shadow load. Wrapped so it can never
     # take down the active pipeline.
     _run_shadow_scan()
-    scan_crypto()
-    send_morning_report()
+    _never_raise(scan_crypto)()
+    _never_raise(send_morning_report)()
     # Evaluate readiness once at boot so a capability already over threshold is
     # announced promptly (idempotent — the one-time flag prevents re-notifying).
     _run_readiness_evaluation()
 
     # Stock scan — once per day at 9:31am EST
-    schedule.every().day.at("09:31").do(scan_stocks)
+    schedule.every().day.at("09:31").do(_never_raise(scan_stocks))
 
     # Shadow scan at 09:33 EST — two minutes after the active stock scan so
     # active trades/alerts land first. Phase 3.1-LIVE.
     schedule.every().day.at("09:33").do(_run_shadow_scan)
 
     # Crypto scan — every hour
-    schedule.every(1).hours.do(scan_crypto)
+    schedule.every(1).hours.do(_never_raise(scan_crypto))
 
     # News updates — every weekday at 8:00am EST
-    schedule.every().day.at("08:00").do(send_morning_report)
+    schedule.every().day.at("08:00").do(_never_raise(send_morning_report))
 
     # Resolve open trades every hour (Phase 1.3) — lightweight, only touches
     # trades with outcome IS NULL or 'open' and skips already-closed ones.
@@ -1904,12 +1953,14 @@ def main() -> None:
     # Phase 2.2b — prediction engine. OFF by default; the sweep self-skips
     # until the user enables it via `python -m trading_bot predictions enable`.
     _seed_prediction_defaults()
-    # 15-min prediction sweep at :00, :15, :30, :45.
+    # 15-min prediction sweep at :00, :15, :30, :45. The sweep isolates
+    # per-ticker errors itself, but its settings/window reads sit outside that
+    # isolation — guard the whole job like everything else.
     for minute in ("00", "15", "30", "45"):
-        schedule.every().hour.at(f":{minute}").do(_run_prediction_sweep)
+        schedule.every().hour.at(f":{minute}").do(_never_raise(_run_prediction_sweep))
     # Resolution sweep every 5 minutes — closes out predictions whose
     # 15-min target window has passed and whose candle is now available.
-    schedule.every(5).minutes.do(_run_prediction_resolution)
+    schedule.every(5).minutes.do(_never_raise(_run_prediction_resolution))
     print(f"Schedules registered: {schedule.jobs}")
 
     while True:

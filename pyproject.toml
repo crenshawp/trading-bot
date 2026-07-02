@@ -62,6 +62,14 @@ ignore_missing_imports = true
 module = "*"
 ignore_errors = true
 
+# mypy 2.x stopped honoring the bare "*" override for top-level modules pulled
+# in as dependencies (backtest is imported by trading_bot/discovery.py), which
+# broke the audit gate with 26 legacy-annotation errors. Name the legacy
+# backtesters explicitly so the gate is green again. Same intent as above.
+[[tool.mypy.overrides]]
+module = ["backtest", "backtest2"]
+ignore_errors = true
+
 # New code in trading_bot/ IS held to strict typing.
 [[tool.mypy.overrides]]
 module = "trading_bot.*"
