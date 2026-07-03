@@ -122,6 +122,55 @@ def _unavailable(why: str) -> SizeRecommendation:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# LONG-TERM SIZING (Phase 14) — DIVERSIFICATION-WEIGHTED, not ATR/stop-based
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class LongTermSize:
+    """A diversification-weighted buy-and-hold size. Distinct from the Phase 7
+    ATR/stop model — there is no tight stop, so there is no stop-distance sizing.
+    ``dollars`` is the capped notional; ``qty`` is fractional shares."""
+
+    dollars: float | None = None
+    qty: float | None = None
+    ok: bool = False
+    reason: str = "not computed"
+
+
+def position_size_long_term(
+    pool_capital: float,
+    entry_price: float | None,
+    *,
+    max_weight_pct: float = config.MAX_POSITION_WEIGHT_PCT,
+) -> LongTermSize:
+    """Diversification-weighted size: ``pool_capital × max_weight_pct%`` notional,
+    converted to fractional shares at ``entry_price``.
+
+    Each long-term position gets up to ``max_weight_pct`` of its pool's capital —
+    the per-position cap IS the allocation (no target/stop). Position COUNT is
+    emergent from the pool's tier deploy cap in the allocator. FAIL-SOFT: a
+    non-positive pool capital or entry price returns an unavailable size, logged.
+    """
+    try:
+        if pool_capital <= 0.0:
+            return _lt_unavailable("non-positive pool capital")
+        if entry_price is None or entry_price <= 0.0:
+            return _lt_unavailable("non-positive entry price")
+        dollars = pool_capital * max_weight_pct / 100.0
+        return LongTermSize(
+            dollars=dollars, qty=dollars / entry_price, ok=True, reason="ok",
+        )
+    except Exception as exc:  # noqa: BLE001 - sizing must never block a candidate
+        return _lt_unavailable(str(exc))
+
+
+def _lt_unavailable(why: str) -> LongTermSize:
+    print(f"  risk: long-term size unavailable ({why})", file=sys.stderr)
+    return LongTermSize(ok=False, reason=f"long-term size unavailable: {why}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PORTFOLIO RISK — advisory verdicts across currently-open positions
 # ══════════════════════════════════════════════════════════════════════════════
 

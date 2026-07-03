@@ -323,14 +323,17 @@ def composite_confidence(candidate: Candidate) -> ConfidenceScore:
 # ── Stage 1: hard eligibility filter ─────────────────────────────────────────
 
 
-def filter_reason(candidate: Candidate, pool_capital: float) -> str | None:
+def filter_reason(
+    candidate: Candidate, pool_capital: float, *, pool: str = config.POOL_SWING,
+) -> str | None:
     """Return a drop reason if ``candidate`` is ineligible, else None.
 
     Hard gates, in order: ticker must be active, its (ticker, signal) pair must
-    be enabled, no earnings blackout, and the volatility-normalized size must put
-    at least ``MIN_DOLLAR_RISK`` at risk against the pool's capital (a signal with
-    no usable ATR is ``unsizeable``; one whose risk falls below the floor is
-    ``below_floor``). Never raises — sizing is fail-soft.
+    be enabled, no earnings blackout, and the pool-appropriate size must put at
+    least ``MIN_DOLLAR_RISK`` at risk against the pool's capital (a signal that
+    cannot be sized is ``unsizeable``; one whose risk falls below the floor is
+    ``below_floor``). ``pool`` selects the sizing model (default SWING = Phase 7).
+    Never raises — sizing is fail-soft.
     """
     if not candidate.ticker_active:
         return "ticker_inactive"
@@ -338,12 +341,31 @@ def filter_reason(candidate: Candidate, pool_capital: float) -> str | None:
         return "pair_muted"
     if candidate.earnings_blackout:
         return "earnings_blackout"
-    size = risk.position_size(candidate.entry, candidate.atr, account=pool_capital)
-    if not size.ok or size.dollar_risk is None:
+    ok, _pv, dollar_risk, _qty = _size_candidate(candidate, pool, pool_capital)
+    if not ok or dollar_risk is None:
         return "unsizeable"
-    if size.dollar_risk < config.MIN_DOLLAR_RISK:
+    if dollar_risk < config.MIN_DOLLAR_RISK:
         return "below_floor"
     return None
+
+
+def _size_candidate(
+    candidate: Candidate, pool: str, pool_capital: float,
+) -> tuple[bool, float | None, float | None, float | None]:
+    """Size a candidate for its pool: ``(ok, position_value, dollar_risk, qty)``.
+
+    SWING uses the Phase 7 ATR/stop model. LONG_TERM / CRYPTO use the Phase 14
+    diversification-weighted model (no tight stop → the notional weight IS both
+    the position value and the amount at risk). Keeping the two sizing methods
+    behind one dispatcher is what lets the pools coexist in one allocator.
+    """
+    if pool in (config.POOL_LONG_TERM, config.POOL_CRYPTO):
+        lt = risk.position_size_long_term(pool_capital, candidate.entry)
+        if not lt.ok or lt.dollars is None or lt.qty is None:
+            return False, None, None, None
+        return True, lt.dollars, lt.dollars, lt.qty
+    size = risk.position_size(candidate.entry, candidate.atr, account=pool_capital)
+    return size.ok, size.position_value, size.dollar_risk, size.recommended_size
 
 
 # ── Stage 2/3: rank, then allocate top-down within each pool ─────────────────
@@ -400,11 +422,8 @@ def allocate(
 
         for rc in [r for r in ranked if r.pool == pool]:   # already rank-ordered
             c = rc.candidate
-            size = risk.position_size(c.entry, c.atr, account=capital)
-            pv = size.position_value
-            dollar_risk = size.dollar_risk
-            qty = size.recommended_size
-            if not size.ok or pv is None or dollar_risk is None or qty is None:
+            ok, pv, dollar_risk, qty = _size_candidate(c, pool, capital)
+            if not ok or pv is None or dollar_risk is None or qty is None:
                 skipped.append(SkippedSignal(
                     c.ticker, c.signal_type, pool, "allocate", "unsizeable",
                 ))
@@ -508,7 +527,7 @@ def build_plan(
             ))
             continue
         pool = route_pool(c)
-        drop_reason = filter_reason(c, caps[pool][0])
+        drop_reason = filter_reason(c, caps[pool][0], pool=pool)
         if drop_reason is not None:
             print(
                 f"  allocate: drop {c.ticker}/{c.signal_type} ({drop_reason})",
