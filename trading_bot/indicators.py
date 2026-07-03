@@ -139,6 +139,17 @@ def classify_vol_regime(
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+def sma(series: pd.Series, period: int) -> pd.Series:
+    """Simple moving average over ``period`` observations.
+
+    The long-horizon TREND line for the Phase 14 buy-and-hold entry/exit logic
+    (``price > sma(close, TREND_PERIOD)``). A plain rolling mean — the trend
+    primitive that the momentum/trend/volatility families above did not provide;
+    reused rather than reimplemented per caller.
+    """
+    return series.rolling(period).mean()
+
+
 def rsi(close: pd.Series, period: int = config.RSI_PERIOD) -> pd.Series:
     """Relative Strength Index over ``period`` candles.
 
