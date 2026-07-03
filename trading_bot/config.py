@@ -151,22 +151,26 @@ POOL_DEPLOY_CAP_NORMAL: float = 0.30    # NORMAL-tier deployed-capital ceiling /
 MIN_DOLLAR_RISK: float = 10.0
 
 # Three logical pools tracked independently against one paper account's capital.
-# LONG_TERM is reserved (buy-hold); no signal type routes to it yet this phase.
+# LONG_TERM (buy-hold stocks) and CRYPTO (long-term BTC/ETH/BNB) are populated by
+# the Phase 14 long-term candidate generator.
 POOL_SWING = "SWING"
 POOL_LONG_TERM = "LONG_TERM"
 POOL_CRYPTO = "CRYPTO"
 POOLS: tuple[str, ...] = (POOL_SWING, POOL_LONG_TERM, POOL_CRYPTO)
-# Notional split of the account's capital across the pools (sums to 1.0). The
-# default reserves the LONG_TERM slice for a later phase; tune freely.
+# Notional split of the account's capital across the pools (sums to 1.0). Tune
+# freely.
 POOL_CAPITAL_SPLIT: dict[str, float] = {
     POOL_SWING: 0.50, POOL_LONG_TERM: 0.30, POOL_CRYPTO: 0.20,
 }
 # Route a signal to its pool by signal_type (fallback: asset_class → stock=SWING,
-# crypto=CRYPTO). LONG_TERM has no automatic routing yet.
+# crypto=CRYPTO). The crypto SWING signals (oversold_reversal / momentum_breakout)
+# are DELIBERATELY ABSENT — they are data-only forever (see DATA_ONLY_SIGNAL_TYPES,
+# enforced in allocation.build_plan) and must NEVER route to execution. Only the
+# Phase 14 long-term signals route into the LONG_TERM / CRYPTO execution pools.
 SIGNAL_TYPE_TO_POOL: dict[str, str] = {
     "ema21_pullback": POOL_SWING,
-    "oversold_reversal": POOL_CRYPTO,
-    "momentum_breakout": POOL_CRYPTO,
+    "long_term_stock": POOL_LONG_TERM,
+    "long_term_crypto": POOL_CRYPTO,
 }
 
 # Composite confidence weights (sum 1.0; per-pair expectancy is PRIMARY). The
@@ -203,3 +207,49 @@ MIN_DTE: int = 14
 # Liquidity floor — a contract failing EITHER gate is excluded regardless of delta.
 MIN_OPEN_INTEREST: int = 100
 MAX_SPREAD_PCT: float = 10.0        # max bid-ask spread as % of mid price
+
+# ──────────────────────────────────────────────────────────────────────────
+# Long-term trading system (Phase 14) — BUY-AND-HOLD, stocks + crypto, PAPER
+# ──────────────────────────────────────────────────────────────────────────
+# Buy-and-hold: fractional shares, no options, no tight stops. Entry candidates
+# feed the SAME operator-inspected Phase 12 allocation plan (no new auto-exec of
+# entries); only the PROTECTIVE EXIT watcher acts automatically (closing).
+LONGTERM_STOCK_SIGNAL = "long_term_stock"
+LONGTERM_CRYPTO_SIGNAL = "long_term_crypto"
+# The crypto SWING signals are data-only FOREVER — never routed to execution.
+DATA_ONLY_SIGNAL_TYPES: frozenset[str] = frozenset(
+    {"oversold_reversal", "momentum_breakout"}
+)
+LONGTERM_STOCK_UNIVERSE: tuple[str, ...] = (
+    "BLK", "GOOGL", "META", "GS", "NOW", "AMZN", "LLY", "TSLA",
+)
+LONGTERM_CRYPTO_UNIVERSE: tuple[str, ...] = ("BTC-USD", "ETH-USD", "BNB-USD")
+
+# Earnings SOFT window (stocks only) — DISTINCT from the Phase 5 hold-window
+# blackout: skip an entry this cycle if earnings fall within this many days
+# (clean entry price, not gap-risk avoidance), and simply retry a later cycle.
+EARNINGS_WAIT_DAYS: int = 5
+
+# Diversification-weighted sizing (NOT the Phase 7 ATR/stop model): each position
+# gets up to this % of its pool's capital. No stop-distance sizing — no tight stop.
+MAX_POSITION_WEIGHT_PCT: float = 15.0
+
+# Technical entry confirmation at a long horizon (stocks + crypto): price above
+# the TREND_PERIOD trend AND ADX >= a moderate-trend floor AND RSI <= overbought.
+TREND_PERIOD: int = 200
+ADX_MIN_TREND: float = 20.0
+RSI_OVERBOUGHT_MAX: float = 70.0
+
+# Protective exit (no profit-taking this phase): close on EITHER a trend breakdown
+# (this many consecutive closes below the TREND_PERIOD trend) OR a drawdown from
+# entry exceeding the stop — whichever triggers first.
+TREND_BREAKDOWN_DAYS: int = 3
+MAX_DRAWDOWN_STOP_PCT: float = 25.0
+
+# Fundamental RED-FLAG screen (stocks only) — a LOOSE filter, not a quality
+# ranker. A candidate is blocked ONLY when BOTH hold (a genuine red flag):
+# earnings growth below the floor AND debt/equity above the ceiling. Missing
+# either datum fails OPEN (does not block). debt/equity from yfinance is a
+# PERCENT (e.g. 150.0 == 1.5x), so the ceiling is expressed the same way.
+FUND_EARNINGS_GROWTH_FLOOR: float = -0.20     # -20% YoY earnings growth
+FUND_DEBT_EQUITY_CEILING: float = 200.0       # 2.0x debt/equity (yfinance %)
