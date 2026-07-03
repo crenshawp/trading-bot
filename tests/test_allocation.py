@@ -316,7 +316,7 @@ def test_build_plan_end_to_end() -> None:
     )
     muted = _candidate(ticker="MUTED", pair_enabled=False, atr=10.0)
     crypto = _candidate(
-        ticker="ETHX", signal_type="oversold_reversal", asset_class="crypto",
+        ticker="ETHX", signal_type="long_term_crypto", asset_class="crypto",
         direction="long", expectancy=0.4, atr=10.0,
     )
 
@@ -332,6 +332,19 @@ def test_build_plan_end_to_end() -> None:
     assert muted_skip.stage == "filter" and muted_skip.reason == "pair_muted"
     # All three pools are accounted for.
     assert {p.pool for p in res.pools} == set(config.POOLS)
+
+
+def test_build_plan_drops_data_only_crypto_swing_signals() -> None:
+    # Crypto SWING signals must NEVER execute — dropped before routing.
+    acct = AccountInfo(ok=True, equity=100_000.0, cash=100_000.0)
+    swing = _candidate(
+        ticker="ETH-USD", signal_type="oversold_reversal", asset_class="crypto",
+        direction="long", expectancy=0.9, atr=10.0,
+    )
+    res = allocation.build_plan([swing], acct)
+    assert res.plan.orders == []                       # nothing planned
+    drop = next(s for s in res.skipped if s.ticker == "ETH-USD")
+    assert "data-only" in drop.reason
 
 
 def test_build_plan_account_unavailable_is_empty_plan() -> None:

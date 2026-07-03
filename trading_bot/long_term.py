@@ -30,14 +30,15 @@ may route to the CRYPTO pool. Still PAPER ONLY.
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pandas as pd
 import yfinance as yf
 
-from trading_bot import config, indicators
+from trading_bot import allocation, config, earnings, indicators
 
 
 def _to_float(value: Any) -> float | None:
@@ -203,3 +204,121 @@ def confirm_technical_entry(
         print(f"  longterm: technical confirm error: {exc}", file=sys.stderr)
         return False, f"error: {exc}"
     return _confirm_conditions(price, trend, adx, rsi, adx_min=adx_min, rsi_max=rsi_max)
+
+
+# ── earnings SOFT wait-window (stocks only; distinct from the Phase 5 blackout) ─
+
+
+def in_earnings_wait_window(
+    ticker: str, *, wait_days: int = config.EARNINGS_WAIT_DAYS,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    """Return ``(in_window, reason)`` for the long-term earnings SOFT window.
+
+    DISTINCT from the Phase 5 hold-window blackout (different threshold, different
+    purpose): if a KNOWN earnings date falls within ``[today, today+wait_days]``
+    we SKIP this cycle for a clean entry price and simply retry a later cycle — it
+    is not a permanent suppression. An UNKNOWN date proceeds (never a reason to
+    skip). Reuses ``earnings.next_earnings_date``.
+    """
+    moment = now if now is not None else datetime.now(UTC)
+    info = earnings.next_earnings_date(ticker)
+    if info.earnings_date is None:
+        return False, "earnings unknown - proceed"
+    today = moment.date()
+    window_end = (moment + timedelta(days=wait_days)).date()
+    earnings_day = info.earnings_date.date()
+    if today <= earnings_day <= window_end:
+        return True, (
+            f"earnings {earnings_day.isoformat()} within {wait_days}d wait "
+            "window - skip, retry later"
+        )
+    return False, f"earnings {earnings_day.isoformat()} outside {wait_days}d wait window"
+
+
+# ── candidate generation (feeds the SAME Phase 12 allocation plan) ────────────
+
+
+def to_allocation_candidate(candidate: LongTermCandidate) -> allocation.Candidate:
+    """Convert a long-term candidate into a Phase 12 allocation Candidate.
+
+    Long-term entries are buy-and-hold longs with NO ATR/stop sizing (``atr=None``
+    — the LONG_TERM/CRYPTO pools size by diversification weight, not Phase 7); the
+    swing gate flags default to permissive since the long-term gates were already
+    applied by the generator."""
+    return allocation.Candidate(
+        ticker=candidate.ticker, signal_type=candidate.signal_type,
+        direction="long", asset_class=candidate.asset_class,
+        entry=candidate.entry_price, atr=None,
+    )
+
+
+def _safe_fetch(
+    price_fetch: Callable[[str], pd.DataFrame | None], ticker: str,
+) -> pd.DataFrame | None:
+    try:
+        return price_fetch(ticker)
+    except Exception as exc:  # noqa: BLE001 - one fetch failure must not sink the run
+        print(f"  longterm: price fetch error for {ticker}: {exc}", file=sys.stderr)
+        return None
+
+
+def generate_candidates(
+    price_fetch: Callable[[str], pd.DataFrame | None],
+    *,
+    now: datetime | None = None,
+    stock_universe: tuple[str, ...] = config.LONGTERM_STOCK_UNIVERSE,
+    crypto_universe: tuple[str, ...] = config.LONGTERM_CRYPTO_UNIVERSE,
+) -> list[LongTermCandidate]:
+    """Generate long-term entry candidates for the daily scan.
+
+    STOCKS: fundamental red-flag screen (fail-open) → technical confirmation →
+    earnings wait-window. CRYPTO: technical confirmation ONLY (no fundamental
+    screen exists for crypto). Emits a :class:`LongTermCandidate` for anything
+    that clears all applicable gates; each emitted candidate carries ONLY a
+    long-term signal type, so the crypto SWING signals can never appear here.
+    Populates candidates for the next allocate-plan inspection — submits NOTHING.
+    ``price_fetch`` is injected (candles per ticker), keeping this testable.
+    """
+    moment = now if now is not None else datetime.now(UTC)
+    out: list[LongTermCandidate] = []
+
+    for ticker in stock_universe:
+        df = _safe_fetch(price_fetch, ticker)
+        if df is None:
+            continue
+        blocked, _reason = fundamental_red_flag(ticker)
+        if blocked:
+            continue
+        confirmed, tech_reason = confirm_technical_entry(df)
+        if not confirmed:
+            continue
+        in_wait, _wreason = in_earnings_wait_window(ticker, now=moment)
+        if in_wait:
+            continue
+        price = _val(df["Close"], -1)
+        if price is None:
+            continue
+        out.append(LongTermCandidate(
+            ticker=ticker, asset_class="stock",
+            signal_type=config.LONGTERM_STOCK_SIGNAL, entry_price=price,
+            entry_rationale=f"stock long-term: {tech_reason}",
+        ))
+
+    for ticker in crypto_universe:
+        df = _safe_fetch(price_fetch, ticker)
+        if df is None:
+            continue
+        confirmed, tech_reason = confirm_technical_entry(df)
+        if not confirmed:
+            continue
+        price = _val(df["Close"], -1)
+        if price is None:
+            continue
+        out.append(LongTermCandidate(
+            ticker=ticker, asset_class="crypto",
+            signal_type=config.LONGTERM_CRYPTO_SIGNAL, entry_price=price,
+            entry_rationale=f"crypto long-term: {tech_reason}",
+        ))
+
+    return out

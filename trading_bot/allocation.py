@@ -494,6 +494,19 @@ def build_plan(
     eligible: list[tuple[Candidate, str]] = []
     skipped = []
     for c in candidates:
+        # Data-only signal types (the crypto SWING signals) can NEVER execute —
+        # drop them before routing so they never reach a pool (Phase 14).
+        if c.signal_type in config.DATA_ONLY_SIGNAL_TYPES:
+            print(
+                f"  allocate: drop {c.ticker}/{c.signal_type} "
+                "(data-only - never executes)",
+                file=sys.stderr,
+            )
+            skipped.append(SkippedSignal(
+                c.ticker, c.signal_type, None, "filter",
+                "data-only signal (never executes)",
+            ))
+            continue
         pool = route_pool(c)
         drop_reason = filter_reason(c, caps[pool][0])
         if drop_reason is not None:
