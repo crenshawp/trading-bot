@@ -29,8 +29,23 @@ may route to the CRYPTO pool. Still PAPER ONLY.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
+
+import yfinance as yf
+
+from trading_bot import config
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass(frozen=True)
@@ -62,3 +77,62 @@ class LongTermPosition:
     exit_date: datetime | None = None
     exit_reason: str | None = None  # trend_breakdown | drawdown_stop
     id: int | None = None
+
+
+# ── fundamental red-flag screen (stocks only, FAIL-OPEN) ─────────────────────
+
+
+def _fetch_fundamentals(ticker: str) -> tuple[float | None, float | None]:
+    """Fetch ``(earnings_growth, debt_to_equity)`` via yfinance. Never raises.
+
+    Isolated so tests monkeypatch it without touching the network. Any failure —
+    or a field yfinance simply does not carry — yields ``None`` for that datum,
+    which the screen treats as fail-open.
+    """
+    try:
+        info = yf.Ticker(ticker).info
+        if not isinstance(info, dict):
+            return None, None
+        growth = info.get("earningsGrowth")
+        if growth is None:
+            growth = info.get("earningsQuarterlyGrowth")
+        return _to_float(growth), _to_float(info.get("debtToEquity"))
+    except Exception as exc:  # noqa: BLE001 - fundamentals lookup must never raise
+        print(f"  longterm: fundamentals fetch error for {ticker}: {exc}",
+              file=sys.stderr)
+        return None, None
+
+
+def screen_fundamentals(
+    earnings_growth: float | None, debt_to_equity: float | None,
+) -> tuple[bool, str]:
+    """Pure red-flag screen. Returns ``(blocked, reason)``.
+
+    A LOOSE filter, NOT a quality ranker: a candidate is blocked ONLY on a
+    genuine red flag — materially negative earnings growth (below
+    ``FUND_EARNINGS_GROWTH_FLOOR``) AND excessive debt/equity (above
+    ``FUND_DEBT_EQUITY_CEILING``), BOTH required. If EITHER datum is missing the
+    screen FAILS OPEN (``blocked=False``) — unknown fundamentals never block.
+    """
+    if earnings_growth is None or debt_to_equity is None:
+        return False, "fundamentals incomplete - fail-open (no block)"
+    if (
+        earnings_growth < config.FUND_EARNINGS_GROWTH_FLOOR
+        and debt_to_equity > config.FUND_DEBT_EQUITY_CEILING
+    ):
+        return True, (
+            f"red flag: earnings growth {earnings_growth:.2f} < "
+            f"{config.FUND_EARNINGS_GROWTH_FLOOR} AND debt/equity "
+            f"{debt_to_equity:.0f} > {config.FUND_DEBT_EQUITY_CEILING:.0f}"
+        )
+    return False, "no red flag"
+
+
+def fundamental_red_flag(ticker: str) -> tuple[bool, str]:
+    """Fetch fundamentals and apply the red-flag screen. Fail-open, never raises."""
+    growth, debt_equity = _fetch_fundamentals(ticker)
+    blocked, reason = screen_fundamentals(growth, debt_equity)
+    if blocked:
+        print(f"  longterm: {ticker} blocked by fundamentals ({reason})",
+              file=sys.stderr)
+    return blocked, reason
