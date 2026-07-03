@@ -347,6 +347,21 @@ def test_build_plan_drops_data_only_crypto_swing_signals() -> None:
     assert "data-only" in drop.reason
 
 
+def test_build_plan_long_term_uses_diversification_sizing() -> None:
+    # LONG_TERM pool capital = 30% of $100k = $30k; a 15% weight = $4500 (NOT
+    # ATR/stop sizing — the candidate has no ATR).
+    acct = AccountInfo(ok=True, equity=100_000.0, cash=100_000.0)
+    lt = Candidate(
+        ticker="AAPL", signal_type="long_term_stock", direction="long",
+        asset_class="stock", entry=100.0, atr=None,
+    )
+    res = allocation.build_plan([lt], acct)
+    order = next(o for o in res.plan.orders if o.ticker == "AAPL")
+    assert order.pool == config.POOL_LONG_TERM
+    assert order.est_cost == 4_500.0            # 15% of $30k, diversification-weighted
+    assert order.qty == 45.0                    # $4500 / $100
+
+
 def test_build_plan_account_unavailable_is_empty_plan() -> None:
     res = allocation.build_plan(
         [_candidate(ticker="AAA")], AccountInfo(ok=False, reason="creds unset"),
