@@ -14,6 +14,7 @@ from trading_bot import (
     db,
     discovery,
     discovery_universe,
+    long_term,
     outcomes,
     performance,
     predictions,
@@ -1571,6 +1572,60 @@ def cmd_options_positions() -> None:
     )
 
 
+# ---- long-term CLI (Phase 14) ----
+
+
+def cmd_longterm_candidates() -> None:
+    """Show current long-term entry candidates (pending allocation). Generated
+    live; they feed the SAME operator-inspected `allocate plan` — nothing here
+    submits an order."""
+    candidates = long_term.generate_candidates(long_term.fetch_daily_candles)
+    print("LONG-TERM ENTRY CANDIDATES  (pending allocation)")
+    print("-" * 84)
+    if not candidates:
+        print("  (none)")
+        return
+    print(f"  {'Ticker':<10} {'Asset':<7} {'Signal':<16} {'Entry':>10}  Rationale")
+    for c in candidates:
+        print(
+            f"  {c.ticker:<10} {c.asset_class:<7} {c.signal_type:<16} "
+            f"{_fmt_money(c.entry_price):>10}  {c.entry_rationale}"
+        )
+    print("\n  These feed `allocate plan` for operator inspection - nothing is submitted.")
+
+
+def cmd_longterm_positions() -> None:
+    """Open long-term positions with current drawdown + trend-breakdown status
+    relative to the protective-exit thresholds."""
+    positions = db.get_open_long_term_positions()
+    print("OPEN LONG-TERM POSITIONS")
+    print("-" * 92)
+    if not positions:
+        print("  (none)")
+        return
+    print(
+        f"  {'Ticker':<10} {'Asset':<7} {'Entry':>9} {'Current':>9} "
+        f"{'Draw%':>7}/{int(config.MAX_DRAWDOWN_STOP_PCT)} "
+        f"{'Below':>5}/{config.TREND_BREAKDOWN_DAYS}"
+    )
+    for p in positions:
+        df = long_term.fetch_daily_candles(p.ticker)
+        current = long_term._val(df["Close"], -1) if df is not None else None
+        drawdown = (
+            (p.entry_price - current) / p.entry_price * 100.0
+            if current is not None and p.entry_price > 0 else None
+        )
+        below = (
+            long_term._consecutive_closes_below_trend(df) if df is not None else None
+        )
+        draw_txt = "-" if drawdown is None else f"{drawdown:.1f}"
+        below_txt = "-" if below is None else str(below)
+        print(
+            f"  {p.ticker:<10} {p.asset_class:<7} {_fmt_money(p.entry_price):>9} "
+            f"{_fmt_money(current):>9} {draw_txt:>7}   {below_txt:>5}"
+        )
+
+
 # ---- predictions CLI (Phase 2.2b) ----
 
 # Seeded defaults — duplicated from scanner._PRED_DEFAULTS so the CLI can
@@ -2049,6 +2104,12 @@ def main() -> None:
     opt_chain_p.add_argument("ticker", help="Underlying ticker, e.g. AAPL")
     options_sub.add_parser("positions")
 
+    # long-term (Phase 14) — buy-and-hold, stocks + crypto
+    longterm_parser = sub.add_parser("longterm")
+    longterm_sub = longterm_parser.add_subparsers(dest="longterm_cmd", required=True)
+    longterm_sub.add_parser("candidates")
+    longterm_sub.add_parser("positions")
+
     # predictions (Phase 2.2b)
     pred_parser = sub.add_parser("predictions")
     pred_sub = pred_parser.add_subparsers(dest="predictions_cmd", required=True)
@@ -2227,6 +2288,11 @@ def main() -> None:
             cmd_options_chain(args.ticker)
         elif args.options_cmd == "positions":
             cmd_options_positions()
+    elif args.command == "longterm":
+        if args.longterm_cmd == "candidates":
+            cmd_longterm_candidates()
+        elif args.longterm_cmd == "positions":
+            cmd_longterm_positions()
     elif args.command == "predictions":
         if args.predictions_cmd == "enable":
             cmd_predictions_enable()

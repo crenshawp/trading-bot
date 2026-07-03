@@ -226,6 +226,29 @@ def to_allocation_candidate(candidate: LongTermCandidate) -> allocation.Candidat
     )
 
 
+def fetch_daily_candles(
+    ticker: str, *, period_days: int | None = None,
+) -> pd.DataFrame | None:
+    """Fetch daily candles for the long-horizon trend. Fail-soft → None.
+
+    Pulls enough history to compute the TREND_PERIOD SMA. Isolated so the CLI and
+    scan can use it while tests inject their own fetch."""
+    days = period_days if period_days is not None else config.TREND_PERIOD + 60
+    try:
+        frame = yf.download(
+            ticker, period=f"{days}d", interval="1d", progress=False,
+            auto_adjust=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - a data fetch must never raise into a scan
+        print(f"  longterm: candle fetch error for {ticker}: {exc}", file=sys.stderr)
+        return None
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return None
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = frame.columns.droplevel(1)
+    return frame
+
+
 def _safe_fetch(
     price_fetch: Callable[[str], pd.DataFrame | None], ticker: str,
 ) -> pd.DataFrame | None:
