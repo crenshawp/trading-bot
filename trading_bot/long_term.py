@@ -30,7 +30,7 @@ may route to the CRYPTO pool. Still PAPER ONLY.
 from __future__ import annotations
 
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -38,7 +38,11 @@ from typing import Any
 import pandas as pd
 import yfinance as yf
 
-from trading_bot import allocation, config, earnings, indicators
+from trading_bot import allocation, config, db, earnings, indicators
+from trading_bot.broker.base import ORDER_TYPE_LIMIT, TIF_DAY, Broker, OrderResult
+from trading_bot.models import LongTermCandidate, LongTermPosition
+
+__all__ = ["LongTermCandidate", "LongTermPosition"]
 
 
 def _to_float(value: Any) -> float | None:
@@ -48,37 +52,6 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
-
-
-@dataclass(frozen=True)
-class LongTermCandidate:
-    """A buy-and-hold entry candidate to feed the Phase 12 allocation plan.
-
-    ``signal_type`` is one of ``config.LONGTERM_STOCK_SIGNAL`` /
-    ``LONGTERM_CRYPTO_SIGNAL`` — the ONLY long-term types that route to
-    execution. ``entry_rationale`` records which gates it cleared (audit)."""
-
-    ticker: str
-    asset_class: str               # 'stock' | 'crypto'
-    signal_type: str               # long_term_stock | long_term_crypto
-    entry_price: float
-    entry_rationale: str = ""
-
-
-@dataclass(frozen=True)
-class LongTermPosition:
-    """An open/closed buy-and-hold position (no tight stop; protective exit only)."""
-
-    ticker: str
-    asset_class: str
-    entry_price: float
-    entry_date: datetime
-    qty: float
-    status: str = "open"           # 'open' | 'closed'
-    exit_price: float | None = None
-    exit_date: datetime | None = None
-    exit_reason: str | None = None  # trend_breakdown | drawdown_stop
-    id: int | None = None
 
 
 # ── fundamental red-flag screen (stocks only, FAIL-OPEN) ─────────────────────
@@ -322,3 +295,131 @@ def generate_candidates(
         ))
 
     return out
+
+
+# ── protective exit watcher (AUTO-EXECUTING; closing is safe to automate) ─────
+#
+# Mirrors the Phase 13 options watcher: closing (never opening) is the one action
+# safe to automate. No profit-taking this phase — protective exits ONLY.
+
+EXIT_TREND_BREAKDOWN = "trend_breakdown"
+EXIT_DRAWDOWN_STOP = "drawdown_stop"
+EXIT_HOLDING = "holding"
+
+
+@dataclass(frozen=True)
+class ProtectiveExitDecision:
+    """Whether to protectively close a long-term position now, and why."""
+
+    action: str      # 'close' | 'hold'
+    reason: str      # trend_breakdown | drawdown_stop | holding
+
+
+@dataclass(frozen=True)
+class ExitAction:
+    """What the watcher did for one position this cycle."""
+
+    position: LongTermPosition
+    action: str                      # 'close' | 'hold' | 'error'
+    reason: str
+    order: OrderResult | None = None
+
+
+def evaluate_protective_exit(
+    entry_price: float,
+    current_price: float | None,
+    consecutive_closes_below_trend: int,
+    *,
+    breakdown_days: int = config.TREND_BREAKDOWN_DAYS,
+    max_drawdown_pct: float = config.MAX_DRAWDOWN_STOP_PCT,
+) -> ProtectiveExitDecision:
+    """Pure protective-exit decision. Close on EITHER a drawdown-from-entry stop
+    OR a trend breakdown (N consecutive closes below the long-horizon trend);
+    otherwise hold. There is NO profit-taking exit this phase. Never raises.
+
+    The drawdown stop is checked first (capital protection); with neither
+    condition met the position is held.
+    """
+    if entry_price > 0.0 and current_price is not None:
+        drawdown_pct = (entry_price - current_price) / entry_price * 100.0
+        if drawdown_pct >= max_drawdown_pct:
+            return ProtectiveExitDecision("close", EXIT_DRAWDOWN_STOP)
+    if consecutive_closes_below_trend >= breakdown_days:
+        return ProtectiveExitDecision("close", EXIT_TREND_BREAKDOWN)
+    return ProtectiveExitDecision("hold", EXIT_HOLDING)
+
+
+def _consecutive_closes_below_trend(
+    df: pd.DataFrame, trend_period: int = config.TREND_PERIOD,
+) -> int:
+    """Count the trailing run of closes STRICTLY below the ``trend_period`` SMA.
+
+    Walks backward from the latest candle; stops at the first close at/above the
+    trend or the first NaN trend value (too little data). Never raises → 0."""
+    try:
+        close = df["Close"]
+        trend = indicators.sma(close, trend_period)
+        count = 0
+        for i in range(len(close) - 1, -1, -1):
+            trend_val = trend.iloc[i]
+            if pd.isna(trend_val):
+                break
+            if float(close.iloc[i]) < float(trend_val):
+                count += 1
+            else:
+                break
+        return count
+    except Exception as exc:  # noqa: BLE001 - the watcher must never raise here
+        print(f"  longterm: trend-breakdown count error: {exc}", file=sys.stderr)
+        return 0
+
+
+def watch_long_term_positions(
+    broker: Broker,
+    *,
+    price_fetch: Callable[[str], pd.DataFrame | None],
+    now: datetime,
+    trend_period: int = config.TREND_PERIOD,
+    positions: Sequence[LongTermPosition] | None = None,
+) -> list[ExitAction]:
+    """Check each open long-term position and AUTO-CLOSE the ones that hit a
+    protective-exit condition (trend breakdown or drawdown stop).
+
+    For a closing position it submits a SELL LIMIT via the Phase 11 equity path
+    (marketable at the latest close), records the ``exit_reason``, and marks the
+    row closed. FAIL-SOFT: an error on one position is logged and NEVER blocks the
+    others. ``price_fetch`` is injected (candles per ticker), keeping this
+    testable; ``positions`` defaults to the open book from the DB.
+    """
+    book = positions if positions is not None else db.get_open_long_term_positions()
+    actions: list[ExitAction] = []
+    for pos in book:
+        try:
+            df = price_fetch(pos.ticker)
+            if df is None:
+                actions.append(ExitAction(pos, "hold", "no price data"))
+                continue
+            current_price = _val(df["Close"], -1)
+            consecutive = _consecutive_closes_below_trend(df, trend_period)
+            decision = evaluate_protective_exit(
+                pos.entry_price, current_price, consecutive,
+            )
+            if decision.action == "hold":
+                actions.append(ExitAction(pos, "hold", decision.reason))
+                continue
+
+            order = broker.submit_order(
+                pos.ticker, pos.qty, "sell", order_type=ORDER_TYPE_LIMIT,
+                limit_price=current_price, time_in_force=TIF_DAY,
+            )
+            if pos.id is not None:
+                db.update_long_term_position(
+                    pos.id, status="closed", exit_price=current_price,
+                    exit_date=now, exit_reason=decision.reason,
+                )
+            actions.append(ExitAction(pos, "close", decision.reason, order=order))
+        except Exception as exc:  # noqa: BLE001 - one position must never block others
+            print(f"  longterm watcher error for {pos.ticker}: {exc}",
+                  file=sys.stderr)
+            actions.append(ExitAction(pos, "error", str(exc)))
+    return actions

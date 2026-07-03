@@ -26,6 +26,7 @@ from trading_bot.models import (
     VALID_VIX_BANDS,
     VALID_WATCHLIST_STATUSES,
     DailyPerf,
+    LongTermPosition,
     OptionPosition,
     Prediction,
     Signal,
@@ -42,6 +43,7 @@ from trading_bot.models import (
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
+# Version 18 (Phase 14) — adds the long_term_positions table (buy-and-hold).
 # Version 17 (Phase 13) — adds the option_positions table (single-leg options).
 # Version 16 (Phase 10) — adds the readiness_state ledger.
 # Version 15 (Phase 9) — adds the optimization_runs history table.
@@ -49,7 +51,7 @@ from trading_bot.models import (
 # Version 13 (Phase 6) — adds trades.ind_* advisory indicator-family columns.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -319,6 +321,24 @@ CREATE TABLE IF NOT EXISTS option_positions (
 
 CREATE INDEX IF NOT EXISTS idx_option_positions_open
     ON option_positions(outcome);
+
+-- Phase 14: long-term buy-and-hold positions (fractional shares, no tight stop).
+-- The protective exit watcher closes these on trend-breakdown or drawdown-stop.
+CREATE TABLE IF NOT EXISTS long_term_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    asset_class TEXT NOT NULL,
+    entry_price REAL NOT NULL,
+    entry_date TEXT NOT NULL,
+    qty REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
+    exit_price REAL,
+    exit_date TEXT,
+    exit_reason TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_long_term_positions_status
+    ON long_term_positions(status);
 """
 
 # Whitelist for update_trade — never interpolate user input into SQL column names.
@@ -339,11 +359,15 @@ _TABLE_NAMES: tuple[str, ...] = (
     "predictions", "settings", "active_watchlist", "discovery_results",
     "shadow_evaluations", "watchlist_transitions",
     "signal_pair_status", "signal_pair_transitions", "optimization_runs",
-    "readiness_state", "option_positions",
+    "readiness_state", "option_positions", "long_term_positions",
 )
 
 _OPTION_POSITION_UPDATABLE_FIELDS: frozenset[str] = frozenset(
     {"order_id", "closed_at", "exit_price", "outcome", "pnl_dollars"}
+)
+
+_LONG_TERM_UPDATABLE_FIELDS: frozenset[str] = frozenset(
+    {"status", "exit_price", "exit_date", "exit_reason"}
 )
 
 # Whitelist for update_prediction — resolution flow + Phase 2.3 context backfill.
@@ -604,6 +628,15 @@ def _migrate_to_v17(_conn: sqlite3.Connection) -> None:
     return None
 
 
+def _migrate_to_v18(_conn: sqlite3.Connection) -> None:
+    """Phase 14 migration step.
+
+    Nothing to ALTER — the new ``long_term_positions`` table is created by the
+    ``CREATE TABLE IF NOT EXISTS`` block above. Documented hook only.
+    """
+    return None
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -625,6 +658,7 @@ def init_db() -> None:
         _migrate_to_v15(conn)
         _migrate_to_v16(conn)
         _migrate_to_v17(conn)
+        _migrate_to_v18(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -2610,6 +2644,116 @@ def update_option_position(position_id: int, **fields: Any) -> None:
         raise ValueError(f"Invalid outcome '{normalized['outcome']}'")
     set_clause = ", ".join(f"{k} = ?" for k in normalized)  # keys are whitelisted
     sql = f"UPDATE option_positions SET {set_clause} WHERE id = ?"  # noqa: S608
+    params = [*normalized.values(), position_id]
+    conn = get_connection()
+    try:
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---- long-term positions (Phase 14) ----
+
+
+def insert_long_term_position(pos: LongTermPosition) -> int:
+    """Insert a buy-and-hold position and return its id."""
+    if pos.status not in ("open", "closed"):
+        raise ValueError(f"Invalid status '{pos.status}'")
+    sql = """
+        INSERT INTO long_term_positions (
+            ticker, asset_class, entry_price, entry_date, qty, status,
+            exit_price, exit_date, exit_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    params = (
+        pos.ticker,
+        pos.asset_class,
+        pos.entry_price,
+        pos.entry_date.isoformat(),
+        pos.qty,
+        pos.status,
+        pos.exit_price,
+        pos.exit_date.isoformat() if pos.exit_date is not None else None,
+        pos.exit_reason,
+    )
+    conn = get_connection()
+    try:
+        cur = conn.execute(sql, params)
+        conn.commit()
+        new_id = cur.lastrowid
+        if new_id is None:
+            raise RuntimeError("INSERT did not return a row id")
+        return new_id
+    finally:
+        conn.close()
+
+
+def _row_to_long_term_position(row: sqlite3.Row) -> LongTermPosition:
+    return LongTermPosition(
+        ticker=str(row["ticker"]),
+        asset_class=str(row["asset_class"]),
+        entry_price=float(row["entry_price"]),
+        entry_date=datetime.fromisoformat(row["entry_date"]),
+        qty=float(row["qty"]),
+        status=str(row["status"]),
+        exit_price=row["exit_price"],
+        exit_date=(
+            datetime.fromisoformat(row["exit_date"]) if row["exit_date"] else None
+        ),
+        exit_reason=row["exit_reason"],
+        id=int(row["id"]),
+    )
+
+
+def get_open_long_term_positions() -> list[LongTermPosition]:
+    """Open buy-and-hold positions — the protective exit watcher's book."""
+    sql = (
+        "SELECT * FROM long_term_positions WHERE status = 'open' "
+        "ORDER BY entry_date ASC"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_long_term_position(r) for r in rows]
+
+
+def get_long_term_positions(limit: int = 100) -> list[LongTermPosition]:
+    """Recent buy-and-hold positions, newest first (reporting / CLI)."""
+    sql = (
+        "SELECT * FROM long_term_positions "
+        "ORDER BY entry_date DESC, id DESC LIMIT ?"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, (limit,)).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_long_term_position(r) for r in rows]
+
+
+def update_long_term_position(position_id: int, **fields: Any) -> None:
+    """Whitelisted partial update — used by the protective exit watcher."""
+    unknown = set(fields) - _LONG_TERM_UPDATABLE_FIELDS
+    if unknown:
+        raise ValueError(
+            f"Unknown long_term_position field(s): {sorted(unknown)} "
+            f"(allowed: {sorted(_LONG_TERM_UPDATABLE_FIELDS)})"
+        )
+    if not fields:
+        return
+    normalized: dict[str, Any] = {}
+    for key, value in fields.items():
+        normalized[key] = value.isoformat() if isinstance(value, datetime) else value
+    if (
+        "status" in normalized
+        and normalized["status"] not in ("open", "closed")
+    ):
+        raise ValueError(f"Invalid status '{normalized['status']}'")
+    set_clause = ", ".join(f"{k} = ?" for k in normalized)  # keys are whitelisted
+    sql = f"UPDATE long_term_positions SET {set_clause} WHERE id = ?"  # noqa: S608
     params = [*normalized.values(), position_id]
     conn = get_connection()
     try:

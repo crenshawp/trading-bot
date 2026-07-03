@@ -122,6 +122,38 @@ VALID_PAIR_STATUSES: frozenset[str] = frozenset({"enabled", "muted"})
 
 
 @dataclass(frozen=True)
+class LongTermCandidate:
+    """A buy-and-hold entry candidate to feed the Phase 12 allocation plan (Phase 14).
+
+    ``signal_type`` is one of ``config.LONGTERM_STOCK_SIGNAL`` /
+    ``LONGTERM_CRYPTO_SIGNAL`` — the ONLY long-term types that route to execution.
+    ``entry_rationale`` records which gates it cleared (audit)."""
+
+    ticker: str
+    asset_class: str               # 'stock' | 'crypto'
+    signal_type: str               # long_term_stock | long_term_crypto
+    entry_price: float
+    entry_rationale: str = ""
+
+
+@dataclass(frozen=True)
+class LongTermPosition:
+    """An open/closed buy-and-hold position (Phase 14; no tight stop — protective
+    exit only)."""
+
+    ticker: str
+    asset_class: str
+    entry_price: float
+    entry_date: datetime
+    qty: float
+    status: str = "open"           # 'open' | 'closed'
+    exit_price: float | None = None
+    exit_date: datetime | None = None
+    exit_reason: str | None = None  # trend_breakdown | drawdown_stop
+    id: int | None = None
+
+
+@dataclass(frozen=True)
 class OptionPosition:
     """An open/closed single-leg option position (Phase 13).
 
