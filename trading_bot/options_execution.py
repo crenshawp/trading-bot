@@ -22,7 +22,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from trading_bot import config, db
+from trading_bot import config, db, risk_of_ruin
 from trading_bot.broker.base import ORDER_TYPE_LIMIT, TIF_DAY, Broker, OrderResult
 from trading_bot.broker.options import (
     OPTION_TYPE_CALL,
@@ -278,11 +278,14 @@ def submit_execution_order(
     and the share fallback both go through ``Broker.submit_order``; the Phase 11
     structured-rejection handling is reused verbatim."""
     limit_price = _limit_price_for(decision)
-    return broker.submit_order(
+    order = broker.submit_order(
         decision.symbol, decision.qty, decision.side,
         order_type=ORDER_TYPE_LIMIT, limit_price=limit_price,
         time_in_force=time_in_force,
     )
+    # Phase 15: feed the consecutive broker-error detector (resets on success).
+    risk_of_ruin.record_broker_result(order.ok)
+    return order
 
 
 def record_option_position(
@@ -446,6 +449,7 @@ def watch_open_option_positions(
                 order_type=ORDER_TYPE_LIMIT, limit_price=limit_price,
                 time_in_force=TIF_DAY,
             )
+            risk_of_ruin.record_broker_result(order.ok)   # Phase 15 detector
             outcome = (
                 "win" if decision.reason == EXIT_TAKE_PROFIT
                 else "loss" if decision.reason == EXIT_STOP_LOSS

@@ -184,7 +184,7 @@ def _decision_full() -> oe.ExecutionDecision:
 
 
 def test_submit_execution_order_is_limit_with_no_bracket_attrs(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_db: Path,
 ) -> None:
     b = FakeBroker()
     calls: list[tuple[str, float, str, dict[str, object]]] = []
@@ -204,7 +204,7 @@ def test_submit_execution_order_is_limit_with_no_bracket_attrs(
         assert forbidden not in kw
 
 
-def test_submit_execution_order_structured_rejection() -> None:
+def test_submit_execution_order_structured_rejection(tmp_db: Path) -> None:
     b = FakeBroker(reject_reason="options not permitted at this level")
     order = oe.submit_execution_order(b, _decision_full())
     assert order.ok is False

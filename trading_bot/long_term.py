@@ -38,7 +38,7 @@ from typing import Any
 import pandas as pd
 import yfinance as yf
 
-from trading_bot import allocation, config, db, earnings, indicators
+from trading_bot import allocation, config, db, earnings, indicators, risk_of_ruin
 from trading_bot.broker.base import ORDER_TYPE_LIMIT, TIF_DAY, Broker, OrderResult
 from trading_bot.models import LongTermCandidate, LongTermPosition
 
@@ -435,6 +435,7 @@ def watch_long_term_positions(
                 pos.ticker, pos.qty, "sell", order_type=ORDER_TYPE_LIMIT,
                 limit_price=current_price, time_in_force=TIF_DAY,
             )
+            risk_of_ruin.record_broker_result(order.ok)   # Phase 15 detector
             if pos.id is not None:
                 db.update_long_term_position(
                     pos.id, status="closed", exit_price=current_price,

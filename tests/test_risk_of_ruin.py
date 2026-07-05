@@ -201,3 +201,111 @@ def test_build_plan_entries_empty_when_entry_revoked() -> None:
     assert res.plan.orders == []                        # entries-empty
     assert res.skipped[0].stage == "risk"
     assert "entries-paused" in res.skipped[0].reason
+
+
+# ───────────────────────── catastrophic detection: broker errors ─────────────
+
+
+def test_broker_error_streak_trips_at_three_consecutive(tmp_db: Path) -> None:
+    ror.record_broker_result(False)
+    ror.record_broker_result(False)
+    assert ror.check_catastrophic() is None            # 2 < 3: calm
+    ror.record_broker_result(False)
+    reason = ror.check_catastrophic()
+    assert reason is not None and "3 consecutive broker errors" in reason
+
+
+def test_broker_error_streak_resets_on_intervening_success(tmp_db: Path) -> None:
+    ror.record_broker_result(False)
+    ror.record_broker_result(False)
+    ror.record_broker_result(True)                     # success resets
+    ror.record_broker_result(False)
+    assert ror.broker_error_streak() == 1
+    assert ror.check_catastrophic() is None
+
+
+def test_order_paths_feed_the_broker_error_counter(tmp_db: Path) -> None:
+    # A structured rejection through the options order path increments the
+    # streak; a successful submit resets it (the Phase 15 wiring, end to end).
+    from datetime import date
+
+    from trading_bot import options_execution as oe
+    from trading_bot.broker.fake import FakeBroker
+    from trading_bot.broker.options import OptionContract
+
+    contract = OptionContract(
+        symbol="AAPL260130C00150000", underlying="AAPL", option_type="call",
+        strike=150.0, expiry="2026-01-30", delta=0.70, open_interest=500,
+        bid=4.9, ask=5.1, mid=5.0,
+    )
+    decision = oe.choose_execution(
+        "call", 600.0, "AAPL", 100.0, [contract], ref_date=date(2026, 1, 1),
+    )
+    oe.submit_execution_order(FakeBroker(reject_reason="market closed"), decision)
+    assert ror.broker_error_streak() == 1
+    oe.submit_execution_order(FakeBroker(), decision)
+    assert ror.broker_error_streak() == 0              # success resets
+
+
+# ───────────────────────── catastrophic detection: unreconcilable ────────────
+
+
+def test_reconcile_divergence_streak_trips_after_persistence(tmp_db: Path) -> None:
+    ror.record_reconcile_result(True)
+    ror.record_reconcile_result(True)
+    assert ror.check_catastrophic() is None
+    ror.record_reconcile_result(True)
+    reason = ror.check_catastrophic()
+    assert reason is not None and "unreconcilable" in reason
+
+
+def test_reconcile_divergence_streak_resets_on_clean_check(tmp_db: Path) -> None:
+    ror.record_reconcile_result(True)
+    ror.record_reconcile_result(True)
+    ror.record_reconcile_result(False)                 # clean reconcile resets
+    assert ror.reconcile_divergence_streak() == 0
+    assert ror.check_catastrophic() is None
+
+
+# ───────────────────────── top-level guard (unhandled exception) ─────────────
+
+
+def test_run_guarded_success_calls_no_handler(tmp_db: Path) -> None:
+    triggered: list[str] = []
+    ok = ror.run_guarded(lambda: None, on_catastrophic=triggered.append)
+    assert ok is True and triggered == []
+
+
+def test_run_guarded_routes_unhandled_exception_without_crashing(
+    tmp_db: Path,
+) -> None:
+    triggered: list[str] = []
+
+    def boom() -> None:
+        raise RuntimeError("core loop blew up")
+
+    ok = ror.run_guarded(boom, on_catastrophic=triggered.append)
+    assert ok is False                                 # process did NOT crash
+    assert len(triggered) == 1
+    assert "core loop blew up" in triggered[0]
+
+
+def test_run_guarded_default_handler_revokes_and_records(tmp_db: Path) -> None:
+    def boom() -> None:
+        raise ValueError("kaboom")
+
+    ok = ror.run_guarded(boom)                         # default handler
+    assert ok is False
+    assert ror.is_entry_authorized() is False          # fail-safe hard revoke
+    assert ror.get_state() == ror.STATE_HOLDING
+
+
+def test_run_guarded_survives_a_failing_handler(tmp_db: Path) -> None:
+    def boom() -> None:
+        raise RuntimeError("primary")
+
+    def bad_handler(_reason: str) -> None:
+        raise RuntimeError("handler also broken")
+
+    ok = ror.run_guarded(boom, on_catastrophic=bad_handler)
+    assert ok is False                                 # still no crash

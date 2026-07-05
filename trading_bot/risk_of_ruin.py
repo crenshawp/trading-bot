@@ -234,3 +234,123 @@ def evaluate_tier1(
     except Exception as exc:  # noqa: BLE001 - a notifier must never break the breaker
         print(f"  risk: tier1 notifier error ({exc})", file=sys.stderr)
     return Tier1Result(True, trigger, losses, drawdown, STATE_PAUSED)
+
+
+# ── Tier 2 detection: catastrophic failure triggers ───────────────────────────
+
+
+def _get_streak(key: str) -> int:
+    raw = settings.get(key, "0") or "0"
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
+def record_broker_result(ok: bool) -> int:
+    """Record one broker order outcome across the equity/options order paths.
+
+    A structured error/rejection increments the consecutive-error streak; a
+    success resets it. Returns the streak. FAIL-SOFT: a persistence error is
+    logged and the last-known streak returned — the counter must never take
+    down an order path.
+    """
+    try:
+        streak = 0 if ok else _get_streak(_BROKER_ERROR_STREAK_KEY) + 1
+        settings.set(_BROKER_ERROR_STREAK_KEY, str(streak))
+        if not ok:
+            print(f"  risk: broker error streak {streak}", file=sys.stderr)
+        return streak
+    except Exception as exc:  # noqa: BLE001 - the counter must never break an order path
+        print(f"  risk: broker-error counter failed ({exc})", file=sys.stderr)
+        return _get_streak(_BROKER_ERROR_STREAK_KEY)
+
+
+def broker_error_streak() -> int:
+    """The current consecutive broker-error count."""
+    return _get_streak(_BROKER_ERROR_STREAK_KEY)
+
+
+def record_reconcile_result(has_divergences: bool) -> int:
+    """Record one reconciliation outcome. Divergences present increments the
+    streak; a clean reconcile resets it. Returns the streak. Fail-soft."""
+    try:
+        streak = 0 if not has_divergences else _get_streak(_RECONCILE_STREAK_KEY) + 1
+        settings.set(_RECONCILE_STREAK_KEY, str(streak))
+        if has_divergences:
+            print(f"  risk: reconcile divergence streak {streak}", file=sys.stderr)
+        return streak
+    except Exception as exc:  # noqa: BLE001 - the counter must never break a check
+        print(f"  risk: reconcile counter failed ({exc})", file=sys.stderr)
+        return _get_streak(_RECONCILE_STREAK_KEY)
+
+
+def reconcile_divergence_streak() -> int:
+    """The current consecutive reconcile-divergence count."""
+    return _get_streak(_RECONCILE_STREAK_KEY)
+
+
+def check_catastrophic() -> str | None:
+    """Return a catastrophic-trigger reason, or None when all detectors are calm.
+
+    Two persisted detectors: the consecutive broker-error streak and the
+    consecutive unreconcilable-position streak. (The third trigger — an
+    unhandled core-loop exception — arrives via :func:`run_guarded` directly.)
+    """
+    errors = broker_error_streak()
+    if errors >= config.MAX_CONSECUTIVE_BROKER_ERRORS:
+        return (
+            f"{errors} consecutive broker errors "
+            f"(limit {config.MAX_CONSECUTIVE_BROKER_ERRORS})"
+        )
+    divergences = reconcile_divergence_streak()
+    if divergences >= config.MAX_CONSECUTIVE_RECONCILE_DIVERGENCES:
+        return (
+            f"unreconcilable positions across {divergences} consecutive checks "
+            f"(limit {config.MAX_CONSECUTIVE_RECONCILE_DIVERGENCES})"
+        )
+    return None
+
+
+def _default_catastrophic_handler(reason: str) -> None:
+    """Fail-safe default when no orchestrator is injected: hard-revoke entry and
+    record the trigger so the next loop pass (or operator) runs the Tier-2
+    shutdown. The full orchestrator (Section 4) is wired in by callers."""
+    revoke(config.ENTRY_CAPABILITY, f"tier2: {reason}")
+    _set_state(STATE_HOLDING)
+    settings.set(_LAST_EVENT_KEY, f"tier2 trigger: {reason}")
+    print(f"  risk: CATASTROPHIC TRIGGER recorded - {reason}", file=sys.stderr)
+
+
+def run_guarded(
+    cycle_fn: Callable[[], None],
+    *,
+    on_catastrophic: Callable[[str], object] | None = None,
+) -> bool:
+    """Run one core-loop cycle under the top-level catastrophic guard.
+
+    ANY unhandled exception is caught (full context logged), routed to the
+    catastrophic handler (the Tier-2 orchestrator in production), and False is
+    returned — the process NEVER crashes silently out of the loop. A failing
+    handler is itself caught, so the guard cannot raise.
+    """
+    try:
+        cycle_fn()
+        return True
+    except Exception as exc:  # noqa: BLE001 - THE top-level guard: catch everything
+        import traceback
+
+        reason = f"unhandled exception in core loop: {exc!r}"
+        print(f"  risk: {reason}\n{traceback.format_exc()}", file=sys.stderr)
+        handler = (
+            on_catastrophic if on_catastrophic is not None
+            else _default_catastrophic_handler
+        )
+        try:
+            handler(reason)
+        except Exception as handler_exc:  # noqa: BLE001 - the guard must never raise
+            print(
+                f"  risk: catastrophic handler itself failed ({handler_exc})",
+                file=sys.stderr,
+            )
+        return False
