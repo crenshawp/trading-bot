@@ -1,0 +1,236 @@
+"""Risk of ruin — circuit breakers + emergency shutdown (Phase 15).
+
+The mandatory safety layer required before any live-switch decision. Two
+severity tiers, kept structurally distinct:
+
+* **TIER 1 (pause)** — 7 consecutive resolved losses OR a 20% peak-to-trough
+  EQUITY drawdown → stop opening NEW positions by REVOKING the
+  ``new_position_entry`` capability, Pushover-notify, and await operator
+  re-authorization. Existing positions are NOT touched — their own watchers
+  (Phase 13 options / Phase 14 long-term) keep managing them.
+* **TIER 2 (emergency shutdown)** — catastrophic failure (repeated broker
+  errors, an unhandled core-loop exception, an unreconcilable position) →
+  close EVERY open position via the EXISTING closers, confirm closure via
+  broker reconciliation, then halt. Never claims a closure the broker did not
+  confirm; never fully shuts down while a position remains open.
+
+AUTHORIZATION LEDGER — the capability pattern mirrored from Phase 10: a named
+capability with persisted state and ONE gate function consulted by actors.
+Phase 10's ``readiness_state`` table only admits warming/ready, so this ledger
+persists in the existing settings store (permissive-by-default: no row ==
+authorized, matching the Phase 4/10 ledger conventions). Re-authorization is
+operator-only and token-gated (the confirmation-token discipline is defined
+here; Phase 10 had no token CLI).
+
+Still PAPER ONLY — this phase builds the gate a future live-switch depends on;
+it does not flip that switch.
+"""
+
+from __future__ import annotations
+
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+
+import requests
+
+from trading_bot import config, db, secrets, settings
+
+# A notifier sends (title, message) and returns True on a confirmed send —
+# dependency-injected so tests capture it; the default posts to Pushover.
+Notifier = Callable[[str, str], bool]
+
+_HTTP_TIMEOUT_SECONDS = 10
+
+# Persisted state keys (settings store).
+_STATE_KEY = "ror.state"                    # normal | paused | holding | halted
+_AUTH_KEY_PREFIX = "auth."                  # auth.<capability> = authorized|revoked
+_AUTH_REASON_SUFFIX = ".reason"
+_BROKER_ERROR_STREAK_KEY = "ror.broker_error_streak"
+_RECONCILE_STREAK_KEY = "ror.reconcile_divergence_streak"
+_LAST_EVENT_KEY = "ror.last_event"
+
+STATE_NORMAL = "normal"
+STATE_PAUSED = "paused"          # Tier 1 tripped — new entries revoked
+STATE_HOLDING = "holding"        # Tier 2 in progress — closes pending (market shut)
+STATE_HALTED = "halted"          # Tier 2 complete or unconfirmable — full stop
+
+
+# ── notification (fail-soft, mirrors readiness._pushover_notify) ─────────────
+
+
+def _pushover_notify(title: str, message: str) -> bool:
+    """Post to Pushover; True only on a 2xx send. Fail-soft, never raises."""
+    try:
+        token = secrets.get_secret("PUSHOVER_APP_TOKEN")
+        user = secrets.get_secret("PUSHOVER_USER_KEY")
+        if not token or not user:
+            print("  risk: Pushover creds unset - notification skipped",
+                  file=sys.stderr)
+            return False
+        resp = requests.post(
+            "https://api.pushover.net/1/messages.json",
+            data={"token": token, "user": user, "title": title, "message": message},
+            timeout=_HTTP_TIMEOUT_SECONDS,
+        )
+        status = getattr(resp, "status_code", None)
+        if status is not None and 200 <= status < 300:
+            return True
+        print(f"  risk: Pushover HTTP {status}", file=sys.stderr)
+        return False
+    except Exception as exc:  # noqa: BLE001 - notification must never raise
+        print(f"  risk: Pushover error ({exc})", file=sys.stderr)
+        return False
+
+
+# ── authorization ledger (the Phase 10 capability pattern) ───────────────────
+
+
+def is_authorized(capability: str) -> bool:
+    """The ONE gate actors consult. Permissive-by-default: no row == authorized."""
+    return settings.get(f"{_AUTH_KEY_PREFIX}{capability}", "authorized") == "authorized"
+
+
+def revoke(capability: str, reason: str) -> None:
+    """Revoke a capability, recording why. Logged; idempotent."""
+    settings.set(f"{_AUTH_KEY_PREFIX}{capability}", "revoked")
+    settings.set(f"{_AUTH_KEY_PREFIX}{capability}{_AUTH_REASON_SUFFIX}", reason)
+    print(f"  risk: capability {capability} REVOKED ({reason})", file=sys.stderr)
+
+
+def authorize(capability: str) -> None:
+    """Restore a capability (operator re-authorization). Logged; idempotent."""
+    settings.set(f"{_AUTH_KEY_PREFIX}{capability}", "authorized")
+    settings.delete(f"{_AUTH_KEY_PREFIX}{capability}{_AUTH_REASON_SUFFIX}")
+    print(f"  risk: capability {capability} authorized", file=sys.stderr)
+
+
+def revoke_reason(capability: str) -> str | None:
+    """The recorded reason for a revocation, or None when authorized."""
+    if is_authorized(capability):
+        return None
+    return settings.get(f"{_AUTH_KEY_PREFIX}{capability}{_AUTH_REASON_SUFFIX}")
+
+
+def is_entry_authorized() -> bool:
+    """May the bot open NEW positions? (The gate the allocation plan checks.)"""
+    return is_authorized(config.ENTRY_CAPABILITY)
+
+
+# ── persisted tier state ──────────────────────────────────────────────────────
+
+
+def get_state() -> str:
+    """Current risk state: normal | paused | holding | halted."""
+    return settings.get(_STATE_KEY, STATE_NORMAL) or STATE_NORMAL
+
+
+def _set_state(state: str) -> None:
+    settings.set(_STATE_KEY, state)
+
+
+# ── equity snapshot recording + drawdown ─────────────────────────────────────
+
+
+def record_equity_snapshot(equity: float | None, *, now: datetime | None = None) -> bool:
+    """Record one equity observation (from ``Broker.get_account().equity``).
+
+    Called once per scan cycle. A missing equity (account unreadable) records
+    nothing and returns False — an outage must not fabricate a drawdown.
+    """
+    if equity is None or equity <= 0.0:
+        print("  risk: no usable equity - snapshot skipped", file=sys.stderr)
+        return False
+    moment = now if now is not None else datetime.now(UTC)
+    db.insert_equity_snapshot(equity, moment)
+    return True
+
+
+def current_drawdown_pct() -> float | None:
+    """Peak-to-trough drawdown % from the equity snapshots, or None if no data.
+
+    Reads EQUITY (which already reflects unrealized losses on open positions),
+    not closed-trade PnL alone.
+    """
+    peak = db.get_equity_peak()
+    latest = db.get_latest_equity()
+    if peak is None or latest is None or peak <= 0.0:
+        return None
+    return (peak - latest) / peak * 100.0
+
+
+# ── Tier 1: consecutive losses + drawdown → pause new entries ────────────────
+
+
+def consecutive_losses() -> int:
+    """The trailing run of resolved LOSSES (newest-first, active book)."""
+    streak = 0
+    for outcome in db.get_recent_resolved_outcomes(limit=max(
+        config.MAX_CONSECUTIVE_LOSSES * 2, 20,
+    )):
+        if outcome == "loss":
+            streak += 1
+        else:
+            break
+    return streak
+
+
+@dataclass(frozen=True)
+class Tier1Result:
+    """The standing after one Tier-1 evaluation pass."""
+
+    tripped: bool
+    trigger: str | None          # 'consecutive_losses' | 'drawdown' | None
+    losses: int
+    drawdown_pct: float | None
+    state: str
+
+
+def evaluate_tier1(
+    *, notifier: Notifier | None = None, now: datetime | None = None,
+) -> Tier1Result:
+    """Evaluate the Tier-1 breakers; trip → revoke new entries + Pushover.
+
+    Trips when the loss streak reaches ``MAX_CONSECUTIVE_LOSSES`` (exactly at,
+    not before) OR the equity drawdown reaches ``MAX_DRAWDOWN_PCT``. Tripping
+    REVOKES ``new_position_entry`` via the authorization ledger and pauses the
+    state — it does NOT touch existing open positions (their own watchers keep
+    running). Already paused/halted states are left as-is (no re-trip spam).
+    """
+    send = notifier if notifier is not None else _pushover_notify
+    losses = consecutive_losses()
+    drawdown = current_drawdown_pct()
+    state = get_state()
+
+    if state in (STATE_PAUSED, STATE_HOLDING, STATE_HALTED):
+        return Tier1Result(False, None, losses, drawdown, state)
+
+    trigger: str | None = None
+    if losses >= config.MAX_CONSECUTIVE_LOSSES:
+        trigger = "consecutive_losses"
+    elif drawdown is not None and drawdown >= config.MAX_DRAWDOWN_PCT:
+        trigger = "drawdown"
+
+    if trigger is None:
+        return Tier1Result(False, None, losses, drawdown, state)
+
+    detail = (
+        f"{losses} consecutive losses (limit {config.MAX_CONSECUTIVE_LOSSES})"
+        if trigger == "consecutive_losses"
+        else f"drawdown {drawdown:.1f}% (limit {config.MAX_DRAWDOWN_PCT:.0f}%)"
+    )
+    revoke(config.ENTRY_CAPABILITY, f"tier1: {detail}")
+    _set_state(STATE_PAUSED)
+    settings.set(_LAST_EVENT_KEY, f"tier1 pause: {detail}")
+    print(f"  risk: TIER 1 PAUSE - {detail}", file=sys.stderr)
+    try:
+        send(
+            "TIER 1 CIRCUIT BREAKER - NEW ENTRIES PAUSED",
+            f"{detail}. New position entry revoked; existing positions remain "
+            "managed by their watchers. Re-authorize via: python -m trading_bot "
+            "risk reauthorize <token>",
+        )
+    except Exception as exc:  # noqa: BLE001 - a notifier must never break the breaker
+        print(f"  risk: tier1 notifier error ({exc})", file=sys.stderr)
+    return Tier1Result(True, trigger, losses, drawdown, STATE_PAUSED)

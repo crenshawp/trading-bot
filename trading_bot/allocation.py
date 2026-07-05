@@ -476,6 +476,7 @@ def build_plan(
     account: AccountInfo,
     *,
     split: dict[str, float] | None = None,
+    entry_authorized: bool = True,
 ) -> AllocationResult:
     """Run the four-stage pipeline and EMIT an :class:`AllocationResult`.
 
@@ -485,11 +486,37 @@ def build_plan(
     the allocation logic is proven (a test asserts zero submissions occur in this
     path).
 
+    ``entry_authorized`` is the Phase 15 risk-of-ruin gate (callers pass
+    ``risk_of_ruin.is_entry_authorized()``): when the ``new_position_entry``
+    capability is revoked the plan is ENTRIES-EMPTY — every candidate is skipped
+    with a logged reason. Existing positions are unaffected (their watchers run
+    regardless of this gate).
+
     Fail-soft: if the paper account cannot be read (``account.ok`` False or no
     usable balances), an empty plan is returned with ``ok=False`` and a logged
     reason; every candidate is recorded as skipped (``account-unavailable``) so
     nothing is silently lost.
     """
+    if not entry_authorized:
+        print(
+            "  allocate: new-position entry REVOKED (risk-of-ruin) - "
+            "entries-empty plan",
+            file=sys.stderr,
+        )
+        return AllocationResult(
+            ok=True,
+            plan=ExecutionPlan(),
+            skipped=[
+                SkippedSignal(
+                    c.ticker, c.signal_type, None, "risk",
+                    "entries-paused (risk-of-ruin)",
+                )
+                for c in candidates
+            ],
+            pools=[],
+            note="entries paused (risk-of-ruin)",
+        )
+
     caps = pool_capitals(account, split=split)
     if caps is None:
         reason = account.reason or "account unavailable"

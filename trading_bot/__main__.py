@@ -20,6 +20,7 @@ from trading_bot import (
     predictions,
     readiness,
     regime,
+    risk_of_ruin,
     secrets,
     self_optimization,
     settings,
@@ -1414,12 +1415,17 @@ def cmd_allocate_plan() -> None:
     the inspectable execution plan. EXECUTES NOTHING — no order is submitted."""
     account = broker.AlpacaBroker().get_account()
     candidates = allocation.sample_candidates()
-    result = allocation.build_plan(candidates, account)
+    # Phase 15: the risk-of-ruin gate — a revoked new_position_entry capability
+    # yields an entries-empty plan (existing positions' watchers run regardless).
+    result = allocation.build_plan(
+        candidates, account,
+        entry_authorized=risk_of_ruin.is_entry_authorized(),
+    )
 
     print("ALLOCATION PLAN  (Phase 12 - PLAN ONLY, executes nothing)")
     print("-" * 84)
     print(f"  Candidates: {len(candidates)} (illustrative SAMPLE set)")
-    if not result.ok:
+    if result.note:
         print(f"  {result.note}")
 
     print()
