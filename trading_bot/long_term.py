@@ -372,6 +372,36 @@ def evaluate_protective_exit(
     return ProtectiveExitDecision("hold", EXIT_HOLDING)
 
 
+def close_long_term_position(
+    broker: Broker,
+    position: LongTermPosition,
+    *,
+    exit_price: float | None,
+    now: datetime,
+    reason: str,
+) -> OrderResult:
+    """THE long-term closing path — a SELL LIMIT via the Phase 11 equity path.
+    Used by the protective exit watcher AND the Phase 15 emergency shutdown, so
+    there is exactly one closer.
+
+    The position row is marked closed ONLY when the broker accepted the order —
+    a rejected close (e.g. market closed) leaves it open so the next cycle
+    retries; nothing is recorded closed without a real order.
+    """
+    limit_price = exit_price if exit_price is not None else position.entry_price
+    order = broker.submit_order(
+        position.ticker, position.qty, "sell", order_type=ORDER_TYPE_LIMIT,
+        limit_price=limit_price, time_in_force=TIF_DAY,
+    )
+    risk_of_ruin.record_broker_result(order.ok)   # Phase 15 detector
+    if order.ok and position.id is not None:
+        db.update_long_term_position(
+            position.id, status="closed", exit_price=exit_price,
+            exit_date=now, exit_reason=reason,
+        )
+    return order
+
+
 def _consecutive_closes_below_trend(
     df: pd.DataFrame, trend_period: int = config.TREND_PERIOD,
 ) -> int:
@@ -431,16 +461,17 @@ def watch_long_term_positions(
                 actions.append(ExitAction(pos, "hold", decision.reason))
                 continue
 
-            order = broker.submit_order(
-                pos.ticker, pos.qty, "sell", order_type=ORDER_TYPE_LIMIT,
-                limit_price=current_price, time_in_force=TIF_DAY,
+            order = close_long_term_position(
+                broker, pos, exit_price=current_price, now=now,
+                reason=decision.reason,
             )
-            risk_of_ruin.record_broker_result(order.ok)   # Phase 15 detector
-            if pos.id is not None:
-                db.update_long_term_position(
-                    pos.id, status="closed", exit_price=current_price,
-                    exit_date=now, exit_reason=decision.reason,
-                )
+            if not order.ok:
+                # Close not accepted (e.g. market closed) — row stays open so the
+                # next cycle retries; never recorded closed without a real order.
+                actions.append(ExitAction(
+                    pos, "error", f"close order failed: {order.reason}", order=order,
+                ))
+                continue
             actions.append(ExitAction(pos, "close", decision.reason, order=order))
         except Exception as exc:  # noqa: BLE001 - one position must never block others
             print(f"  longterm watcher error for {pos.ticker}: {exc}",

@@ -13,6 +13,7 @@ from pathlib import Path
 from trading_bot import allocation, config, db
 from trading_bot import risk_of_ruin as ror
 from trading_bot.broker.base import AccountInfo
+from trading_bot.broker.fake import FakeBroker
 from trading_bot.models import LongTermPosition, OptionPosition, Signal, Trade
 
 _TS = datetime(2026, 1, 1, 9, 0, tzinfo=UTC)
@@ -309,3 +310,127 @@ def test_run_guarded_survives_a_failing_handler(tmp_db: Path) -> None:
 
     ok = ror.run_guarded(boom, on_catastrophic=bad_handler)
     assert ok is False                                 # still no crash
+
+
+# ───────────────────────── Tier 2: emergency shutdown ───────────────────────
+
+
+class _ClosingFakeBroker(FakeBroker):
+    """A FakeBroker whose accepted SELLs actually clear the broker-side position,
+    so reconciliation can confirm a flat book."""
+
+    def submit_order(self, symbol: str, qty: float, side: str, **kw: object):  # type: ignore[no-untyped-def]
+        order = super().submit_order(symbol, qty, side, **kw)  # type: ignore[arg-type]
+        if order.ok and side == "sell":
+            self._positions.pop(symbol, None)
+        return order
+
+
+def _seed_open_option() -> None:
+    db.insert_option_position(OptionPosition(
+        symbol="AAPL260116C00150000", underlying="AAPL", option_type="call",
+        strike=150.0, expiry="2026-01-16", contracts=2.0, opened_at=_TS,
+        premium_entry=5.0, outcome="open",
+    ))
+
+
+def _seed_open_long_term() -> None:
+    db.insert_long_term_position(LongTermPosition(
+        ticker="META", asset_class="stock", entry_price=480.0, entry_date=_TS,
+        qty=5.0, status="open",
+    ))
+
+
+def test_emergency_shutdown_calls_all_three_closers_then_halts(
+    tmp_db: Path,
+) -> None:
+    _seed_open_option()
+    _seed_open_long_term()
+    b = _ClosingFakeBroker()
+    b.set_position("NVDA", 3.0, avg_entry_price=120.0)   # broker-side equity
+    rec = _Recorder()
+
+    result = ror.emergency_shutdown(
+        b, trigger="test trigger", notifier=rec, now=_TS,
+        option_price_fetch=lambda _s: 6.0,
+        long_term_price_fetch=lambda _t: 470.0,
+    )
+
+    assert result.status == "halted"
+    # ALL THREE closers were invoked — one closed entry per book.
+    kinds = {c.split(" ")[0] for c in result.closed}
+    assert kinds == {"option", "long-term", "equity"}
+    # Internal books are closed, broker book flat, state persisted halted.
+    assert db.get_open_option_positions() == []
+    assert db.get_open_long_term_positions() == []
+    assert ror.get_state() == ror.STATE_HALTED
+    assert ror.is_entry_authorized() is False
+    # The emergency Pushover fired with the required title.
+    assert any(
+        "BOT HAS ENCOUNTERED A SEVERE ERROR SHUT DOWN INITIATED" in t
+        for t, _m in rec.calls
+    )
+
+
+def test_emergency_shutdown_market_closed_defers_and_retries(
+    tmp_db: Path,
+) -> None:
+    _seed_open_option()
+    rec = _Recorder()
+    closed_market = FakeBroker(reject_reason="market closed")
+
+    first = ror.emergency_shutdown(
+        closed_market, trigger="test", notifier=rec, now=_TS,
+        option_price_fetch=lambda _s: 6.0,
+    )
+    # Deferred, NOT skipped: holding state, position still open, NOT halted.
+    assert first.status == "holding"
+    assert first.pending and "market closed" in first.pending[0]
+    assert len(db.get_open_option_positions()) == 1     # row NOT faked closed
+    assert ror.get_state() == ror.STATE_HOLDING
+
+    # Next cycle, market open: the retry completes and halts.
+    second = ror.emergency_shutdown(
+        FakeBroker(), trigger="test", notifier=rec, now=_TS,
+        option_price_fetch=lambda _s: 6.0,
+    )
+    assert second.status == "halted"
+    assert db.get_open_option_positions() == []
+    assert ror.get_state() == ror.STATE_HALTED
+
+
+def test_emergency_shutdown_reconcile_failure_never_claims_closure(
+    tmp_db: Path, monkeypatch,
+) -> None:
+    from trading_bot.broker.reconcile import ReconciliationReport
+
+    _seed_open_option()
+    rec = _Recorder()
+    monkeypatch.setattr(
+        ror, "reconcile",
+        lambda _b: ReconciliationReport(ok=False, note="broker down"),
+    )
+    result = ror.emergency_shutdown(
+        FakeBroker(), trigger="test", notifier=rec, now=_TS,
+        option_price_fetch=lambda _s: 6.0,
+    )
+    assert result.status == "unconfirmed"               # no false "closed" claim
+    assert any(
+        "UNABLE TO CONFIRM CLOSURE" in t and "MANUAL INTERVENTION" in t
+        for t, _m in rec.calls
+    )
+    # No "severe error shutdown" success message was sent.
+    assert not any("SHUT DOWN INITIATED" in t for t, _m in rec.calls)
+
+
+def test_emergency_shutdown_holds_while_broker_still_shows_positions(
+    tmp_db: Path,
+) -> None:
+    # A plain FakeBroker never clears its seeded position on sell, so the
+    # reconcile-confirmation step keeps the bot ALIVE in holding — a full halt
+    # only happens after confirmed closure.
+    b = FakeBroker()
+    b.set_position("NVDA", 3.0, avg_entry_price=120.0)
+    result = ror.emergency_shutdown(b, trigger="test", notifier=_Recorder(), now=_TS)
+    assert result.status == "holding"
+    assert ror.get_state() == ror.STATE_HOLDING         # alive, not halted

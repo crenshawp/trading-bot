@@ -413,6 +413,39 @@ def _option_pnl_dollars(
     )
 
 
+def close_option_position(
+    broker: Broker,
+    position: OptionPosition,
+    *,
+    exit_price: float | None,
+    now: datetime,
+    outcome: str,
+) -> tuple[OrderResult, float | None]:
+    """THE option-closing path — a single-leg SELL LIMIT via the Phase 11 order
+    path (no bracket attributes exist for options). Used by the exit watcher AND
+    the Phase 15 emergency shutdown, so there is exactly one closer.
+
+    The position row is marked closed ONLY when the broker accepted the order —
+    a rejected close (e.g. market closed) leaves the row open so the next cycle
+    retries; nothing is ever recorded closed that was not submitted.
+    Returns ``(order, realized_pnl_dollars)``.
+    """
+    limit_price = exit_price if exit_price is not None else position.premium_entry
+    order = broker.submit_order(
+        position.symbol, position.contracts, "sell",
+        order_type=ORDER_TYPE_LIMIT, limit_price=limit_price,
+        time_in_force=TIF_DAY,
+    )
+    risk_of_ruin.record_broker_result(order.ok)   # Phase 15 detector
+    pnl = _option_pnl_dollars(position, exit_price)
+    if order.ok and position.id is not None:
+        db.update_option_position(
+            position.id, order_id=order.order_id, outcome=outcome,
+            closed_at=now, exit_price=exit_price, pnl_dollars=pnl,
+        )
+    return order, pnl
+
+
 def watch_open_option_positions(
     broker: Broker,
     *,
@@ -443,24 +476,21 @@ def watch_open_option_positions(
                 continue
 
             exit_price = option_price_fetch(pos.symbol)
-            limit_price = exit_price if exit_price is not None else pos.premium_entry
-            order = broker.submit_order(
-                pos.symbol, pos.contracts, "sell",
-                order_type=ORDER_TYPE_LIMIT, limit_price=limit_price,
-                time_in_force=TIF_DAY,
-            )
-            risk_of_ruin.record_broker_result(order.ok)   # Phase 15 detector
             outcome = (
                 "win" if decision.reason == EXIT_TAKE_PROFIT
                 else "loss" if decision.reason == EXIT_STOP_LOSS
                 else "expired"
             )
-            pnl = _option_pnl_dollars(pos, exit_price)
-            if pos.id is not None:
-                db.update_option_position(
-                    pos.id, order_id=order.order_id, outcome=outcome,
-                    closed_at=now, exit_price=exit_price, pnl_dollars=pnl,
-                )
+            order, pnl = close_option_position(
+                broker, pos, exit_price=exit_price, now=now, outcome=outcome,
+            )
+            if not order.ok:
+                # Close not accepted (e.g. market closed) — row stays open so the
+                # next cycle retries; never recorded closed without a real order.
+                actions.append(ExitAction(
+                    pos, "error", f"close order failed: {order.reason}", order=order,
+                ))
+                continue
             actions.append(
                 ExitAction(pos, "close", decision.reason, order=order, pnl_dollars=pnl)
             )

@@ -36,6 +36,9 @@ from datetime import UTC, datetime
 import requests
 
 from trading_bot import config, db, secrets, settings
+from trading_bot.broker.base import Broker
+from trading_bot.broker.reconcile import reconcile
+from trading_bot.models import OptionPosition
 
 # A notifier sends (title, message) and returns True on a confirmed send —
 # dependency-injected so tests capture it; the default posts to Pushover.
@@ -320,6 +323,211 @@ def _default_catastrophic_handler(reason: str) -> None:
     _set_state(STATE_HOLDING)
     settings.set(_LAST_EVENT_KEY, f"tier2 trigger: {reason}")
     print(f"  risk: CATASTROPHIC TRIGGER recorded - {reason}", file=sys.stderr)
+
+
+# ── Tier 2: emergency shutdown orchestrator ──────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ShutdownResult:
+    """The outcome of one emergency-shutdown pass.
+
+    ``status``:
+    * ``holding``     — closes submitted but not all accepted (e.g. market
+      closed) or the broker still shows positions: the bot stays ALIVE in a
+      minimal holding state and retries next cycle. It never fully shuts down
+      while a position remains open.
+    * ``unconfirmed`` — the broker itself was unreachable at confirmation:
+      halted in a safe non-crashing state, closure NOT claimed, manual
+      intervention summoned.
+    * ``halted``      — every position broker-confirmed closed; full halt.
+    """
+
+    status: str
+    trigger: str
+    closed: list[str]
+    pending: list[str]
+    note: str = ""
+
+
+def _emergency_option_outcome(pos: OptionPosition, exit_price: float | None) -> str:
+    """Outcome label for an emergency option close, from realized premium PnL."""
+    if exit_price is None or pos.premium_entry is None:
+        return "expired"
+    if exit_price > pos.premium_entry:
+        return "win"
+    if exit_price < pos.premium_entry:
+        return "loss"
+    return "breakeven"
+
+
+def emergency_shutdown(
+    broker: Broker,
+    *,
+    trigger: str,
+    notifier: Notifier | None = None,
+    now: datetime | None = None,
+    option_price_fetch: Callable[[str], float | None] | None = None,
+    long_term_price_fetch: Callable[[str], float | None] | None = None,
+) -> ShutdownResult:
+    """TIER 2: close EVERY open position, confirm closure, then halt.
+
+    The ONE shutdown path — the manual kill switch and every auto-detected
+    catastrophic trigger run THIS function; there is no separate/weaker route.
+
+    1. Hard-revoke all new-position entry immediately.
+    2. Close every open position via the EXISTING closers — the Phase 13 options
+       closer, the Phase 14 long-term closer, and the Phase 11 equity order path
+       for any remaining broker-side position. Closing logic is never
+       reimplemented here.
+    3. Market closed (a close is rejected): do NOT skip — return ``holding`` so
+       the still-alive loop retries automatically at the next cycle/open.
+    4. Confirm closure via broker reconciliation — a position is never claimed
+       closed without broker confirmation.
+    5. Broker unreachable at confirmation: log the unresolvable state, Pushover
+       for manual intervention, halt safely WITHOUT claiming closure.
+    6. All confirmed closed: full halt + emergency Pushover, event recorded.
+    """
+    # Lazy imports: options_execution / long_term import THIS module for the
+    # broker-error detector, so the orchestrator resolves them at call time.
+    from trading_bot import long_term as lt
+    from trading_bot import options_execution as oe
+
+    send = notifier if notifier is not None else _pushover_notify
+    moment = now if now is not None else datetime.now(UTC)
+
+    # 1 — block all new entry, immediately and unconditionally.
+    revoke(config.ENTRY_CAPABILITY, f"tier2: {trigger}")
+    _set_state(STATE_HOLDING)
+    settings.set(_LAST_EVENT_KEY, f"tier2 shutdown: {trigger}")
+    print(f"  risk: EMERGENCY SHUTDOWN initiated ({trigger})", file=sys.stderr)
+
+    closed: list[str] = []
+    pending: list[str] = []
+
+    # 2a — options book, via the Phase 13 closer.
+    for pos in db.get_open_option_positions():
+        try:
+            price = option_price_fetch(pos.symbol) if option_price_fetch else None
+            exit_price = price if price is not None else pos.premium_entry
+            order, _pnl = oe.close_option_position(
+                broker, pos, exit_price=exit_price, now=moment,
+                outcome=_emergency_option_outcome(pos, exit_price),
+            )
+            if order.ok:
+                closed.append(f"option {pos.symbol} x{pos.contracts:g} @ {exit_price}")
+            else:
+                pending.append(f"option {pos.symbol} ({order.reason})")
+        except Exception as exc:  # noqa: BLE001 - one position must never block the rest
+            print(f"  risk: option close error for {pos.symbol}: {exc}",
+                  file=sys.stderr)
+            pending.append(f"option {pos.symbol} (error: {exc})")
+
+    # 2b — long-term book, via the Phase 14 closer.
+    for lt_pos in db.get_open_long_term_positions():
+        try:
+            price = (
+                long_term_price_fetch(lt_pos.ticker)
+                if long_term_price_fetch else None
+            )
+            exit_price = price if price is not None else lt_pos.entry_price
+            order = lt.close_long_term_position(
+                broker, lt_pos, exit_price=exit_price, now=moment,
+                reason="emergency_shutdown",
+            )
+            if order.ok:
+                closed.append(f"long-term {lt_pos.ticker} x{lt_pos.qty:g} @ {exit_price}")
+            else:
+                pending.append(f"long-term {lt_pos.ticker} ({order.reason})")
+        except Exception as exc:  # noqa: BLE001 - one position must never block the rest
+            print(f"  risk: long-term close error for {lt_pos.ticker}: {exc}",
+                  file=sys.stderr)
+            pending.append(f"long-term {lt_pos.ticker} (error: {exc})")
+
+    # 2c — any remaining broker-side position, via the Phase 11 equity path.
+    positions = broker.get_positions()
+    if positions.ok:
+        for bpos in positions.positions:
+            try:
+                price = (
+                    bpos.market_value / bpos.qty
+                    if bpos.market_value is not None and bpos.qty
+                    else bpos.avg_entry_price
+                )
+                side = "sell" if bpos.side != "short" else "buy"
+                order = broker.submit_order(
+                    bpos.symbol, abs(bpos.qty), side,
+                    order_type="limit", limit_price=price, time_in_force="day",
+                )
+                record_broker_result(order.ok)
+                if order.ok:
+                    closed.append(f"equity {bpos.symbol} x{bpos.qty:g}")
+                else:
+                    pending.append(f"equity {bpos.symbol} ({order.reason})")
+            except Exception as exc:  # noqa: BLE001 - one position must never block the rest
+                print(f"  risk: equity close error for {bpos.symbol}: {exc}",
+                      file=sys.stderr)
+                pending.append(f"equity {bpos.symbol} (error: {exc})")
+    else:
+        pending.append(f"broker positions unreadable ({positions.reason})")
+
+    # 3 — anything not accepted (e.g. market closed): stay alive and retry.
+    if pending:
+        note = (
+            f"{len(pending)} close(s) pending - holding state, retrying next "
+            "cycle (market closed or broker degraded)"
+        )
+        print(f"  risk: {note}", file=sys.stderr)
+        _safe_send(send, "EMERGENCY SHUTDOWN HOLDING - CLOSES PENDING",
+                   f"Trigger: {trigger}. Pending: {'; '.join(pending)}")
+        return ShutdownResult("holding", trigger, closed, pending, note)
+
+    # 4 — confirm closure via reconciliation; the broker is authoritative.
+    report = reconcile(broker)
+    if not report.ok:
+        # 5 — broker unreachable: never fabricate a closure.
+        note = "broker unreachable - closure NOT confirmed"
+        print(f"  risk: {note}", file=sys.stderr)
+        _safe_send(
+            send,
+            "UNABLE TO CONFIRM CLOSURE - MANUAL INTERVENTION REQUIRED",
+            f"Trigger: {trigger}. Close orders submitted: "
+            f"{'; '.join(closed) or '(none)'} - but reconciliation failed "
+            f"({report.note}). Verify positions manually.",
+        )
+        _set_state(STATE_HALTED)
+        settings.set(_LAST_EVENT_KEY, f"tier2 UNCONFIRMED halt: {trigger}")
+        return ShutdownResult("unconfirmed", trigger, closed, pending, note)
+
+    if report.broker_symbols:
+        note = (
+            f"broker still holds {report.broker_symbols} - holding state, "
+            "retrying next cycle"
+        )
+        print(f"  risk: {note}", file=sys.stderr)
+        return ShutdownResult("holding", trigger, closed, pending, note)
+
+    # 6 — every position broker-confirmed closed: full halt.
+    _set_state(STATE_HALTED)
+    settings.set(_LAST_EVENT_KEY, f"tier2 halt complete: {trigger}")
+    _safe_send(
+        send,
+        "BOT HAS ENCOUNTERED A SEVERE ERROR SHUT DOWN INITIATED",
+        f"Trigger: {trigger}. Positions closed: {'; '.join(closed) or '(none)'}. "
+        "Closure broker-confirmed via reconciliation. Restart requires: "
+        "python -m trading_bot risk reauthorize <token>",
+    )
+    print("  risk: SHUTDOWN COMPLETE - all positions confirmed closed",
+          file=sys.stderr)
+    return ShutdownResult("halted", trigger, closed, pending, "confirmed closed")
+
+
+def _safe_send(send: Notifier, title: str, message: str) -> None:
+    """Notify without ever letting a notifier failure break the shutdown."""
+    try:
+        send(title, message)
+    except Exception as exc:  # noqa: BLE001 - the shutdown must not depend on Pushover
+        print(f"  risk: notifier error ({exc})", file=sys.stderr)
 
 
 def run_guarded(
