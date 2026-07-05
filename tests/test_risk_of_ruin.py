@@ -434,3 +434,97 @@ def test_emergency_shutdown_holds_while_broker_still_shows_positions(
     result = ror.emergency_shutdown(b, trigger="test", notifier=_Recorder(), now=_TS)
     assert result.status == "holding"
     assert ror.get_state() == ror.STATE_HOLDING         # alive, not halted
+
+
+# ───────────────────────── re-authorization (token-gated) ───────────────────
+
+
+def test_reauthorize_requires_exact_token(tmp_db: Path) -> None:
+    ror.revoke(config.ENTRY_CAPABILITY, "tier1: test")
+    ok, message = ror.reauthorize("wrong-token")
+    assert ok is False and "invalid confirmation token" in message
+    assert ror.is_entry_authorized() is False           # nothing changed
+
+
+def test_reauthorize_clears_tier1_pause(tmp_db: Path) -> None:
+    _seed_resolved(["loss"] * 7)
+    ror.evaluate_tier1(notifier=_Recorder())
+    assert ror.get_state() == ror.STATE_PAUSED
+    ok, _ = ror.reauthorize(config.ROR_REAUTHORIZE_TOKEN)
+    assert ok is True
+    assert ror.get_state() == ror.STATE_NORMAL
+    assert ror.is_entry_authorized() is True
+
+
+def test_reauthorize_clears_tier2_halt_and_resets_detectors(tmp_db: Path) -> None:
+    ror.record_broker_result(False)
+    ror.emergency_shutdown(FakeBroker(), trigger="test", notifier=_Recorder(), now=_TS)
+    assert ror.get_state() == ror.STATE_HALTED
+    ok, _ = ror.reauthorize(config.ROR_REAUTHORIZE_TOKEN)
+    assert ok is True
+    assert ror.get_state() == ror.STATE_NORMAL
+    assert ror.is_entry_authorized() is True
+    assert ror.broker_error_streak() == 0               # detectors reset
+
+
+# ───────────────────────── manual kill switch (identical path) ──────────────
+
+
+def test_kill_switch_refuses_wrong_token(tmp_db: Path) -> None:
+    _seed_open_option()
+    result = ror.kill_switch("wrong", FakeBroker(), notifier=_Recorder(), now=_TS)
+    assert result is None                               # nothing happened
+    assert len(db.get_open_option_positions()) == 1
+    assert ror.get_state() == ror.STATE_NORMAL
+
+
+def test_kill_switch_runs_the_identical_shutdown_path(
+    tmp_db: Path, monkeypatch,
+) -> None:
+    # The kill switch delegates to emergency_shutdown ITSELF — same function
+    # object, no separate/weaker code path.
+    calls: list[str] = []
+    original = ror.emergency_shutdown
+
+    def spy(broker, **kw):  # type: ignore[no-untyped-def]
+        calls.append(kw["trigger"])
+        return original(broker, **kw)
+
+    monkeypatch.setattr(ror, "emergency_shutdown", spy)
+    result = ror.kill_switch(
+        config.ROR_KILLSWITCH_TOKEN, FakeBroker(), notifier=_Recorder(), now=_TS,
+    )
+    assert calls == ["manual kill switch"]              # the one orchestrator ran
+    assert result is not None and result.status == "halted"
+
+
+def test_kill_switch_and_auto_trigger_produce_identical_behavior(
+    tmp_db: Path,
+) -> None:
+    # Same setup → the manual kill switch and an auto-detected trigger yield the
+    # same status, the same closed book, and the same persisted end state.
+    _seed_open_option()
+    rec_auto = _Recorder()
+    auto = ror.emergency_shutdown(
+        FakeBroker(), trigger="3 consecutive broker errors", notifier=rec_auto,
+        now=_TS, option_price_fetch=lambda _s: 6.0,
+    )
+    auto_state = ror.get_state()
+
+    # Reset the world and repeat via the kill switch.
+    ok, _ = ror.reauthorize(config.ROR_REAUTHORIZE_TOKEN)
+    assert ok
+    _seed_open_option()
+    rec_manual = _Recorder()
+    manual = ror.kill_switch(
+        config.ROR_KILLSWITCH_TOKEN, FakeBroker(), notifier=rec_manual, now=_TS,
+        option_price_fetch=lambda _s: 6.0,
+    )
+
+    assert manual is not None
+    assert manual.status == auto.status == "halted"
+    assert manual.closed == auto.closed                 # same closures
+    assert ror.get_state() == auto_state == ror.STATE_HALTED
+    assert (
+        [t for t, _m in rec_manual.calls] == [t for t, _m in rec_auto.calls]
+    )                                                   # same notifications

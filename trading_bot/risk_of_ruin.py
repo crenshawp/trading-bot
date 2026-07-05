@@ -530,6 +530,60 @@ def _safe_send(send: Notifier, title: str, message: str) -> None:
         print(f"  risk: notifier error ({exc})", file=sys.stderr)
 
 
+# ── operator controls: re-authorization + manual kill switch ─────────────────
+
+
+def reauthorize(token: str) -> tuple[bool, str]:
+    """Clear a Tier-1 pause OR a Tier-2 halt and restore capabilities.
+
+    OPERATOR-ONLY and token-gated (the confirmation-token discipline extending
+    the Phase 10 capability pattern): the exact ``ROR_REAUTHORIZE_TOKEN`` must be
+    supplied or nothing changes. Restores the entry capability, resets the
+    catastrophic detectors, and returns the state to normal. The bot never
+    leaves a paused/halted state any other way.
+    """
+    if token != config.ROR_REAUTHORIZE_TOKEN:
+        return False, (
+            "invalid confirmation token - nothing changed "
+            f"(expected {config.ROR_REAUTHORIZE_TOKEN!r})"
+        )
+    previous = get_state()
+    authorize(config.ENTRY_CAPABILITY)
+    settings.set(_BROKER_ERROR_STREAK_KEY, "0")
+    settings.set(_RECONCILE_STREAK_KEY, "0")
+    _set_state(STATE_NORMAL)
+    settings.set(_LAST_EVENT_KEY, f"operator re-authorization (was {previous})")
+    print(f"  risk: operator re-authorization (was {previous})", file=sys.stderr)
+    return True, f"re-authorized: state {previous} -> normal, entry restored"
+
+
+def kill_switch(
+    token: str,
+    broker: Broker,
+    *,
+    notifier: Notifier | None = None,
+    now: datetime | None = None,
+    option_price_fetch: Callable[[str], float | None] | None = None,
+    long_term_price_fetch: Callable[[str], float | None] | None = None,
+) -> ShutdownResult | None:
+    """The manual kill switch — the IDENTICAL Tier-2 shutdown path, on demand.
+
+    Token-gated: a wrong token returns None and NOTHING happens. A correct token
+    runs :func:`emergency_shutdown` itself — the very same orchestrator an
+    auto-detected catastrophic trigger runs; there is no separate or weaker
+    human-invoked code path.
+    """
+    if token != config.ROR_KILLSWITCH_TOKEN:
+        print("  risk: kill switch REFUSED (invalid confirmation token)",
+              file=sys.stderr)
+        return None
+    return emergency_shutdown(
+        broker, trigger="manual kill switch", notifier=notifier, now=now,
+        option_price_fetch=option_price_fetch,
+        long_term_price_fetch=long_term_price_fetch,
+    )
+
+
 def run_guarded(
     cycle_fn: Callable[[], None],
     *,

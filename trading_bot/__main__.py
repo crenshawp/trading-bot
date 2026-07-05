@@ -1632,6 +1632,68 @@ def cmd_longterm_positions() -> None:
         )
 
 
+# ---- risk-of-ruin CLI (Phase 15) ----
+
+
+def cmd_risk_ror_status() -> None:
+    """Current tier state, drawdown, streaks, and entry authorization."""
+    drawdown = risk_of_ruin.current_drawdown_pct()
+    print("RISK-OF-RUIN STATUS  (Phase 15 safety layer)")
+    print("-" * 64)
+    print(f"  State:                 {risk_of_ruin.get_state()}")
+    print(
+        f"  Entry authorized:      "
+        f"{'yes' if risk_of_ruin.is_entry_authorized() else 'NO'}"
+    )
+    reason = risk_of_ruin.revoke_reason(config.ENTRY_CAPABILITY)
+    if reason:
+        print(f"  Revoke reason:         {reason}")
+    print(
+        f"  Consecutive losses:    {risk_of_ruin.consecutive_losses()} "
+        f"/ {config.MAX_CONSECUTIVE_LOSSES} limit"
+    )
+    dd_txt = "-" if drawdown is None else f"{drawdown:.1f}%"
+    print(f"  Equity drawdown:       {dd_txt} / {config.MAX_DRAWDOWN_PCT:.0f}% limit")
+    print(
+        f"  Broker-error streak:   {risk_of_ruin.broker_error_streak()} "
+        f"/ {config.MAX_CONSECUTIVE_BROKER_ERRORS} limit"
+    )
+    print(
+        f"  Reconcile divergences: {risk_of_ruin.reconcile_divergence_streak()} "
+        f"/ {config.MAX_CONSECUTIVE_RECONCILE_DIVERGENCES} limit"
+    )
+    catastrophic = risk_of_ruin.check_catastrophic()
+    if catastrophic:
+        print(f"  CATASTROPHIC TRIGGER:  {catastrophic}")
+
+
+def cmd_risk_reauthorize(token: str) -> None:
+    """Operator re-authorization after a Tier-1 pause or Tier-2 halt."""
+    ok, message = risk_of_ruin.reauthorize(token)
+    print(message)
+    if not ok:
+        sys.exit(1)
+
+
+def cmd_risk_killswitch(token: str) -> None:
+    """Human-invoked Tier-2 emergency shutdown — the IDENTICAL orchestrator an
+    auto-detected catastrophic trigger runs."""
+    result = risk_of_ruin.kill_switch(token, broker.AlpacaBroker())
+    if result is None:
+        print(
+            "kill switch REFUSED: invalid confirmation token "
+            f"(expected {config.ROR_KILLSWITCH_TOKEN!r})"
+        )
+        sys.exit(1)
+    print(f"KILL SWITCH: {result.status}  (trigger: {result.trigger})")
+    for line in result.closed:
+        print(f"  closed:  {line}")
+    for line in result.pending:
+        print(f"  pending: {line}")
+    if result.note:
+        print(f"  note: {result.note}")
+
+
 # ---- predictions CLI (Phase 2.2b) ----
 
 # Seeded defaults — duplicated from scanner._PRED_DEFAULTS so the CLI can
@@ -2066,6 +2128,11 @@ def main() -> None:
         help="How many recent risk-assessed signals to show (default 20)",
     )
     risk_sub.add_parser("exposure")
+    # Phase 15 — risk-of-ruin operator controls.
+    risk_reauth_p = risk_sub.add_parser("reauthorize")
+    risk_reauth_p.add_argument("token", help="Confirmation token (operator-only)")
+    risk_kill_p = risk_sub.add_parser("killswitch")
+    risk_kill_p.add_argument("token", help="Confirmation token (operator-only)")
 
     # optimize (Phase 9)
     optimize_parser = sub.add_parser("optimize")
@@ -2263,9 +2330,16 @@ def main() -> None:
             cmd_indicators_status(limit=args.limit)
     elif args.command == "risk":
         if args.risk_cmd == "status":
+            # Phase 15 tier state first, then the Phase 7 advisory signal view.
+            cmd_risk_ror_status()
+            print()
             cmd_risk_status(limit=args.limit)
         elif args.risk_cmd == "exposure":
             cmd_risk_exposure()
+        elif args.risk_cmd == "reauthorize":
+            cmd_risk_reauthorize(args.token)
+        elif args.risk_cmd == "killswitch":
+            cmd_risk_killswitch(args.token)
     elif args.command == "optimize":
         if args.optimize_cmd == "run":
             cmd_optimize_run(

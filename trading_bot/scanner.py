@@ -39,6 +39,7 @@ from trading_bot import (
     readiness,
     regime,
     risk,
+    risk_of_ruin,
     settings,
     vix,
 )
@@ -1211,6 +1212,36 @@ def _run_readiness_evaluation() -> None:
         print(f"  readiness evaluation error: {exc}", file=sys.stderr)
 
 
+def _run_risk_cycle() -> None:
+    """Phase 15: one risk-of-ruin pass per scan cycle.
+
+    Records an equity snapshot (drawdown source), evaluates the Tier-1 circuit
+    breaker, and — if a catastrophic detector has tripped or a Tier-2 shutdown
+    is mid-flight (holding state, e.g. market was closed) — runs the emergency
+    shutdown orchestrator. Swallow-all so a transient failure never kills the
+    loop; the orchestrator itself is fail-soft."""
+    try:
+        from trading_bot.broker import AlpacaBroker
+
+        broker = AlpacaBroker()
+        account = broker.get_account()
+        risk_of_ruin.record_equity_snapshot(account.equity)
+        risk_of_ruin.evaluate_tier1()
+
+        reason = risk_of_ruin.check_catastrophic()
+        if reason is not None:
+            risk_of_ruin.emergency_shutdown(broker, trigger=reason)
+        elif risk_of_ruin.get_state() == risk_of_ruin.STATE_HOLDING:
+            # A prior shutdown pass left closes pending (market closed) — the
+            # bot stays alive and retries automatically until confirmed.
+            risk_of_ruin.emergency_shutdown(
+                broker, trigger="retrying pending emergency closes",
+            )
+    except Exception as exc:
+        import sys
+        print(f"  risk cycle error: {exc}", file=sys.stderr)
+
+
 def _run_daily_perf_update() -> None:
     """Materialize yesterday's daily_performance row. Swallow-all on failure
     so a transient DB error doesn't kill the scheduling loop."""
@@ -1880,6 +1911,15 @@ def main() -> None:
     DRY_RUN = bool(args.dry_run)
 
     db.init_db()         # idempotent — creates schema on first deploy
+    # Phase 15: a halted bot NEVER restarts on its own. Explicit operator
+    # re-authorization (risk reauthorize <token>) is the only way back.
+    if risk_of_ruin.get_state() == risk_of_ruin.STATE_HALTED:
+        print(
+            "risk-of-ruin: HALTED - refusing to start. Re-authorize via: "
+            "python -m trading_bot risk reauthorize <token>",
+            file=sys.stderr,
+        )
+        return
     # Phase 3.1: seed the DB-driven watchlist from the hardcoded seed list on
     # first run. Idempotent — a no-op once the table has any rows, so it never
     # clobbers discovery promotions.
@@ -1937,6 +1977,11 @@ def main() -> None:
     # summons ML builds on first crossing, notifying exactly once (Phase 10).
     schedule.every(1).hours.do(_run_readiness_evaluation)
 
+    # Phase 15: risk-of-ruin pass every hour — equity snapshot (drawdown source),
+    # Tier-1 circuit breaker, catastrophic detectors, and holding-state retries.
+    _never_raise(_run_risk_cycle)()
+    schedule.every(1).hours.do(_never_raise(_run_risk_cycle))
+
     # Materialize yesterday's daily_performance row daily at 00:30 UTC
     # (~20:30 ET, well after market close and the hourly resolver). Phase 1.4.
     schedule.every().day.at("00:30", "UTC").do(_run_daily_perf_update)
@@ -1963,9 +2008,28 @@ def main() -> None:
     schedule.every(5).minutes.do(_never_raise(_run_prediction_resolution))
     print(f"Schedules registered: {schedule.jobs}")
 
-    while True:
+    # Phase 15: the top-level catastrophic guard. ANY unhandled exception that
+    # escapes the per-job wrappers is caught, logged with full context, and
+    # routed to the Tier-2 emergency shutdown — the process never crashes
+    # silently, and it never keeps trading after a halt.
+    def _core_cycle() -> None:
         schedule.run_pending()
         time.sleep(1)
+
+    def _catastrophic_handler(reason: str) -> None:
+        from trading_bot.broker import AlpacaBroker
+
+        risk_of_ruin.emergency_shutdown(AlpacaBroker(), trigger=reason)
+
+    while True:
+        risk_of_ruin.run_guarded(_core_cycle, on_catastrophic=_catastrophic_handler)
+        if risk_of_ruin.get_state() == risk_of_ruin.STATE_HALTED:
+            print(
+                "risk-of-ruin: HALTED - exiting. Re-authorize via: "
+                "python -m trading_bot risk reauthorize <token>",
+                file=sys.stderr,
+            )
+            return
 
 
 if __name__ == "__main__":
