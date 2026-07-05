@@ -528,3 +528,100 @@ def test_kill_switch_and_auto_trigger_produce_identical_behavior(
     assert (
         [t for t, _m in rec_manual.calls] == [t for t, _m in rec_auto.calls]
     )                                                   # same notifications
+
+
+# ───────────────────────── Pushover notifier (fail-soft) ────────────────────
+
+
+def test_pushover_notify_success(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "trading_bot.risk_of_ruin.secrets.get_secret", lambda _n: "key",
+    )
+
+    class _Resp:
+        status_code = 200
+
+    monkeypatch.setattr(
+        "trading_bot.risk_of_ruin.requests.post", lambda *a, **k: _Resp(),
+    )
+    assert ror._pushover_notify("t", "m") is True
+
+
+def test_pushover_notify_failsoft(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        "trading_bot.risk_of_ruin.secrets.get_secret", lambda _n: None,
+    )
+    assert ror._pushover_notify("t", "m") is False        # creds unset
+
+    monkeypatch.setattr(
+        "trading_bot.risk_of_ruin.secrets.get_secret", lambda _n: "key",
+    )
+
+    class _Resp:
+        status_code = 500
+
+    monkeypatch.setattr(
+        "trading_bot.risk_of_ruin.requests.post", lambda *a, **k: _Resp(),
+    )
+    assert ror._pushover_notify("t", "m") is False        # non-2xx
+
+    def boom(*_a: object, **_k: object) -> object:
+        raise RuntimeError("net down")
+
+    monkeypatch.setattr("trading_bot.risk_of_ruin.requests.post", boom)
+    assert ror._pushover_notify("t", "m") is False        # exception swallowed
+    assert "error" in capsys.readouterr().err
+
+
+# ───────────────────────── risk CLI (status / reauthorize / killswitch) ─────
+
+
+def test_cli_risk_ror_status(tmp_db: Path, capsys) -> None:
+    from trading_bot import __main__ as m
+    db.insert_equity_snapshot(10_000.0, _TS)
+    db.insert_equity_snapshot(9_000.0, _TS + timedelta(hours=1))
+    m.cmd_risk_ror_status()
+    out = capsys.readouterr().out
+    assert "RISK-OF-RUIN STATUS" in out
+    assert "Entry authorized:      yes" in out
+    assert "10.0%" in out                               # current drawdown
+
+
+def test_cli_risk_ror_status_shows_revoked_and_trigger(tmp_db: Path, capsys) -> None:
+    from trading_bot import __main__ as m
+    ror.revoke(config.ENTRY_CAPABILITY, "tier1: test")
+    for _ in range(3):
+        ror.record_broker_result(False)
+    m.cmd_risk_ror_status()
+    out = capsys.readouterr().out
+    assert "Entry authorized:      NO" in out
+    assert "tier1: test" in out
+    assert "CATASTROPHIC TRIGGER" in out
+
+
+def test_cli_risk_reauthorize(tmp_db: Path, capsys) -> None:
+    import pytest
+
+    from trading_bot import __main__ as m
+    ror.revoke(config.ENTRY_CAPABILITY, "tier1: test")
+    with pytest.raises(SystemExit):
+        m.cmd_risk_reauthorize("wrong")                 # wrong token → exit 1
+    assert ror.is_entry_authorized() is False
+    m.cmd_risk_reauthorize(config.ROR_REAUTHORIZE_TOKEN)
+    assert ror.is_entry_authorized() is True
+    assert "re-authorized" in capsys.readouterr().out
+
+
+def test_cli_risk_killswitch(tmp_db: Path, monkeypatch, capsys) -> None:
+    import pytest
+
+    from trading_bot import __main__ as m
+    monkeypatch.setattr(m.broker, "AlpacaBroker", lambda: FakeBroker())
+    monkeypatch.setattr(ror, "_pushover_notify", lambda _t, _m: True)
+    with pytest.raises(SystemExit):
+        m.cmd_risk_killswitch("wrong")                  # refused, exit 1
+    assert ror.get_state() == ror.STATE_NORMAL
+    m.cmd_risk_killswitch(config.ROR_KILLSWITCH_TOKEN)
+    out = capsys.readouterr().out
+    assert "KILL SWITCH: halted" in out
+    assert ror.get_state() == ror.STATE_HALTED
