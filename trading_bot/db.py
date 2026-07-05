@@ -43,6 +43,7 @@ from trading_bot.models import (
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
+# Version 19 (Phase 15) — adds the equity_snapshots table (drawdown tracking).
 # Version 18 (Phase 14) — adds the long_term_positions table (buy-and-hold).
 # Version 17 (Phase 13) — adds the option_positions table (single-leg options).
 # Version 16 (Phase 10) — adds the readiness_state ledger.
@@ -51,7 +52,7 @@ from trading_bot.models import (
 # Version 13 (Phase 6) — adds trades.ind_* advisory indicator-family columns.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -339,6 +340,18 @@ CREATE TABLE IF NOT EXISTS long_term_positions (
 
 CREATE INDEX IF NOT EXISTS idx_long_term_positions_status
     ON long_term_positions(status);
+
+-- Phase 15: account-equity snapshots, one per scan cycle. Drawdown is measured
+-- peak-to-trough on EQUITY (so unrealized losses on open positions count), not
+-- on closed-trade PnL alone.
+CREATE TABLE IF NOT EXISTS equity_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at TEXT NOT NULL,
+    equity REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_equity_snapshots_at
+    ON equity_snapshots(captured_at);
 """
 
 # Whitelist for update_trade — never interpolate user input into SQL column names.
@@ -360,6 +373,7 @@ _TABLE_NAMES: tuple[str, ...] = (
     "shadow_evaluations", "watchlist_transitions",
     "signal_pair_status", "signal_pair_transitions", "optimization_runs",
     "readiness_state", "option_positions", "long_term_positions",
+    "equity_snapshots",
 )
 
 _OPTION_POSITION_UPDATABLE_FIELDS: frozenset[str] = frozenset(
@@ -637,6 +651,15 @@ def _migrate_to_v18(_conn: sqlite3.Connection) -> None:
     return None
 
 
+def _migrate_to_v19(_conn: sqlite3.Connection) -> None:
+    """Phase 15 migration step.
+
+    Nothing to ALTER — the new ``equity_snapshots`` table is created by the
+    ``CREATE TABLE IF NOT EXISTS`` block above. Documented hook only.
+    """
+    return None
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -659,6 +682,7 @@ def init_db() -> None:
         _migrate_to_v16(conn)
         _migrate_to_v17(conn)
         _migrate_to_v18(conn)
+        _migrate_to_v19(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -2761,3 +2785,70 @@ def update_long_term_position(position_id: int, **fields: Any) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+# ---- equity snapshots (Phase 15) ----
+
+
+def insert_equity_snapshot(equity: float, captured_at: datetime) -> int:
+    """Record one account-equity observation. Returns the row id."""
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "INSERT INTO equity_snapshots (captured_at, equity) VALUES (?, ?)",
+            (captured_at.isoformat(), equity),
+        )
+        conn.commit()
+        new_id = cur.lastrowid
+        if new_id is None:
+            raise RuntimeError("INSERT did not return a row id")
+        return new_id
+    finally:
+        conn.close()
+
+
+def get_equity_peak() -> float | None:
+    """The running maximum of recorded equity (the drawdown peak), or None."""
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT MAX(equity) AS peak FROM equity_snapshots").fetchone()
+    finally:
+        conn.close()
+    if row is None or row["peak"] is None:
+        return None
+    return float(row["peak"])
+
+
+def get_latest_equity() -> float | None:
+    """The most recently recorded equity, or None if never recorded."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT equity FROM equity_snapshots "
+            "ORDER BY captured_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    return float(row["equity"]) if row is not None else None
+
+
+def get_recent_resolved_outcomes(limit: int = 50) -> list[str]:
+    """The most recent RESOLVED outcomes ('win'/'loss'), newest first.
+
+    The same canonical resolved definition every gating subsystem uses
+    (``outcome IN ('win','loss')`` — expired/open excluded), ordered by
+    ``closed_at`` so the Phase 15 consecutive-loss streak reads the true
+    trailing run. Active track only — shadow losses are not real losses.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT outcome FROM trades "
+            "WHERE outcome IN ('win','loss') AND track_mode = 'active' "
+            "  AND closed_at IS NOT NULL "
+            "ORDER BY closed_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [str(r["outcome"]) for r in rows]

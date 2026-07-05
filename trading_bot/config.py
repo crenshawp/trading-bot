@@ -253,3 +253,26 @@ MAX_DRAWDOWN_STOP_PCT: float = 25.0
 # PERCENT (e.g. 150.0 == 1.5x), so the ceiling is expressed the same way.
 FUND_EARNINGS_GROWTH_FLOOR: float = -0.20     # -20% YoY earnings growth
 FUND_DEBT_EQUITY_CEILING: float = 200.0       # 2.0x debt/equity (yfinance %)
+
+# ──────────────────────────────────────────────────────────────────────────
+# Risk of ruin (Phase 15) — CIRCUIT BREAKERS + EMERGENCY SHUTDOWN
+# ──────────────────────────────────────────────────────────────────────────
+# The mandatory safety layer required before any live-switch decision. Two
+# structurally distinct tiers:
+#   TIER 1 (pause)  — stop opening NEW positions; existing positions keep being
+#                     managed by their own watchers. Cleared only by operator
+#                     re-authorization.
+#   TIER 2 (emergency shutdown) — close EVERY open position, confirm closure via
+#                     reconciliation, then halt. Never claims a closure the
+#                     broker did not confirm.
+MAX_CONSECUTIVE_LOSSES: int = 7        # Tier 1: trailing resolved-loss streak
+MAX_DRAWDOWN_PCT: float = 20.0         # Tier 1: peak-to-trough EQUITY drawdown %
+MAX_CONSECUTIVE_BROKER_ERRORS: int = 3     # Tier 2: broker error/rejection streak
+MAX_CONSECUTIVE_RECONCILE_DIVERGENCES: int = 3  # Tier 2: unreconcilable persistence
+# The capability revoked on a trip. Permissive-by-default (no row == authorized),
+# matching the Phase 10 ledger convention; consulted before ANY new entry plans.
+ENTRY_CAPABILITY: str = "new_position_entry"
+# Operator confirmation tokens (Phase 10 had no token CLI — the discipline is
+# DEFINED here): the CLI refuses to act unless the exact token is supplied.
+ROR_REAUTHORIZE_TOKEN: str = "CONFIRM-REAUTHORIZE"
+ROR_KILLSWITCH_TOKEN: str = "CONFIRM-KILLSWITCH"
