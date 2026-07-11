@@ -8,6 +8,8 @@ path submits ZERO broker orders.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from trading_bot import allocation, config
@@ -384,7 +386,7 @@ def test_sample_candidates_shape() -> None:
 
 
 def test_cli_allocate_plan_ok(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
     from trading_bot import __main__ as m
     monkeypatch.setattr(m.broker, "AlpacaBroker", lambda: FakeBroker())
@@ -397,7 +399,7 @@ def test_cli_allocate_plan_ok(
 
 
 def test_cli_allocate_plan_account_unavailable(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
     from trading_bot import __main__ as m
     monkeypatch.setattr(m.broker, "AlpacaBroker", lambda: FakeBroker(fail=True))
@@ -409,7 +411,7 @@ def test_cli_allocate_plan_account_unavailable(
 
 
 def test_allocate_path_submits_zero_orders(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The allocate path produces a plan and submits NOTHING. Assert the broker's
     submit_order is never called anywhere in the CLI allocate path."""
