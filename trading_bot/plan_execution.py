@@ -20,10 +20,11 @@ Still PAPER ONLY. No real money.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
-from trading_bot import db
+from trading_bot import config, db, risk_of_ruin
 
 _ET = ZoneInfo("America/New_York")
 
@@ -66,3 +67,35 @@ def already_executed(ticker: str, pool: str, now: datetime) -> bool:
     retried within the same cycle.
     """
     return db.has_submitted_plan_execution(ticker, pool, cycle_start(now))
+
+
+# ── authorization gate (Phase 15 — checked INDEPENDENTLY, never assumed) ─────
+
+
+@dataclass(frozen=True)
+class AuthorizationCheck:
+    """Whether the execute run may open new positions, and why not if not."""
+
+    authorized: bool
+    reason: str
+
+
+def check_authorization() -> AuthorizationCheck:
+    """Consult the Phase 15 ledger before executing ANYTHING.
+
+    ``build_plan`` already goes entries-empty when ``new_position_entry`` is
+    revoked, but execute NEVER assumes the plan it holds was filtered — it asks
+    the ledger itself. Revoked (Tier 1 pause, Tier 2 shutdown, or any manual
+    revocation) refuses the ENTIRE run: nothing is submitted, and the recorded
+    revocation reason plus the risk state are surfaced so the operator knows
+    exactly why.
+    """
+    if risk_of_ruin.is_entry_authorized():
+        return AuthorizationCheck(True, "new_position_entry authorized")
+    revoke_reason = risk_of_ruin.revoke_reason(config.ENTRY_CAPABILITY)
+    state = risk_of_ruin.get_state()
+    return AuthorizationCheck(
+        False,
+        f"new_position_entry REVOKED ({revoke_reason or 'no reason recorded'}; "
+        f"risk state: {state})",
+    )

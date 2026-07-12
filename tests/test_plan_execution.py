@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from trading_bot import db
+from trading_bot import config, db, risk_of_ruin
 from trading_bot import plan_execution as pe
 from trading_bot.models import PlanExecution
 
@@ -108,3 +108,28 @@ def test_cycle_start_is_midnight_et() -> None:
 
 def test_make_plan_id_derives_from_timestamp() -> None:
     assert pe.make_plan_id(_NOW) == "plan-20260710T150000Z"
+
+
+# ───────────────────────── authorization gate (Phase 15) ─────────────────────
+
+
+def test_check_authorization_permissive_by_default(tmp_db: Path) -> None:
+    check = pe.check_authorization()
+    assert check.authorized is True
+    assert "authorized" in check.reason
+
+
+def test_check_authorization_refuses_when_revoked(tmp_db: Path) -> None:
+    risk_of_ruin.revoke(config.ENTRY_CAPABILITY, "tier1: 7 consecutive losses")
+    check = pe.check_authorization()
+    assert check.authorized is False
+    assert "REVOKED" in check.reason
+    assert "tier1: 7 consecutive losses" in check.reason
+    assert "risk state" in check.reason
+
+
+def test_check_authorization_restored_after_reauthorize(tmp_db: Path) -> None:
+    risk_of_ruin.revoke(config.ENTRY_CAPABILITY, "tier1: drawdown")
+    assert pe.check_authorization().authorized is False
+    risk_of_ruin.authorize(config.ENTRY_CAPABILITY)
+    assert pe.check_authorization().authorized is True
