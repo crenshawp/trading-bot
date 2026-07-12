@@ -17,6 +17,7 @@ from trading_bot import (
     long_term,
     outcomes,
     performance,
+    plan_execution,
     predictions,
     readiness,
     regime,
@@ -1407,12 +1408,15 @@ def cmd_broker_reconcile() -> None:
         print(f"    [{d.kind}] {d.symbol or '-'}: {d.detail}")
 
 
-# ---- allocate CLI (Phase 12) — PLAN ONLY, executes nothing ----
+# ---- allocate CLI (Phase 12 plan / Phase 16 execute) ----
 
 
-def cmd_allocate_plan() -> None:
-    """Run the four-stage allocator against live PAPER account state and print
-    the inspectable execution plan. EXECUTES NOTHING — no order is submitted."""
+def _build_live_plan() -> tuple[
+    broker.AccountInfo, list[allocation.Candidate], allocation.AllocationResult,
+]:
+    """The ONE plan-building path both ``allocate plan`` and ``allocate execute``
+    use: live PAPER account state + the labelled sample candidate set through
+    the four-stage allocator, with the Phase 15 entry gate applied."""
     account = broker.AlpacaBroker().get_account()
     candidates = allocation.sample_candidates()
     # Phase 15: the risk-of-ruin gate — a revoked new_position_entry capability
@@ -1421,7 +1425,19 @@ def cmd_allocate_plan() -> None:
         candidates, account,
         entry_authorized=risk_of_ruin.is_entry_authorized(),
     )
+    return account, candidates, result
 
+
+def cmd_allocate_plan() -> None:
+    """Run the four-stage allocator against live PAPER account state and print
+    the inspectable execution plan. EXECUTES NOTHING — no order is submitted."""
+    _account, candidates, result = _build_live_plan()
+    _print_allocation_result(candidates, result)
+
+
+def _print_allocation_result(
+    candidates: list[allocation.Candidate], result: allocation.AllocationResult,
+) -> None:
     print("ALLOCATION PLAN  (Phase 12 - PLAN ONLY, executes nothing)")
     print("-" * 84)
     print(f"  Candidates: {len(candidates)} (illustrative SAMPLE set)")
@@ -1468,6 +1484,90 @@ def cmd_allocate_plan() -> None:
 
     print()
     print("  NOTE: this is a PLAN only - no orders were submitted.")
+
+
+def cmd_allocate_execute(*, confirm: bool) -> None:
+    """Phase 16: submit an approved plan's orders via their pool paths.
+
+    WITHOUT ``--confirm`` this REFUSES to submit anything and prints the plan
+    for review instead (the same output as ``allocate plan``) — the explicit
+    confirmation is mandatory, not a suggestion. With ``--confirm`` it builds a
+    FRESH plan (same path as ``allocate plan``), checks the Phase 15
+    authorization independently, then routes every order through
+    ``plan_execution.execute_plan`` and prints what was submitted / rejected /
+    skipped.
+    """
+    account, candidates, result = _build_live_plan()
+
+    if not confirm:
+        _print_allocation_result(candidates, result)
+        print()
+        print("  REFUSED: --confirm is required to submit orders.")
+        print("  Review the plan above, then re-run:")
+        print("    python -m trading_bot allocate execute --confirm")
+        return
+
+    print("PLAN EXECUTION  (Phase 16 - operator-confirmed, Alpaca PAPER)")
+    print("-" * 84)
+    if not result.ok:
+        print(f"  Nothing to execute: {result.note}")
+        return
+
+    # Options are available only when the paper account has an options trading
+    # level; the chain client is the existing Phase 13 read-only data client.
+    options_available = (account.options_trading_level or 0) > 0
+    chain_fetch = broker.AlpacaOptionsClient().get_option_chain
+
+    run = plan_execution.execute_plan(
+        broker.AlpacaBroker(), result.plan,
+        option_chain_fetch=chain_fetch,
+        options_available=options_available,
+    )
+
+    if not run.ok:
+        print(f"  EXECUTION REFUSED - {run.note}")
+        print("  Nothing was submitted.")
+        return
+
+    submitted = [e for e in run.executions if e.status == "submitted"]
+    rejected = [e for e in run.executions if e.status == "rejected"]
+    errored = [e for e in run.executions if e.status == "error"]
+    skipped = [e for e in run.executions if e.status == "skipped"]
+
+    print(f"  Run: {run.plan_id}   planned orders: {len(run.executions)}")
+
+    print()
+    print(f"  Submitted ({len(submitted)}):")
+    for e in submitted:
+        print(
+            f"    {e.order.ticker:<8} {e.order.pool:<10} {e.vehicle or '-':<18} "
+            f"qty {e.order.qty:>11.4f}   ref {e.order_ref or '-'}"
+        )
+    if not submitted:
+        print("    (none)")
+
+    print()
+    print(f"  Rejected ({len(rejected) + len(errored)}):")
+    for e in [*rejected, *errored]:
+        print(f"    {e.order.ticker:<8} {e.order.pool:<10} [{e.status}] {e.reason}")
+    if not rejected and not errored:
+        print("    (none)")
+
+    print()
+    print(f"  Skipped ({len(skipped)}):")
+    for e in skipped:
+        print(f"    {e.order.ticker:<8} {e.order.pool:<10} {e.reason}")
+    if not skipped:
+        print("    (none)")
+
+    if result.skipped:
+        print()
+        print(f"  Filtered by the plan ({len(result.skipped)}, never routed):")
+        for s in result.skipped:
+            print(f"    {s.ticker:<8} {s.signal_type:<18} [{s.stage}] {s.reason}")
+
+    print()
+    print("  NOTE: Alpaca PAPER account only - no real money.")
 
 
 # ---- options CLI (Phase 13) ----
@@ -2165,10 +2265,16 @@ def main() -> None:
     broker_sub.add_parser("positions")
     broker_sub.add_parser("reconcile")
 
-    # allocate (Phase 12) — PLAN ONLY, executes nothing
+    # allocate (Phase 12 plan / Phase 16 execute)
     allocate_parser = sub.add_parser("allocate")
     allocate_sub = allocate_parser.add_subparsers(dest="allocate_cmd", required=True)
     allocate_sub.add_parser("plan")
+    allocate_execute_p = allocate_sub.add_parser("execute")
+    allocate_execute_p.add_argument(
+        "--confirm", action="store_true",
+        help="Actually submit the plan's orders (PAPER). Without this flag the "
+             "plan is printed for review and NOTHING is submitted.",
+    )
 
     # options (Phase 13) — single-leg, PAPER
     options_parser = sub.add_parser("options")
@@ -2363,6 +2469,8 @@ def main() -> None:
     elif args.command == "allocate":
         if args.allocate_cmd == "plan":
             cmd_allocate_plan()
+        elif args.allocate_cmd == "execute":
+            cmd_allocate_execute(confirm=args.confirm)
     elif args.command == "options":
         if args.options_cmd == "chain":
             cmd_options_chain(args.ticker)
