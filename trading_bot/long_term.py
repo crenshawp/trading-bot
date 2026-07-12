@@ -320,6 +320,45 @@ def generate_candidates(
     return out
 
 
+# ── entry submission (Phase 16 — operator-triggered via allocate execute) ────
+
+
+def submit_long_term_entry(
+    broker: Broker,
+    *,
+    ticker: str,
+    asset_class: str,
+    qty: float,
+    entry_price: float,
+    now: datetime,
+) -> tuple[OrderResult, int | None]:
+    """THE long-term ENTRY path (Phase 16) — a fractional-share BUY LIMIT via
+    the Phase 11 equity order path, at the diversification-weighted qty/cost
+    the Phase 12 allocator already computed. NO new sizing logic — this is only
+    the submission call that was missing between "plan produced" and "order
+    submitted".
+
+    The mirror of :func:`close_long_term_position`: on a broker-accepted order
+    the position row is inserted OPEN so the EXISTING protective exit watcher
+    manages it from the next cycle. A rejected/errored order records NOTHING —
+    no position is ever recorded that was not submitted. Never called
+    automatically; the operator-gated ``allocate execute --confirm`` is the
+    only caller. Returns ``(order, position_id | None)``.
+    """
+    order = broker.submit_order(
+        ticker, qty, "buy", order_type=ORDER_TYPE_LIMIT,
+        limit_price=entry_price, time_in_force=TIF_DAY,
+    )
+    risk_of_ruin.record_broker_result(order.ok)   # Phase 15 detector
+    position_id: int | None = None
+    if order.ok:
+        position_id = db.insert_long_term_position(LongTermPosition(
+            ticker=ticker, asset_class=asset_class, entry_price=entry_price,
+            entry_date=now, qty=qty, status="open",
+        ))
+    return order, position_id
+
+
 # ── protective exit watcher (AUTO-EXECUTING; closing is safe to automate) ─────
 #
 # Mirrors the Phase 13 options watcher: closing (never opening) is the one action
