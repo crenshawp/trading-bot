@@ -1244,16 +1244,19 @@ def _run_risk_cycle() -> None:
 
 
 def _run_evaluator_cycle() -> None:
-    """Phase 15.5: DAILY pairs + watchlist evaluation (real mode). This is the
-    missing call site behind the incident where negative-expectancy pairs ran
-    uncaught for weeks. Swallow-all so a transient failure never kills the
-    scheduling loop. (The per-event transition Pushover is added in Section 2.)"""
+    """Phase 15.5: DAILY pairs + watchlist evaluation (real mode), firing ONE
+    combined Pushover whenever a run produces any mute/enable/demote/recover
+    transition (silent on a no-op day). This is the missing call site behind the
+    incident where negative-expectancy pairs ran uncaught for weeks. Swallow-all
+    so a transient failure never kills the scheduling loop; the notification is
+    itself fail-soft."""
     try:
-        result = evaluator_scheduling.run_daily_evaluators()
+        result = evaluator_scheduling.run_and_notify()
         print(
             f"[{datetime.now().strftime('%H:%M:%S')}] evaluators: "
             f"{result.pair_transitions} pair + {result.watchlist_transitions} "
             f"watchlist transition(s)"
+            + (" - notified" if result.notified else "")
         )
     except Exception as exc:
         import sys
