@@ -20,6 +20,7 @@ from trading_bot.models import (
     VALID_MARKET_REGIMES,
     VALID_OUTCOMES,
     VALID_PAIR_STATUSES,
+    VALID_PLAN_EXECUTION_STATUSES,
     VALID_PREDICTION_DIRECTIONS,
     VALID_PREDICTION_OUTCOMES,
     VALID_TRACK_MODES,
@@ -28,6 +29,7 @@ from trading_bot.models import (
     DailyPerf,
     LongTermPosition,
     OptionPosition,
+    PlanExecution,
     Prediction,
     Signal,
     Trade,
@@ -43,6 +45,7 @@ from trading_bot.models import (
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
+# Version 20 (Phase 16) — adds the plan_executions table (execution audit trail).
 # Version 19 (Phase 15) — adds the equity_snapshots table (drawdown tracking).
 # Version 18 (Phase 14) — adds the long_term_positions table (buy-and-hold).
 # Version 17 (Phase 13) — adds the option_positions table (single-leg options).
@@ -52,7 +55,7 @@ from trading_bot.models import (
 # Version 13 (Phase 6) — adds trades.ind_* advisory indicator-family columns.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -352,6 +355,29 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_equity_snapshots_at
     ON equity_snapshots(captured_at);
+
+-- Phase 16: plan-execution audit trail. One row per planned order the execute
+-- command acted on (submitted / rejected / error / skipped), linking the plan
+-- run (plan_id) to the broker order (order_ref). The idempotency guard reads
+-- this table: a 'submitted' row for the same (ticker, pool) within the current
+-- cycle blocks a re-submission, so running execute twice never double-submits.
+CREATE TABLE IF NOT EXISTS plan_executions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL,
+    executed_at TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    pool TEXT NOT NULL,
+    signal_type TEXT,
+    side TEXT,
+    qty REAL,
+    vehicle TEXT,
+    status TEXT NOT NULL CHECK (status IN ('submitted','rejected','error','skipped')),
+    order_ref TEXT,
+    reason TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_executions_ticker_pool
+    ON plan_executions(ticker, pool, executed_at);
 """
 
 # Whitelist for update_trade — never interpolate user input into SQL column names.
@@ -373,7 +399,7 @@ _TABLE_NAMES: tuple[str, ...] = (
     "shadow_evaluations", "watchlist_transitions",
     "signal_pair_status", "signal_pair_transitions", "optimization_runs",
     "readiness_state", "option_positions", "long_term_positions",
-    "equity_snapshots",
+    "equity_snapshots", "plan_executions",
 )
 
 _OPTION_POSITION_UPDATABLE_FIELDS: frozenset[str] = frozenset(
@@ -660,6 +686,15 @@ def _migrate_to_v19(_conn: sqlite3.Connection) -> None:
     return None
 
 
+def _migrate_to_v20(_conn: sqlite3.Connection) -> None:
+    """Phase 16 migration step.
+
+    Nothing to ALTER — the new ``plan_executions`` table is created by the
+    ``CREATE TABLE IF NOT EXISTS`` block above. Documented hook only.
+    """
+    return None
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -683,6 +718,7 @@ def init_db() -> None:
         _migrate_to_v17(conn)
         _migrate_to_v18(conn)
         _migrate_to_v19(conn)
+        _migrate_to_v20(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -2852,3 +2888,89 @@ def get_recent_resolved_outcomes(limit: int = 50) -> list[str]:
     finally:
         conn.close()
     return [str(r["outcome"]) for r in rows]
+
+
+# ---- plan executions (Phase 16) ----
+
+
+def insert_plan_execution(execution: PlanExecution) -> int:
+    """Insert one plan-execution audit row and return its id."""
+    if execution.status not in VALID_PLAN_EXECUTION_STATUSES:
+        raise ValueError(
+            f"Invalid plan-execution status '{execution.status}' "
+            f"(expected one of {sorted(VALID_PLAN_EXECUTION_STATUSES)})"
+        )
+    sql = """
+        INSERT INTO plan_executions (
+            plan_id, executed_at, ticker, pool, signal_type, side, qty,
+            vehicle, status, order_ref, reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    params = (
+        execution.plan_id,
+        execution.executed_at.isoformat(),
+        execution.ticker,
+        execution.pool,
+        execution.signal_type,
+        execution.side,
+        execution.qty,
+        execution.vehicle,
+        execution.status,
+        execution.order_ref,
+        execution.reason,
+    )
+    conn = get_connection()
+    try:
+        cur = conn.execute(sql, params)
+        conn.commit()
+        new_id = cur.lastrowid
+        if new_id is None:
+            raise RuntimeError("INSERT did not return a row id")
+        return new_id
+    finally:
+        conn.close()
+
+
+def _row_to_plan_execution(row: sqlite3.Row) -> PlanExecution:
+    return PlanExecution(
+        plan_id=str(row["plan_id"]),
+        executed_at=datetime.fromisoformat(row["executed_at"]),
+        ticker=str(row["ticker"]),
+        pool=str(row["pool"]),
+        status=str(row["status"]),
+        signal_type=row["signal_type"],
+        side=row["side"],
+        qty=row["qty"],
+        vehicle=row["vehicle"],
+        order_ref=row["order_ref"],
+        reason=str(row["reason"] or ""),
+        id=int(row["id"]),
+    )
+
+
+def get_plan_executions(limit: int = 100) -> list[PlanExecution]:
+    """Recent plan-execution audit rows, newest first (reporting / CLI)."""
+    sql = "SELECT * FROM plan_executions ORDER BY executed_at DESC, id DESC LIMIT ?"
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, (limit,)).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_plan_execution(r) for r in rows]
+
+
+def has_submitted_plan_execution(ticker: str, pool: str, since: datetime) -> bool:
+    """True if a SUBMITTED plan-execution row exists for (ticker, pool) at/after
+    ``since`` — the Phase 16 idempotency guard's question. Only 'submitted'
+    blocks: a rejected/error/skipped attempt may be retried."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM plan_executions "
+            "WHERE ticker = ? AND pool = ? AND status = 'submitted' "
+            "  AND executed_at >= ? LIMIT 1",
+            (ticker, pool, since.isoformat()),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row is not None

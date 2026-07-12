@@ -153,6 +153,36 @@ class LongTermPosition:
     id: int | None = None
 
 
+# Phase 16: outcome of one planned order in an execute run. 'submitted' means
+# the broker accepted the order (this is what the idempotency guard blocks on);
+# 'rejected' is a structured broker refusal; 'error' is a transport/unexpected
+# failure; 'skipped' records an order the run declined to submit (e.g. already
+# executed this cycle).
+VALID_PLAN_EXECUTION_STATUSES: frozenset[str] = frozenset(
+    {"submitted", "rejected", "error", "skipped"}
+)
+
+
+@dataclass(frozen=True)
+class PlanExecution:
+    """One plan_executions audit row (Phase 16): what the execute command did
+    with one planned order, linking the plan run (``plan_id``) to the broker
+    order (``order_ref``)."""
+
+    plan_id: str
+    executed_at: datetime
+    ticker: str
+    pool: str
+    status: str                     # submitted | rejected | error | skipped
+    signal_type: str | None = None
+    side: str | None = None
+    qty: float | None = None
+    vehicle: str | None = None      # option_full | option_undersized | shares
+    order_ref: str | None = None    # broker order id when submitted
+    reason: str = ""
+    id: int | None = None
+
+
 @dataclass(frozen=True)
 class OptionPosition:
     """An open/closed single-leg option position (Phase 13).

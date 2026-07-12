@@ -30,11 +30,11 @@ def _make_signal(**overrides: Any) -> Signal:
 def test_init_db_is_idempotent(tmp_db: Path) -> None:
     db.init_db()  # tmp_db already called init_db once; second call must not error
     db.init_db()
-    assert db.schema_version() == 19
+    assert db.schema_version() == 20
 
 
 def test_schema_version_is_1_after_init(tmp_db: Path) -> None:
-    assert db.schema_version() == 19
+    assert db.schema_version() == 20
 
 
 # ---- signals ----
@@ -200,7 +200,7 @@ def test_get_table_counts_zero_on_fresh_db(tmp_db: Path) -> None:
         "signal_pair_status": 0, "signal_pair_transitions": 0,
         "optimization_runs": 0, "readiness_state": 0,
         "option_positions": 0, "long_term_positions": 0,
-        "equity_snapshots": 0,
+        "equity_snapshots": 0, "plan_executions": 0,
     }
 
 
