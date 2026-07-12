@@ -31,6 +31,7 @@ from trading_bot import (
     context,
     db,
     earnings,
+    evaluator_scheduling,
     indicators,
     news_client,
     outcomes,
@@ -1242,6 +1243,23 @@ def _run_risk_cycle() -> None:
         print(f"  risk cycle error: {exc}", file=sys.stderr)
 
 
+def _run_evaluator_cycle() -> None:
+    """Phase 15.5: DAILY pairs + watchlist evaluation (real mode). This is the
+    missing call site behind the incident where negative-expectancy pairs ran
+    uncaught for weeks. Swallow-all so a transient failure never kills the
+    scheduling loop. (The per-event transition Pushover is added in Section 2.)"""
+    try:
+        result = evaluator_scheduling.run_daily_evaluators()
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] evaluators: "
+            f"{result.pair_transitions} pair + {result.watchlist_transitions} "
+            f"watchlist transition(s)"
+        )
+    except Exception as exc:
+        import sys
+        print(f"  evaluator cycle error: {exc}", file=sys.stderr)
+
+
 def _run_daily_perf_update() -> None:
     """Materialize yesterday's daily_performance row. Swallow-all on failure
     so a transient DB error doesn't kill the scheduling loop."""
@@ -1981,6 +1999,14 @@ def main() -> None:
     # Tier-1 circuit breaker, catastrophic detectors, and holding-state retries.
     _never_raise(_run_risk_cycle)()
     schedule.every(1).hours.do(_never_raise(_run_risk_cycle))
+
+    # Phase 15.5: DAILY pairs + watchlist evaluation at 09:40 EST — after the
+    # 09:36 VIX snapshot so all daily context is fresh, and independent of the
+    # morning report (08:00) and daily-perf summary (00:30 UTC), which still fire
+    # on their own triggers. The missing call site that lets the evaluators
+    # (already authorized to auto-act per Phase 10) actually run each day.
+    _never_raise(_run_evaluator_cycle)()
+    schedule.every().day.at("09:40").do(_never_raise(_run_evaluator_cycle))
 
     # Materialize yesterday's daily_performance row daily at 00:30 UTC
     # (~20:30 ET, well after market close and the hourly resolver). Phase 1.4.
