@@ -1,26 +1,37 @@
-"""Broker-authoritative reconciliation — Phase 11.
+"""Broker-authoritative reconciliation — Phase 11, scope fixed in Phase 18.
 
-Compares the bot's internal open trades against what the broker actually holds
-and REPORTS the divergences. The broker is the source of truth for what
-positions / orders really exist; when the two disagree the broker wins. This
-phase REPORTS divergences only — it never mutates a trade record. Auto-healing
-internal history from the broker is wired carefully in a later phase, because a
-transient broker read must never be allowed to corrupt the outcome history.
+Compares the bot's BROKER-TRACKED open positions against what the broker
+actually holds and REPORTS the divergences. The broker is the source of truth
+for what positions / orders really exist; when the two disagree the broker
+wins. This layer REPORTS divergences only — it never mutates a record.
+Auto-healing internal history from the broker is wired carefully in a later
+phase, because a transient broker read must never be allowed to corrupt the
+outcome history.
+
+SCOPE (Phase 18): the internal side is ONLY what was actually routed through
+execution — open option positions and open long-term positions, both recorded
+exclusively on a broker-accepted order. The ``trades`` table is SIGNAL
+tracking: yfinance-resolved signal rows that were never sent to a broker and
+vastly outnumber real positions. Comparing them against broker positions
+produced a flood of false ``internal_only`` divergences in completely normal
+operation — noise that would falsely trip Phase 15's Tier 2
+reconcile-divergence streak the moment reconciliation ran automatically. Those
+rows are out of reconciliation's scope entirely: not compared, not reported.
 
 Three divergence kinds are detected:
 
-* ``internal_only``  — the bot has an open trade but the broker holds nothing.
-* ``broker_only``    — the broker holds a position the bot does not track.
+* ``internal_only``  — the bot has an open broker-tracked position but the
+  broker holds nothing under that symbol.
+* ``broker_only``    — the broker holds a position the bot does not track
+  (e.g. a Phase 16 SWING shares fallback, which has no internal lifecycle
+  book — an honest gap worth surfacing).
 * ``qty_mismatch``   — both sides have the symbol but the quantities differ.
+  The internal side now carries REAL quantities (contracts / fractional
+  shares from the position tables), so this check is live.
 
-The ``qty_mismatch`` check only fires when the internal side carries a known
-quantity. Phase 11 does not yet attach real order quantities to trades (signal→
-order wiring is a later phase), so today internal quantities are ``None`` and
-``reconcile`` surfaces presence divergences; the comparison is already in place
-for when trades start carrying fills.
-
-If the broker is UNREACHABLE the report is ``ok=False`` and NO internal trade is
-flagged — an outage is never treated as "the broker has no positions".
+If the broker is UNREACHABLE the report is ``ok=False`` and NO internal
+position is flagged — an outage is never treated as "the broker has no
+positions".
 """
 
 from __future__ import annotations
@@ -101,29 +112,40 @@ def compare_positions(
 
 
 def internal_open_positions() -> dict[str, float | None]:
-    """Symbols the bot believes are open, from its ACTIVE open trades.
+    """Symbols the bot believes are open AT THE BROKER, with real quantities.
 
-    Quantity is ``None``: Phase 11 trades do not carry a real order quantity yet
-    (no signal→order wiring). Shadow trades are excluded — they never become
-    real broker positions.
+    Phase 18 scope: ONLY broker-tracked positions —
+
+    * open ``option_positions`` (recorded exclusively when the broker accepted
+      the order; each row carries its broker ``order_id``), keyed by OCC
+      symbol with quantity in contracts;
+    * open ``long_term_positions`` (inserted exclusively by the Phase 16
+      entry path after a broker-accepted order), keyed by ticker with the
+      fractional-share quantity.
+
+    Multiple open rows on one symbol (entries across cycles) sum. The
+    ``trades`` table is deliberately NOT read: those are signal-tracking rows
+    resolved against yfinance data, never routed to a broker — reconciling
+    them produced false ``internal_only`` floods in normal operation.
     """
     result: dict[str, float | None] = {}
-    for trade in db.get_open_trades():
-        if trade.track_mode != "active":
-            continue
-        signal = db.get_signal_by_id(trade.signal_id)
-        if signal is None:
-            continue
-        result.setdefault(signal.ticker, None)
+    for option in db.get_open_option_positions():
+        current = result.get(option.symbol) or 0.0
+        result[option.symbol] = current + option.contracts
+    for position in db.get_open_long_term_positions():
+        current = result.get(position.ticker) or 0.0
+        result[position.ticker] = current + position.qty
     return result
 
 
 def reconcile(broker_client: Broker) -> ReconciliationReport:
-    """Reconcile internal open trades against the broker. Broker is authoritative.
+    """Reconcile broker-tracked open positions against the broker (which is
+    authoritative). Signal-tracking trades are out of scope — see
+    :func:`internal_open_positions`.
 
     Fail-soft: if the broker positions read fails the report is ``ok=False`` and
-    no internal trade is flagged. Divergences are logged to stderr and returned;
-    nothing is mutated.
+    no internal position is flagged. Divergences are logged to stderr and
+    returned; nothing is mutated.
     """
     positions = broker_client.get_positions()
     if not positions.ok:

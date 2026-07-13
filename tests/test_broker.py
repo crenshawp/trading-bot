@@ -15,11 +15,12 @@ import pytest
 from trading_bot import broker, db
 from trading_bot.broker import alpaca, base
 from trading_bot.broker.fake import FakeBroker
-from trading_bot.models import Signal, Trade
+from trading_bot.models import LongTermPosition, Signal, Trade
 
 
 def _seed_open_active(ticker: str, *, track_mode: str = "active") -> None:
-    """Seed one OPEN trade for ``ticker`` (defaults to the active book)."""
+    """Seed one OPEN signal-tracking trade for ``ticker`` (yfinance-resolved;
+    never routed to a broker — OUT of reconciliation's scope since Phase 18)."""
     ts = datetime(2026, 1, 1, tzinfo=UTC)
     sid = db.insert_signal(Signal(
         timestamp=ts, ticker=ticker, asset_class="stock",
@@ -27,6 +28,15 @@ def _seed_open_active(ticker: str, *, track_mode: str = "active") -> None:
     ))
     db.insert_trade(Trade(
         signal_id=sid, opened_at=ts, outcome="open", track_mode=track_mode,
+    ))
+
+
+def _seed_broker_tracked(ticker: str, qty: float = 10.0) -> None:
+    """Seed one OPEN broker-tracked position (a Phase 16 long-term entry —
+    rows in this table exist only after a broker-accepted order)."""
+    db.insert_long_term_position(LongTermPosition(
+        ticker=ticker, asset_class="stock", entry_price=100.0,
+        entry_date=datetime(2026, 1, 1, tzinfo=UTC), qty=qty, status="open",
     ))
 
 
@@ -600,7 +610,7 @@ def test_compare_positions_clean_when_aligned() -> None:
 
 
 def test_reconcile_internal_only(tmp_db: Path) -> None:
-    _seed_open_active("AAPL")
+    _seed_broker_tracked("AAPL")              # a real broker-routed position
     report = broker.reconcile(FakeBroker())   # broker holds nothing
     assert report.ok is True
     assert [(d.kind, d.symbol) for d in report.divergences] == [
@@ -621,27 +631,29 @@ def test_reconcile_broker_only(tmp_db: Path) -> None:
 
 
 def test_reconcile_clean_when_aligned(tmp_db: Path) -> None:
-    _seed_open_active("AAPL")
+    _seed_broker_tracked("AAPL", qty=10.0)
     b = FakeBroker()
     b.set_position("AAPL", 10)
     report = broker.reconcile(b)
     assert report.ok is True
-    assert report.divergences == []          # presence matches (qty not tracked yet)
+    assert report.divergences == []          # presence AND quantity match
 
 
 def test_reconcile_excludes_shadow_trades(tmp_db: Path) -> None:
     _seed_open_active("SHDW", track_mode="shadow")
     report = broker.reconcile(FakeBroker())
-    # The shadow trade is not a real broker position, so it is NOT flagged.
+    # A shadow trade is signal tracking, not a broker position — never flagged.
+    # (Since Phase 18 the whole trades table is out of scope; this guards the
+    # original shadow guarantee within that.)
     assert report.internal_symbols == []
     assert report.divergences == []
 
 
 def test_reconcile_broker_unavailable_flags_nothing(tmp_db: Path) -> None:
-    _seed_open_active("AAPL")
+    _seed_broker_tracked("AAPL")
     report = broker.reconcile(FakeBroker(fail=True))
     assert report.ok is False
-    # An outage must NOT flag the internal trade as 'internal_only'.
+    # An outage must NOT flag the tracked position as 'internal_only'.
     assert [d.kind for d in report.divergences] == ["broker_unavailable"]
     assert all(d.kind != "internal_only" for d in report.divergences)
 
