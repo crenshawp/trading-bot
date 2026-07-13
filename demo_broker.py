@@ -10,7 +10,10 @@ SQLite database. It shows:
 * a structured rejection that never raises;
 * the order lifecycle (an auto-filled order becomes a position);
 * broker-authoritative reconciliation surfacing ``internal_only`` and
-  ``broker_only`` divergences — reported, never auto-resolved;
+  ``broker_only`` divergences — reported, never auto-resolved. Phase 18 scope:
+  only BROKER-TRACKED positions (option / long-term rows recorded on accepted
+  orders) are compared; the scanner's signal-tracking trades are out of scope
+  and produce no divergences;
 * an unreachable broker: reconciliation reports ``ok=False`` and flags nothing.
 
 The real ``AlpacaBroker`` speaks to Alpaca's PAPER endpoint with the same neutral
@@ -29,11 +32,14 @@ config.DB_PATH = Path(tempfile.mkdtemp()) / "demo_broker.db"
 
 from trading_bot import broker, db  # noqa: E402
 from trading_bot.broker.fake import FakeBroker  # noqa: E402
-from trading_bot.models import Signal, Trade  # noqa: E402
+from trading_bot.models import LongTermPosition, Signal, Trade  # noqa: E402
 
 
-def _seed_internal_open(ticker: str) -> None:
-    """Open an internal ACTIVE trade so reconciliation has something to compare."""
+def _seed_signal_tracking(ticker: str) -> None:
+    """Open a SIGNAL-TRACKING trade (yfinance-resolved, never sent to a broker).
+
+    Phase 18: these are OUT of reconciliation's scope — seeded here to show
+    they no longer flood the report with false divergences."""
     ts = datetime(2026, 1, 1, tzinfo=UTC)
     sid = db.insert_signal(Signal(
         timestamp=ts, ticker=ticker, asset_class="stock",
@@ -41,6 +47,15 @@ def _seed_internal_open(ticker: str) -> None:
     ))
     db.insert_trade(Trade(
         signal_id=sid, opened_at=ts, outcome="open", track_mode="active",
+    ))
+
+
+def _seed_broker_tracked(ticker: str, qty: float) -> None:
+    """Open a BROKER-TRACKED position (a Phase 16 long-term entry — recorded
+    only after a broker-accepted order). This is what reconciliation compares."""
+    db.insert_long_term_position(LongTermPosition(
+        ticker=ticker, asset_class="stock", entry_price=100.0,
+        entry_date=datetime(2026, 1, 1, tzinfo=UTC), qty=qty, status="open",
     ))
 
 
@@ -71,12 +86,15 @@ def main() -> None:
     for p in filled.get_positions().positions:
         print(f"  position: {p.symbol} qty={p.qty} side={p.side}")
 
-    print("\n=== Reconciliation (broker is authoritative) ===")
-    _seed_internal_open("AAPL")              # the bot thinks AAPL is open
+    print("\n=== Reconciliation (broker-tracked scope, Phase 18) ===")
+    for ticker in ("META", "GOOGL", "GS"):   # scanner signal rows — OUT of scope
+        _seed_signal_tracking(ticker)
+    _seed_broker_tracked("AAPL", qty=10.0)   # a real broker-routed position
     recon = FakeBroker()
     recon.set_position("TSLA", 4)            # the broker holds untracked TSLA
     report = broker.reconcile(recon)
     print(f"  internal={report.internal_symbols}  broker={report.broker_symbols}")
+    print("  (3 signal-tracking trades seeded - none compared, none flagged)")
     for d in report.divergences:
         print(f"    [{d.kind}] {d.symbol}: {d.detail}")
 

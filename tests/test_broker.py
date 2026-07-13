@@ -15,7 +15,7 @@ import pytest
 from trading_bot import broker, db
 from trading_bot.broker import alpaca, base
 from trading_bot.broker.fake import FakeBroker
-from trading_bot.models import LongTermPosition, Signal, Trade
+from trading_bot.models import LongTermPosition, OptionPosition, Signal, Trade
 
 
 def _seed_open_active(ticker: str, *, track_mode: str = "active") -> None:
@@ -663,6 +663,112 @@ def test_reconcile_surfaces_open_order_count(tmp_db: Path) -> None:
     b.submit_order("NVDA", 2, broker.SIDE_BUY, limit_price=120.0)  # rests as 'new'
     report = broker.reconcile(b)
     assert report.broker_open_orders == 1
+
+
+# ───────────────── reconciliation scope (Phase 18: broker-tracked only) ──────
+
+
+def test_reconcile_mixed_book_reports_only_broker_tracked(tmp_db: Path) -> None:
+    """The live-fire bug: signal-tracking rows vastly outnumber real positions
+    and must produce ZERO divergences — only the broker-routed position is
+    compared."""
+    for ticker in ("META", "GOOGL", "GS", "NOW", "AMZN"):   # scanner signal rows
+        _seed_open_active(ticker)
+    _seed_broker_tracked("AAPL")                            # the one real position
+
+    report = broker.reconcile(FakeBroker())                 # broker holds nothing
+    assert report.internal_symbols == ["AAPL"]
+    assert [(d.kind, d.symbol) for d in report.divergences] == [
+        ("internal_only", "AAPL"),
+    ]                                                       # and ONLY that
+
+
+def test_reconcile_signal_only_trade_is_never_a_divergence(tmp_db: Path) -> None:
+    _seed_open_active("META")                # yfinance-tracked, never submitted
+    report = broker.reconcile(FakeBroker())  # broker holds nothing — and that's fine
+    assert report.ok is True
+    assert report.internal_symbols == []
+    assert report.divergences == []
+
+
+def test_reconcile_qty_mismatch_on_broker_tracked(tmp_db: Path) -> None:
+    _seed_broker_tracked("AAPL", qty=10.0)
+    b = FakeBroker()
+    b.set_position("AAPL", 6.0)              # partial fill / manual change
+    report = broker.reconcile(b)
+    (d,) = report.divergences
+    assert d.kind == "qty_mismatch"
+    assert (d.internal_qty, d.broker_qty) == (10.0, 6.0)
+
+
+def test_reconcile_includes_open_option_positions(tmp_db: Path) -> None:
+    db.insert_option_position(OptionPosition(
+        symbol="AAPL260116C00190000", underlying="AAPL", option_type="call",
+        strike=190.0, expiry="2026-01-16", contracts=2.0,
+        opened_at=datetime(2026, 1, 1, tzinfo=UTC), order_id="ord-1",
+        outcome="open",
+    ))
+    b = FakeBroker()
+    b.set_position("AAPL260116C00190000", 2.0)
+    assert broker.reconcile(b).divergences == []      # OCC symbol + qty align
+
+    b_short = FakeBroker()
+    b_short.set_position("AAPL260116C00190000", 1.0)
+    (d,) = broker.reconcile(b_short).divergences
+    assert d.kind == "qty_mismatch"
+
+
+def test_reconcile_sums_multiple_open_rows_per_symbol(tmp_db: Path) -> None:
+    _seed_broker_tracked("AAPL", qty=10.0)   # entries across separate cycles
+    _seed_broker_tracked("AAPL", qty=5.0)
+    b = FakeBroker()
+    b.set_position("AAPL", 15.0)
+    assert broker.reconcile(b).divergences == []
+
+
+def test_reconcile_closed_positions_are_out_of_scope(tmp_db: Path) -> None:
+    db.insert_long_term_position(LongTermPosition(
+        ticker="AAPL", asset_class="stock", entry_price=100.0,
+        entry_date=datetime(2026, 1, 1, tzinfo=UTC), qty=10.0, status="closed",
+        exit_price=110.0, exit_date=datetime(2026, 2, 1, tzinfo=UTC),
+        exit_reason="trend_breakdown",
+    ))
+    report = broker.reconcile(FakeBroker())
+    assert report.internal_symbols == []
+    assert report.divergences == []
+
+
+# ───────────────── limit-price rounding (Phase 18: valid tick on the wire) ───
+
+
+def test_round_limit_price_lly_regression() -> None:
+    """The LLY live-fire rejection shape: a yfinance float32 artifact carries
+    sub-penny noise that Alpaca refuses. Rounding yields the valid 2-decimal
+    tick."""
+    assert alpaca.round_limit_price(795.4400024414062) == 795.44
+    assert alpaca.round_limit_price(795.44) == 795.44        # already valid
+    assert alpaca.round_limit_price(190.0) == 190.0
+    # Division-derived prices (shares fallback est_cost/qty) normalize too.
+    assert alpaca.round_limit_price(10_000.0 / 20.833333333333332) == 480.0
+
+
+def test_alpaca_submit_rounds_limit_price_on_the_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_creds(monkeypatch)
+    captured: list[dict[str, object]] = []
+    _patch_request(
+        monkeypatch,
+        _FakeResp(200, {"id": "abc", "status": "accepted", "symbol": "LLY"}),
+        capture=captured,
+    )
+    result = alpaca.AlpacaBroker().submit_order(
+        "LLY", 3.0, broker.SIDE_BUY, limit_price=795.4400024414062,
+    )
+    assert result.ok is True
+    body = captured[0]["json"]
+    assert isinstance(body, dict)
+    assert body["limit_price"] == "795.44"    # sub-penny noise never hits the wire
 
 
 # ───────────────────────── broker reconcile CLI ─────────────────────────────
