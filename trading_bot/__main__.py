@@ -9,6 +9,7 @@ from datetime import date
 from trading_bot import (
     allocation,
     broker,
+    candidate_source,
     config,
     context,
     db,
@@ -1411,36 +1412,59 @@ def cmd_broker_reconcile() -> None:
 # ---- allocate CLI (Phase 12 plan / Phase 16 execute) ----
 
 
-def _build_live_plan() -> tuple[
-    broker.AccountInfo, list[allocation.Candidate], allocation.AllocationResult,
+def _build_live_plan(
+    *, sample: bool = False, mark_considered: bool = False,
+) -> tuple[
+    broker.AccountInfo, list[allocation.Candidate],
+    allocation.AllocationResult, str,
 ]:
     """The ONE plan-building path both ``allocate plan`` and ``allocate execute``
-    use: live PAPER account state + the labelled sample candidate set through
-    the four-stage allocator, with the Phase 15 entry gate applied."""
+    use: live PAPER account state + candidates through the four-stage allocator,
+    with the Phase 15 entry gate applied.
+
+    Phase 17: candidates default to the bot's LIVE fired signals
+    (``candidate_source.live_candidates``); ``sample=True`` keeps the labelled
+    illustrative fixture available for demos. ``mark_considered`` is passed
+    through to the live source — True only on the execute-bound pull (the
+    ``--confirm`` run), so previews never consume signals.
+    """
     account = broker.AlpacaBroker().get_account()
-    candidates = allocation.sample_candidates()
+    if sample:
+        candidates = allocation.sample_candidates()
+        source_label = "illustrative SAMPLE set (--sample)"
+    else:
+        candidates = candidate_source.live_candidates(
+            mark_considered=mark_considered,
+        )
+        source_label = (
+            f"live fired signals (last {config.CANDIDATE_RECENCY_HOURS}h, "
+            "unconsidered)"
+        )
     # Phase 15: the risk-of-ruin gate — a revoked new_position_entry capability
     # yields an entries-empty plan (existing positions' watchers run regardless).
     result = allocation.build_plan(
         candidates, account,
         entry_authorized=risk_of_ruin.is_entry_authorized(),
     )
-    return account, candidates, result
+    return account, candidates, result, source_label
 
 
-def cmd_allocate_plan() -> None:
+def cmd_allocate_plan(*, sample: bool = False) -> None:
     """Run the four-stage allocator against live PAPER account state and print
-    the inspectable execution plan. EXECUTES NOTHING — no order is submitted."""
-    _account, candidates, result = _build_live_plan()
-    _print_allocation_result(candidates, result)
+    the inspectable execution plan. EXECUTES NOTHING — no order is submitted,
+    and no signal is marked considered (this is the review step)."""
+    _account, candidates, result, source_label = _build_live_plan(sample=sample)
+    _print_allocation_result(candidates, result, source_label)
 
 
 def _print_allocation_result(
-    candidates: list[allocation.Candidate], result: allocation.AllocationResult,
+    candidates: list[allocation.Candidate],
+    result: allocation.AllocationResult,
+    source_label: str,
 ) -> None:
     print("ALLOCATION PLAN  (Phase 12 - PLAN ONLY, executes nothing)")
     print("-" * 84)
-    print(f"  Candidates: {len(candidates)} (illustrative SAMPLE set)")
+    print(f"  Candidates: {len(candidates)} ({source_label})")
     if result.note:
         print(f"  {result.note}")
 
@@ -1486,7 +1510,7 @@ def _print_allocation_result(
     print("  NOTE: this is a PLAN only - no orders were submitted.")
 
 
-def cmd_allocate_execute(*, confirm: bool) -> None:
+def cmd_allocate_execute(*, confirm: bool, sample: bool = False) -> None:
     """Phase 16: submit an approved plan's orders via their pool paths.
 
     WITHOUT ``--confirm`` this REFUSES to submit anything and prints the plan
@@ -1496,11 +1520,17 @@ def cmd_allocate_execute(*, confirm: bool) -> None:
     authorization independently, then routes every order through
     ``plan_execution.execute_plan`` and prints what was submitted / rejected /
     skipped.
+
+    Phase 17: the plan is built from LIVE fired signals, and the ``--confirm``
+    pull is the one that marks them considered — a signal enters a submitting
+    plan exactly once, whatever that plan later does with it.
     """
-    account, candidates, result = _build_live_plan()
+    account, candidates, result, source_label = _build_live_plan(
+        sample=sample, mark_considered=confirm,
+    )
 
     if not confirm:
-        _print_allocation_result(candidates, result)
+        _print_allocation_result(candidates, result, source_label)
         print()
         print("  REFUSED: --confirm is required to submit orders.")
         print("  Review the plan above, then re-run:")
@@ -1683,8 +1713,9 @@ def cmd_options_positions() -> None:
 
 def cmd_longterm_candidates() -> None:
     """Show current long-term entry candidates (pending allocation). Generated
-    live; they feed the SAME operator-inspected `allocate plan` — nothing here
-    submits an order."""
+    live; Phase 17 also LOGS each one into the signals table so the live
+    candidate source can pull it into `allocate plan` / `allocate execute` —
+    nothing here submits an order."""
     candidates = long_term.generate_candidates(long_term.fetch_daily_candles)
     print("LONG-TERM ENTRY CANDIDATES  (pending allocation)")
     print("-" * 84)
@@ -1697,7 +1728,11 @@ def cmd_longterm_candidates() -> None:
             f"  {c.ticker:<10} {c.asset_class:<7} {c.signal_type:<16} "
             f"{_fmt_money(c.entry_price):>10}  {c.entry_rationale}"
         )
-    print("\n  These feed `allocate plan` for operator inspection - nothing is submitted.")
+    ids = long_term.persist_candidates(candidates)
+    print(
+        f"\n  Logged {len(ids)} candidate(s) to signals - they feed "
+        "`allocate plan` / `allocate execute`. Nothing is submitted here."
+    )
 
 
 def cmd_longterm_positions() -> None:
@@ -2265,15 +2300,25 @@ def main() -> None:
     broker_sub.add_parser("positions")
     broker_sub.add_parser("reconcile")
 
-    # allocate (Phase 12 plan / Phase 16 execute)
+    # allocate (Phase 12 plan / Phase 16 execute / Phase 17 live candidates)
     allocate_parser = sub.add_parser("allocate")
     allocate_sub = allocate_parser.add_subparsers(dest="allocate_cmd", required=True)
-    allocate_sub.add_parser("plan")
+    allocate_plan_p = allocate_sub.add_parser("plan")
+    allocate_plan_p.add_argument(
+        "--sample", action="store_true",
+        help="Use the illustrative sample candidate set instead of live fired "
+             "signals (demo/inspection only).",
+    )
     allocate_execute_p = allocate_sub.add_parser("execute")
     allocate_execute_p.add_argument(
         "--confirm", action="store_true",
         help="Actually submit the plan's orders (PAPER). Without this flag the "
              "plan is printed for review and NOTHING is submitted.",
+    )
+    allocate_execute_p.add_argument(
+        "--sample", action="store_true",
+        help="Use the illustrative sample candidate set instead of live fired "
+             "signals (demo/inspection only).",
     )
 
     # options (Phase 13) — single-leg, PAPER
@@ -2468,9 +2513,9 @@ def main() -> None:
             cmd_broker_reconcile()
     elif args.command == "allocate":
         if args.allocate_cmd == "plan":
-            cmd_allocate_plan()
+            cmd_allocate_plan(sample=args.sample)
         elif args.allocate_cmd == "execute":
-            cmd_allocate_execute(confirm=args.confirm)
+            cmd_allocate_execute(confirm=args.confirm, sample=args.sample)
     elif args.command == "options":
         if args.options_cmd == "chain":
             cmd_options_chain(args.ticker)

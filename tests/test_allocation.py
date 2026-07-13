@@ -385,15 +385,16 @@ def test_sample_candidates_shape() -> None:
 # ───────────────────────── allocate plan CLI ────────────────────────────────
 
 
-def test_cli_allocate_plan_ok(
+def test_cli_allocate_plan_sample_ok(
     tmp_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
     from trading_bot import __main__ as m
     monkeypatch.setattr(m.broker, "AlpacaBroker", lambda: FakeBroker())
-    m.cmd_allocate_plan()
+    m.cmd_allocate_plan(sample=True)   # Phase 17: sample kept behind --sample
     out = capsys.readouterr().out
     assert "ALLOCATION PLAN" in out
     assert "PLAN only" in out
+    assert "SAMPLE" in out        # the source is clearly labelled
     assert "META" in out          # an eligible candidate appears in the plan
     assert "NVDA" in out          # the inactive candidate appears in skipped
 

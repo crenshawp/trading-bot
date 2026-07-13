@@ -481,7 +481,8 @@ def test_update_long_term_position_rejects_unknown_field(tmp_db: Path) -> None:
 
 
 def test_cli_longterm_candidates(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     from trading_bot import __main__ as m
     monkeypatch.setattr(
@@ -496,7 +497,15 @@ def test_cli_longterm_candidates(
     out = capsys.readouterr().out
     assert "LONG-TERM ENTRY CANDIDATES" in out
     assert "AAPL" in out
-    assert "nothing is submitted" in out
+    assert "Logged 1 candidate(s) to signals" in out
+    assert "Nothing is submitted" in out
+    # Phase 17: the candidate was persisted as a fired signal (no trades row —
+    # long-term outcomes are tracked in long_term_positions, not the resolver).
+    (sig,) = db.get_signals()
+    assert sig.ticker == "AAPL"
+    assert sig.signal_type == config.LONGTERM_STOCK_SIGNAL
+    assert sig.id is not None
+    assert db.get_trade_by_signal_id(sig.id) is None
 
 
 def test_cli_longterm_candidates_empty(

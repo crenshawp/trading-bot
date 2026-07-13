@@ -471,7 +471,8 @@ def test_cli_execute_with_confirm_submits(
     broker = SpyBroker()
     monkeypatch.setattr(m.broker, "AlpacaBroker", lambda: broker)
     monkeypatch.setattr(m.broker, "AlpacaOptionsClient", FakeChainClient)
-    m.cmd_allocate_execute(confirm=True)
+    # Phase 17: the sample fixture stays available behind --sample.
+    m.cmd_allocate_execute(confirm=True, sample=True)
     out = capsys.readouterr().out
     assert "PLAN EXECUTION" in out
     assert "Submitted" in out
