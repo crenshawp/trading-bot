@@ -20,6 +20,7 @@ fail soft (``reason='ALPACA credentials unset'``) and nothing is sent.
 from __future__ import annotations
 
 import dataclasses
+import re
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -54,6 +55,27 @@ from trading_bot.broker.base import (
 ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets"
 
 _HTTP_TIMEOUT_SECONDS = 10
+
+# The bot stores crypto tickers in yfinance form (BTC-USD); Alpaca's trading
+# API expects the pair with a slash (BTC/USD). The suffix match is deliberately
+# tight so only crypto pairs translate — stock tickers and OCC option symbols
+# contain no '-USD' suffix and pass through untouched.
+_CRYPTO_TICKER_RE = re.compile(r"^(?P<base>[A-Z0-9]+)-USD$")
+
+
+def to_alpaca_symbol(symbol: str) -> str:
+    """Translate an internal symbol to Alpaca's wire format (Phase 17).
+
+    ``BTC-USD`` → ``BTC/USD``; anything that is not a yfinance-style crypto
+    pair (stock tickers, OCC option symbols) is returned unchanged. Applied at
+    THE broker boundary — ``AlpacaBroker.submit_order`` — so every submission
+    path (long-term crypto entry, protective-exit close, emergency shutdown)
+    gets the translation and internal storage/display keeps the yfinance form.
+    """
+    match = _CRYPTO_TICKER_RE.match(symbol)
+    if match is None:
+        return symbol
+    return f"{match.group('base')}/USD"
 
 # Alpaca order lifecycle states → the neutral status set. Anything unmapped
 # becomes STATUS_UNKNOWN (a new Alpaca state we have not classified), never an
@@ -331,8 +353,10 @@ class AlpacaBroker(Broker):
             )
             return rejection
 
+        # Phase 17: crypto pairs are stored internally in yfinance form
+        # (BTC-USD) but Alpaca's API wants BTC/USD — translate at THE boundary.
         body: dict[str, Any] = {
-            "symbol": symbol, "qty": str(qty), "side": side,
+            "symbol": to_alpaca_symbol(symbol), "qty": str(qty), "side": side,
             "type": order_type, "time_in_force": time_in_force,
         }
         if limit_price is not None:
