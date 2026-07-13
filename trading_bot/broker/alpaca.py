@@ -77,6 +77,21 @@ def to_alpaca_symbol(symbol: str) -> str:
         return symbol
     return f"{match.group('base')}/USD"
 
+
+def round_limit_price(price: float) -> float:
+    """Round a limit price to a valid tick increment — 2 decimals (Phase 18).
+
+    Upstream limit prices are raw floats: yfinance closes carry float32
+    artifacts (``795.4400024414062``), and the shares-fallback / emergency
+    paths derive prices by division. Alpaca rejects sub-penny equity limit
+    prices, so EVERY limit price is normalized here — the same single
+    submission boundary as :func:`to_alpaca_symbol` — covering the Phase 16
+    execution path and every close path at once. Two decimals is a valid tick
+    for this bot's whole universe (equities well above $1, option premiums at
+    the $0.01 tick, crypto pairs).
+    """
+    return round(price, 2)
+
 # Alpaca order lifecycle states → the neutral status set. Anything unmapped
 # becomes STATUS_UNKNOWN (a new Alpaca state we have not classified), never an
 # error — the call still succeeded.
@@ -336,6 +351,10 @@ class AlpacaBroker(Broker):
         time_in_force: str = TIF_DAY,
         client_order_id: str | None = None,
     ) -> OrderResult:
+        # Phase 18: normalize the limit price to a valid tick FIRST, so the
+        # intent log, validation echo, and wire body all carry the same value.
+        if limit_price is not None:
+            limit_price = round_limit_price(limit_price)
         # Log intent BEFORE anything is sent, so there is always a record of
         # what was attempted even if the send fails.
         print(

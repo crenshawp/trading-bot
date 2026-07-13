@@ -9,6 +9,7 @@ from __future__ import annotations
 from trading_bot.broker.alpaca import (
     ALPACA_PAPER_BASE_URL,
     AlpacaBroker,
+    round_limit_price,
     to_alpaca_symbol,
 )
 from trading_bot.broker.base import (
@@ -97,5 +98,6 @@ __all__ = [
     "occ_symbol",
     "parse_occ_symbol",
     "reconcile",
+    "round_limit_price",
     "to_alpaca_symbol",
 ]
