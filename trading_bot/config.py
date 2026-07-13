@@ -255,6 +255,15 @@ FUND_EARNINGS_GROWTH_FLOOR: float = -0.20     # -20% YoY earnings growth
 FUND_DEBT_EQUITY_CEILING: float = 200.0       # 2.0x debt/equity (yfinance %)
 
 # ──────────────────────────────────────────────────────────────────────────
+# Live candidate sourcing (Phase 17)
+# ──────────────────────────────────────────────────────────────────────────
+# Recency window for pulling fired signals into an allocation plan: one daily
+# stock-scan cycle (the slowest cadence — crypto fires hourly, long-term
+# candidates are daily). A signal older than this is stale: its entry price
+# belongs to a market state the next scan has already superseded.
+CANDIDATE_RECENCY_HOURS: int = 24
+
+# ──────────────────────────────────────────────────────────────────────────
 # Risk of ruin (Phase 15) — CIRCUIT BREAKERS + EMERGENCY SHUTDOWN
 # ──────────────────────────────────────────────────────────────────────────
 # The mandatory safety layer required before any live-switch decision. Two

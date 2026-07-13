@@ -29,6 +29,7 @@ may route to the CRYPTO pool. Still PAPER ONLY.
 
 from __future__ import annotations
 
+import json
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -40,7 +41,7 @@ import yfinance as yf
 
 from trading_bot import allocation, config, db, earnings, indicators, risk_of_ruin
 from trading_bot.broker.base import ORDER_TYPE_LIMIT, TIF_DAY, Broker, OrderResult
-from trading_bot.models import LongTermCandidate, LongTermPosition
+from trading_bot.models import LongTermCandidate, LongTermPosition, Signal
 
 __all__ = ["LongTermCandidate", "LongTermPosition"]
 
@@ -318,6 +319,47 @@ def generate_candidates(
         ))
 
     return out
+
+
+# ── candidate persistence (Phase 17 — long-term entries land in signals) ─────
+
+
+def persist_candidates(
+    candidates: Sequence[LongTermCandidate], *, now: datetime | None = None,
+) -> list[int]:
+    """Log generated long-term candidates into the ``signals`` table (Phase 17).
+
+    Long-term entries historically lived only in memory (generated on demand,
+    never persisted) — so the live candidate source could never see them. This
+    records each one as a fired signal (direction ``'long'``, the generator's
+    rationale kept in ``raw_indicators_json``) WITHOUT opening a trades row:
+    long-term outcomes are tracked in ``long_term_positions`` by the protective
+    exit watcher, not by the TP/SL trade resolver. One shared timestamp per
+    batch lets the dedupe index collapse an accidental double-insert within a
+    run. Returns the signal ids. Fail-soft per candidate: one bad row is logged
+    and never blocks the rest.
+    """
+    moment = now if now is not None else datetime.now(UTC)
+    ids: list[int] = []
+    for c in candidates:
+        try:
+            ids.append(db.insert_signal(Signal(
+                timestamp=moment,
+                ticker=c.ticker,
+                asset_class=c.asset_class,
+                signal_type=c.signal_type,
+                direction="long",
+                entry_price=c.entry_price,
+                raw_indicators_json=json.dumps(
+                    {"entry_rationale": c.entry_rationale}
+                ),
+            )))
+        except Exception as exc:  # noqa: BLE001 - one candidate must never block the batch
+            print(
+                f"  longterm: candidate persist error for {c.ticker}: {exc}",
+                file=sys.stderr,
+            )
+    return ids
 
 
 # ── entry submission (Phase 16 — operator-triggered via allocate execute) ────

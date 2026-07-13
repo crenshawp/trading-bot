@@ -25,6 +25,10 @@ class Signal:
     earnings_risk: bool = False
     news_risk: bool = False
     raw_indicators_json: str | None = None
+    # Phase 17: set (via db.mark_signals_considered) when the live candidate
+    # source pulls this signal into an execute-bound plan — at PULL time, not
+    # execution time. NULL = never considered. insert_signal does not write it.
+    considered_at: datetime | None = None
     id: int | None = None       # populated after insert
 
 

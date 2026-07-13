@@ -45,6 +45,7 @@ from trading_bot.models import (
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
+# Version 21 (Phase 17) — adds signals.considered_at (live-candidate sourcing).
 # Version 20 (Phase 16) — adds the plan_executions table (execution audit trail).
 # Version 19 (Phase 15) — adds the equity_snapshots table (drawdown tracking).
 # Version 18 (Phase 14) — adds the long_term_positions table (buy-and-hold).
@@ -55,7 +56,7 @@ from trading_bot.models import (
 # Version 13 (Phase 6) — adds trades.ind_* advisory indicator-family columns.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -695,6 +696,21 @@ def _migrate_to_v20(_conn: sqlite3.Connection) -> None:
     return None
 
 
+def _migrate_to_v21(conn: sqlite3.Connection) -> None:
+    """Phase 17 migration step: ``signals.considered_at``.
+
+    NULL until the signal is pulled into an execute-bound plan by the live
+    candidate source — set at PULL time (not execution time) so a signal is
+    considered exactly once, regardless of what the plan later did with it.
+    Existing rows stay NULL; the live query's recency window keeps historical
+    signals from flooding the first post-migration plan.
+    """
+    cur = conn.execute("PRAGMA table_info(signals)")
+    cols = {str(row[1]) for row in cur.fetchall()}
+    if "considered_at" not in cols:
+        conn.execute("ALTER TABLE signals ADD COLUMN considered_at TEXT")
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -719,6 +735,7 @@ def init_db() -> None:
         _migrate_to_v18(conn)
         _migrate_to_v19(conn)
         _migrate_to_v20(conn)
+        _migrate_to_v21(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -840,6 +857,10 @@ def _row_to_signal(row: sqlite3.Row) -> Signal:
         earnings_risk=bool(row["earnings_risk"]),
         news_risk=bool(row["news_risk"]),
         raw_indicators_json=row["raw_indicators_json"],
+        considered_at=(
+            datetime.fromisoformat(row["considered_at"])
+            if row["considered_at"] else None
+        ),
         id=int(row["id"]),
     )
 
@@ -2974,3 +2995,72 @@ def has_submitted_plan_execution(ticker: str, pool: str, since: datetime) -> boo
     finally:
         conn.close()
     return row is not None
+
+
+# ---- live candidate sourcing (Phase 17) ----
+
+
+def get_actionable_signals(since: datetime) -> list[dict[str, Any]]:
+    """Fired signals that are still plannable, newest first (Phase 17).
+
+    The three boundaries are enforced BY THE QUERY, not left to downstream
+    checks: (1) fired at/after ``since`` (the recency window); (2) never
+    considered (``considered_at IS NULL``); (3) not shadow-tracked, and the
+    paper-tracking trade — when one exists — is still open (a resolved trade
+    means the move already played out). Signals with NO trade row (the
+    long-term entries, which are tracked in ``long_term_positions`` instead)
+    are included via the LEFT JOIN.
+
+    Each dict carries the signal columns plus the joined trade's fire-time
+    advisory context (``track_mode``, ``sentiment_score``, ``ind_*``) so the
+    candidate mapper needs no second query.
+    """
+    sql = (
+        "SELECT signals.*, trades.track_mode AS trade_track_mode, "
+        "       trades.sentiment_score AS trade_sentiment_score, "
+        "       trades.ind_rsi AS trade_ind_rsi, "
+        "       trades.ind_adx AS trade_ind_adx, "
+        "       trades.ind_obv AS trade_ind_obv, "
+        "       trades.ind_vol_regime AS trade_ind_vol_regime, "
+        "       trades.ind_concentration AS trade_ind_concentration "
+        "FROM signals "
+        "LEFT JOIN trades ON trades.signal_id = signals.id "
+        "WHERE signals.timestamp >= ? "
+        "  AND signals.considered_at IS NULL "
+        "  AND (trades.id IS NULL "
+        "       OR (trades.track_mode = 'active' "
+        "           AND (trades.outcome IS NULL OR trades.outcome = 'open'))) "
+        "ORDER BY signals.timestamp DESC, signals.id DESC"
+    )
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, (since.isoformat(),)).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def mark_signals_considered(
+    signal_ids: Sequence[int], considered_at: datetime,
+) -> int:
+    """Stamp ``considered_at`` on the given signals; returns the rows updated.
+
+    Only NULL rows are stamped (the first consideration wins — the timestamp
+    records when the signal entered a plan, never when it was re-seen).
+    """
+    ids = [int(i) for i in signal_ids]
+    if not ids:
+        return 0
+    # The interpolation is literal '?' placeholders only; values bind below.
+    placeholders = ", ".join("?" for _ in ids)
+    sql = (
+        "UPDATE signals SET considered_at = ? "
+        f"WHERE id IN ({placeholders}) AND considered_at IS NULL"  # noqa: S608
+    )
+    conn = get_connection()
+    try:
+        cur = conn.execute(sql, [considered_at.isoformat(), *ids])
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
