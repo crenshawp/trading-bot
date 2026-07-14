@@ -193,8 +193,12 @@ def _execute_swing(
     The chain fetch is fail-soft: unavailable/erroring chains simply mean
     options are unavailable and the hierarchy falls through to shares — exactly
     Phase 13's documented behaviour. The exit watcher's TP/SL levels are
-    recovered from the order (``_swing_exit_levels``); the deadline is left
-    unset (no hold-window field exists on a PlannedOrder to carry one).
+    recovered from the order (``_swing_exit_levels``); the hold deadline is the
+    order's CARRIED ``hold_deadline`` (Phase 20 — the original swing signal's
+    resolver settlement deadline), applied to the SHARES vehicle only: option
+    positions keep their Phase 13 behaviour untouched. A missing value on a
+    SWING order degrades to no time stop (today's behaviour), logged — never a
+    crash in the fire path.
     """
     contracts: list[OptionContract] = []
     chain_ok = False
@@ -222,8 +226,19 @@ def _execute_swing(
         )
 
     tp, sl = _swing_exit_levels(order)
+    # Phase 20: only the shares fallback takes the carried hold window —
+    # option-position deadlines are Phase 13's domain and stay untouched.
+    deadline = None
+    if decision.vehicle == oe.VEHICLE_SHARES:
+        deadline = order.hold_deadline
+        if deadline is None:
+            print(
+                f"  execute: no hold window carried for {order.ticker} "
+                "shares fallback - deadline unset (TP/SL only)",
+                file=sys.stderr,
+            )
     result, _position_id = oe.execute_decision(
-        broker, decision, opened_at=now, tp=tp, sl=sl,
+        broker, decision, opened_at=now, tp=tp, sl=sl, deadline=deadline,
     )
     return OrderExecution(
         order, _status_from_order_result(result),
