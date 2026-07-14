@@ -170,6 +170,28 @@ def _hold_window_days(signal: dict) -> int:
     return config.EARNINGS_BLACKOUT_DEFAULT_DAYS
 
 
+def _hold_estimate_from(signal: dict) -> int | None:
+    """The DAYS-denominated hold estimate to PERSIST on the signal row
+    (Phase 21): ``"3-5 days"`` -> 5, the window's outer bound (matching
+    ``_hold_window_days``).
+
+    Distinct from ``_hold_window_days``' earnings-blackout fallback: for
+    persistence, absent or non-day strings must stay ``None`` — NULL keeps the
+    resolver's asset-class default, unchanged. The crypto signals' ``"2-8
+    hours"`` estimate is hours-shaped and does not fit the integer-days
+    column, so crypto deliberately persists nothing (14-day default as ever).
+    """
+    import re
+
+    raw = str(signal.get("hold_days", ""))
+    if "day" not in raw.lower():
+        return None
+    nums = re.findall(r"\d+", raw)
+    if not nums:
+        return None
+    return max(int(n) for n in nums)
+
+
 def _should_check_earnings(signal: dict) -> bool:
     """Earnings blackout applies only to stock TRADE signals (call/put).
     Crypto has no earnings; warning entries aren't trades."""
@@ -730,6 +752,11 @@ def log_signal(
         entry_price=float(signal["price"]),
         stop_loss=float(stop_loss_raw) if stop_loss_raw is not None else None,
         take_profit=float(take_profit_raw) if take_profit_raw is not None else None,
+        # Phase 21: persist the ATR-based estimate the scanner ALREADY computed
+        # (it was dropped here since Phase 1 — every signal resolved on the
+        # 30-day default instead of its own 1-5 day intent). Forward-only:
+        # existing rows are never touched and NULL still means the default.
+        hold_estimate_days=_hold_estimate_from(signal),
     )
     signal_id = db.insert_signal(rec)
 
