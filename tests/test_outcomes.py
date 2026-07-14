@@ -333,6 +333,54 @@ def test_post_fix_signal_resolves_on_its_own_real_window(
     assert resolved.closed_at == opened + timedelta(days=2)
 
 
+def test_crypto_signal_still_resolves_on_unchanged_default(
+    tmp_db: Path,
+    fake_candles: Callable[..., pd.DataFrame],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 21 changes stock behavior only: a crypto signal's hours-shaped
+    estimate persists NOTHING, so it keeps resolving on the same 14-day
+    crypto default as ever."""
+    from trading_bot import regime, scanner, vix
+
+    def _no_regime(*_a: object, **_k: object) -> object:
+        raise regime.RegimeFetchError("offline")
+
+    def _no_vix(*_a: object, **_k: object) -> object:
+        raise vix.VixFetchError("offline")
+
+    monkeypatch.setattr("trading_bot.regime.get_current_regime", _no_regime)
+    monkeypatch.setattr("trading_bot.vix.get_current_vix", _no_vix)
+
+    sid = scanner.log_signal({
+        "ticker": "BTC-USD", "asset_type": "crypto",
+        "trade_type": "⚡ CRYPTO TRADE", "direction": "LONG 📈",
+        "setup": "Oversold Reversal", "price": 50_000.0,
+        "take_profit": 51_000.0, "stop_loss": 49_500.0,
+        "hold_days": "2-8 hours", "confidence": "High",
+    })
+    assert sid is not None
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+    assert signal.hold_estimate_days is None
+
+    trade = db.get_trade_by_signal_id(sid)
+    assert trade is not None
+    opened = trade.opened_at
+    # Flat candles between SL (49500) and TP (51000) — no touch.
+    df = fake_candles(
+        highs=[50_500] * 3, lows=[49_800] * 3, closes=[50_000] * 3,
+        start=opened, interval="1h",
+    )
+    _patch_yf(monkeypatch, df)
+
+    resolved = outcomes.resolve_trade(
+        trade, signal, now=opened + timedelta(days=15),
+    )
+    assert resolved.outcome == "expired"
+    assert resolved.closed_at == opened + timedelta(days=14)   # crypto default
+
+
 # ────────────────────── PnL calculation ──────────────────────
 
 

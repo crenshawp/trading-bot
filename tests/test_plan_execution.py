@@ -473,6 +473,57 @@ def test_option_position_deadline_untouched_by_carried_window(
     assert db.get_open_long_term_positions() == []
 
 
+def test_fired_signal_window_reaches_shares_fallback_deadline(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 21 end to end: a signal fired through scanner.log_signal carries
+    its now-persisted estimate all the way to the shares-fallback position's
+    deadline — fire → candidate → plan → executed time stop, no defaults."""
+    from trading_bot import allocation, candidate_source, regime, scanner, vix
+    from trading_bot.broker.base import AccountInfo
+
+    def _no_regime(*_a: object, **_k: object) -> object:
+        raise regime.RegimeFetchError("offline")
+
+    def _no_vix(*_a: object, **_k: object) -> object:
+        raise vix.VixFetchError("offline")
+
+    monkeypatch.setattr("trading_bot.regime.get_current_regime", _no_regime)
+    monkeypatch.setattr("trading_bot.vix.get_current_vix", _no_vix)
+
+    sid = scanner.log_signal({
+        "ticker": "META", "asset_type": "stock",
+        "trade_type": "📆 SWING TRADE", "direction": "CALL 📈",
+        "setup": "EMA21 Pullback", "price": 480.0,
+        "take_profit": 496.0, "stop_loss": 468.0,
+        "hold_days": "3-5 days", "confidence": "High",
+    })
+    assert sid is not None
+    # Separate PRE-EXISTING gap (out of Phase 21 scope): log_signal doesn't
+    # persist atr either, and Phase 7 sizing needs it. Supply it directly so
+    # this test exercises the hold-window plumbing, not the atr gap.
+    conn = db.get_connection()
+    try:
+        conn.execute("UPDATE signals SET atr = ? WHERE id = ?", (8.0, sid))
+        conn.commit()
+    finally:
+        conn.close()
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+
+    candidates = candidate_source.live_candidates(now=signal.timestamp)
+    result = allocation.build_plan(
+        candidates, AccountInfo(ok=True, equity=100_000.0, cash=100_000.0),
+    )
+    run = pe.execute_plan(
+        SpyBroker(), result.plan, now=signal.timestamp,   # no chain -> shares
+    )
+    assert run.executions[0].status == "submitted"
+    (pos,) = db.get_open_long_term_positions()
+    assert pos.source == "swing_fallback"
+    assert pos.deadline == signal.timestamp + timedelta(days=5)   # not +30
+
+
 def test_long_term_entry_never_acquires_a_deadline(tmp_db: Path) -> None:
     """LOCKED DESIGN regression: even an adversarial LONG_TERM order carrying
     a hold_deadline produces a genuine long-term position with deadline=None —

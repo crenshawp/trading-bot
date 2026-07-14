@@ -14,14 +14,14 @@ broker boundary. The real path is ``python -m trading_bot allocate plan`` /
 from __future__ import annotations
 
 import tempfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from trading_bot import config
 
 config.DB_PATH = Path(tempfile.mkdtemp()) / "demo_live_candidates.db"
 
-from trading_bot import allocation, candidate_source, db, long_term  # noqa: E402
+from trading_bot import allocation, candidate_source, db, long_term, outcomes  # noqa: E402
 from trading_bot import plan_execution as pe  # noqa: E402
 from trading_bot.broker.alpaca import to_alpaca_symbol  # noqa: E402
 from trading_bot.broker.fake import FakeBroker  # noqa: E402
@@ -34,10 +34,19 @@ def _seed_fired_signals() -> None:
     """Seed what a real scan cycle leaves behind: a swing stock signal (with
     its fire-time trade context), a data-only crypto SWING signal, and a
     long-term crypto entry persisted by the Phase 17 candidate logger."""
+    # An OLD-STYLE row: fired before Phase 21 persisted estimates (NULL) —
+    # and 25h ago, so it is also outside the plan's recency window.
+    db.insert_signal(Signal(
+        timestamp=_NOW - timedelta(hours=25), ticker="AAPL",
+        asset_class="stock", signal_type="ema21_pullback", direction="call",
+        entry_price=190.0,
+    ))
+
     swing = db.insert_signal(Signal(
         timestamp=_NOW, ticker="META", asset_class="stock",
         signal_type="ema21_pullback", direction="call", entry_price=480.0,
-        atr=8.0, rsi=55.0, hold_estimate_days=2,   # the scanner's hold window
+        atr=8.0, rsi=55.0,
+        hold_estimate_days=2,   # what log_signal persists since Phase 21
     ))
     db.insert_trade(Trade(
         signal_id=swing, opened_at=_NOW, outcome="open", track_mode="active",
@@ -67,7 +76,21 @@ def main() -> None:
     _seed_fired_signals()
     broker = FakeBroker()
 
-    print("=== Live candidate source: real fired signals, not samples ===")
+    print("=== Phase 21 before/after: the resolver's settlement window ===")
+    for sig in db.get_signals():
+        if sig.signal_type != "ema21_pullback":
+            continue
+        window = outcomes.hold_window_for(sig.hold_estimate_days, sig.asset_class)
+        label = (
+            f"real {sig.hold_estimate_days}-day estimate"
+            if sig.hold_estimate_days else "NULL -> 30-day default"
+        )
+        print(
+            f"  {sig.ticker:<8} fired {sig.timestamp:%Y-%m-%d %H:%M} "
+            f"({label:<24}) -> settles by {sig.timestamp + window:%Y-%m-%d}"
+        )
+
+    print("\n=== Live candidate source: real fired signals, not samples ===")
     candidates = candidate_source.live_candidates(now=_NOW, mark_considered=True)
     for c in candidates:
         window = (

@@ -57,6 +57,48 @@ def test_log_signal_inserts_into_db(tmp_db: Path) -> None:
     assert row.stop_loss == 49500.0
 
 
+def test_hold_estimate_from_parses_day_strings() -> None:
+    """Phase 21: the persistence parser takes the window's outer bound from
+    DAYS-denominated estimates and returns None for everything else — None
+    persists NULL, which keeps the resolver's default, unchanged."""
+    assert scanner._hold_estimate_from({"hold_days": "3-5 days"}) == 5
+    assert scanner._hold_estimate_from({"hold_days": "2-3 days"}) == 3
+    assert scanner._hold_estimate_from({"hold_days": "1-2 days"}) == 2
+    # Crypto's hours-shaped estimate doesn't fit the integer-days column.
+    assert scanner._hold_estimate_from({"hold_days": "2-8 hours"}) is None
+    assert scanner._hold_estimate_from({"hold_days": ""}) is None
+    assert scanner._hold_estimate_from({}) is None
+    assert scanner._hold_estimate_from({"hold_days": "some days"}) is None
+
+
+def test_log_signal_persists_stock_hold_estimate(tmp_db: Path) -> None:
+    sid = scanner.log_signal({
+        "ticker": "GOOGL", "asset_type": "stock",
+        "trade_type": "📆 SWING TRADE", "direction": "CALL 📈",
+        "setup": "EMA21 Pullback", "price": 180.0,
+        "take_profit": 185.0, "stop_loss": 178.0,
+        "hold_days": "3-5 days", "confidence": "High",
+    })
+    assert sid is not None
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+    assert signal.hold_estimate_days == 5
+
+
+def test_log_signal_crypto_hold_estimate_stays_null(tmp_db: Path) -> None:
+    sid = scanner.log_signal({
+        "ticker": "BTC-USD", "asset_type": "crypto",
+        "trade_type": "⚡ CRYPTO TRADE", "direction": "LONG 📈",
+        "setup": "Oversold Reversal", "price": 50_000.0,
+        "take_profit": 51_000.0, "stop_loss": 49_500.0,
+        "hold_days": "2-8 hours", "confidence": "High",
+    })
+    assert sid is not None
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+    assert signal.hold_estimate_days is None   # crypto default unchanged
+
+
 def test_log_signal_returns_id(tmp_db: Path) -> None:
     sid = scanner.log_signal({
         "ticker":      "GOOGL",
