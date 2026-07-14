@@ -364,6 +364,24 @@ def test_build_plan_long_term_uses_diversification_sizing() -> None:
     assert order.qty == 45.0                    # $4500 / $100
 
 
+def test_planned_order_carries_hold_deadline_unchanged() -> None:
+    """Phase 20: the candidate's hold_deadline is a pure PASS-THROUGH — the
+    allocator neither computes nor alters it."""
+    from datetime import UTC, datetime
+
+    deadline = datetime(2026, 7, 12, 15, 0, tzinfo=UTC)
+    acct = AccountInfo(ok=True, equity=100_000.0, cash=100_000.0)
+
+    with_window = allocation.build_plan(
+        [_candidate(hold_deadline=deadline)], acct,
+    )
+    (order,) = with_window.plan.orders
+    assert order.hold_deadline == deadline           # unchanged, uncomputed
+
+    without_window = allocation.build_plan([_candidate()], acct)
+    assert without_window.plan.orders[0].hold_deadline is None
+
+
 def test_build_plan_account_unavailable_is_empty_plan() -> None:
     res = allocation.build_plan(
         [_candidate(ticker="AAA")], AccountInfo(ok=False, reason="creds unset"),

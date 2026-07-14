@@ -39,11 +39,13 @@ def _seed_signal(
     rsi: float | None = 55.0,
     earnings_risk: bool = False,
     timestamp: datetime = _NOW,
+    hold_days: int | None = None,
 ) -> int:
     return db.insert_signal(Signal(
         timestamp=timestamp, ticker=ticker, asset_class=asset_class,
         signal_type=signal_type, direction=direction, entry_price=entry,
         atr=atr, rsi=rsi, earnings_risk=earnings_risk,
+        hold_estimate_days=hold_days,
     ))
 
 
@@ -223,6 +225,58 @@ def test_dedupe_keeps_newest_signal_per_pair(tmp_db: Path) -> None:
         signal = db.get_signal_by_id(sid)
         assert signal is not None
         assert signal.considered_at is not None
+
+
+# ───────────────────────── hold-window carrying (Phase 20) ──────────────────
+
+
+def test_swing_candidate_carries_resolver_hold_deadline(tmp_db: Path) -> None:
+    """The signal's own hold estimate becomes the carried deadline — fire
+    timestamp + the Phase 1 resolver window, nothing invented."""
+    sid = _seed_signal(hold_days=3)
+    _seed_trade(sid)
+    (c,) = _live()
+    assert c.hold_deadline == _NOW + timedelta(days=3)
+
+
+def test_swing_candidate_without_estimate_uses_resolver_default(
+    tmp_db: Path,
+) -> None:
+    """Live signals don't persist an estimate today — the carried deadline is
+    then the SAME asset-class default the resolver has settled trades on since
+    Phase 1 (30 days for stock)."""
+    from trading_bot import outcomes
+
+    sid = _seed_signal(hold_days=None)
+    _seed_trade(sid)
+    (c,) = _live()
+    expected = _NOW + outcomes.hold_window_for(None, "stock")
+    assert c.hold_deadline == expected == _NOW + timedelta(days=30)
+
+
+def test_long_term_candidates_carry_no_hold_deadline(tmp_db: Path) -> None:
+    """LONG_TERM / CRYPTO pools have no time stop by design."""
+    _seed_signal(
+        ticker="AAPL", signal_type="long_term_stock", direction="long",
+        atr=None, rsi=None,
+    )
+    _seed_signal(
+        ticker="BTC-USD", signal_type="long_term_crypto", asset_class="crypto",
+        direction="long", entry=64_000.0, atr=None, rsi=None,
+    )
+    candidates = _live()
+    assert len(candidates) == 2
+    assert all(c.hold_deadline is None for c in candidates)
+
+
+def test_hold_deadline_survives_allocation_into_planned_order(
+    tmp_db: Path,
+) -> None:
+    sid = _seed_signal(hold_days=2)
+    _seed_trade(sid)
+    result = allocation.build_plan(_live(), _ACCOUNT)
+    (order,) = result.plan.orders
+    assert order.hold_deadline == _NOW + timedelta(days=2)   # pass-through
 
 
 # ───────────────────────── two-layer crypto-swing guarantee (live data) ──────

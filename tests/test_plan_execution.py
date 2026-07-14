@@ -145,24 +145,26 @@ def test_check_authorization_restored_after_reauthorize(tmp_db: Path) -> None:
 def _swing_order(
     *, ticker: str = "META", qty: float = 10.0, entry: float = 480.0,
     est_cost: float = 600.0, dollar_risk: float = 150.0, side: str = "buy",
-    rank: int = 1,
+    rank: int = 1, hold_deadline: datetime | None = None,
 ) -> PlannedOrder:
     return PlannedOrder(
         rank=rank, pool=config.POOL_SWING, tier="HIGH", ticker=ticker,
         signal_type="ema21_pullback", side=side, qty=qty, entry=entry,
         est_cost=est_cost, dollar_risk=dollar_risk, score=0.8,
+        hold_deadline=hold_deadline,
     )
 
 
 def _long_term_order(
     *, ticker: str = "AAPL", pool: str = config.POOL_LONG_TERM,
     qty: float = 45.0, entry: float = 100.0, rank: int = 2,
+    hold_deadline: datetime | None = None,
 ) -> PlannedOrder:
     signal = "long_term_crypto" if pool == config.POOL_CRYPTO else "long_term_stock"
     return PlannedOrder(
         rank=rank, pool=pool, tier="NORMAL", ticker=ticker, signal_type=signal,
         side="buy", qty=qty, entry=entry, est_cost=qty * entry,
-        dollar_risk=qty * entry, score=0.4,
+        dollar_risk=qty * entry, score=0.4, hold_deadline=hold_deadline,
     )
 
 
@@ -396,6 +398,97 @@ def test_every_outcome_is_recorded_in_plan_executions(tmp_db: Path) -> None:
     )
     statuses = [r.status for r in db.get_plan_executions()]
     assert "skipped" in statuses
+
+
+# ───────────────────────── hold-window plumbing (Phase 20) ───────────────────
+
+
+def test_shares_fallback_persists_carried_hold_deadline(tmp_db: Path) -> None:
+    """The live path no longer records deadline=None: the shares fallback
+    inherits the ORIGINAL swing signal's settlement deadline."""
+    deadline = _NOW + timedelta(days=2)
+    broker = SpyBroker()
+    run = pe.execute_plan(
+        broker,
+        ExecutionPlan(orders=[_swing_order(hold_deadline=deadline)]),
+        now=_NOW,                       # no chain -> shares fallback
+    )
+    assert run.executions[0].status == "submitted"
+    (pos,) = db.get_open_long_term_positions()
+    assert pos.source == "swing_fallback"
+    assert pos.deadline == deadline     # the REAL time stop, carried through
+
+
+def test_watcher_hold_deadline_fires_on_carried_value(tmp_db: Path) -> None:
+    """End to end: execute -> tracked with the carried deadline -> the Phase 19
+    watcher time-stops it once that moment passes."""
+    import pandas as pd
+
+    deadline = _NOW + timedelta(days=2)
+    pe.execute_plan(
+        SpyBroker(),
+        ExecutionPlan(orders=[_swing_order(hold_deadline=deadline)]),
+        now=_NOW,
+    )
+    flat = pd.DataFrame({
+        "Open": [480.0] * 5, "High": [480.0] * 5, "Low": [480.0] * 5,
+        "Close": [480.0] * 5, "Volume": [1_000_000] * 5,   # between TP and SL
+    })
+    (action,) = long_term.watch_long_term_positions(
+        SpyBroker(), price_fetch=lambda _t: flat,
+        now=deadline + timedelta(hours=1),
+    )
+    assert action.action == "close" and action.reason == "hold_deadline"
+
+
+def test_shares_fallback_missing_deadline_fails_soft(
+    tmp_db: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A SWING order without a carried window degrades to today's behavior
+    (no time stop), logged — the fire path never raises."""
+    run = pe.execute_plan(
+        SpyBroker(),
+        ExecutionPlan(orders=[_swing_order(hold_deadline=None)]),
+        now=_NOW,
+    )
+    assert run.executions[0].status == "submitted"    # fired anyway
+    (pos,) = db.get_open_long_term_positions()
+    assert pos.deadline is None
+    assert "no hold window carried" in capsys.readouterr().err
+
+
+def test_option_position_deadline_untouched_by_carried_window(
+    tmp_db: Path,
+) -> None:
+    """Phase 13's domain: even with a carried window on the order, an OPTION
+    position's deadline stays exactly as before (None from this path)."""
+    run = pe.execute_plan(
+        SpyBroker(),
+        ExecutionPlan(orders=[_swing_order(hold_deadline=_NOW + timedelta(days=2))]),
+        now=_NOW, option_chain_fetch=_chain_fetch,     # full option fits
+    )
+    assert run.executions[0].vehicle == "option_full"
+    (opt,) = db.get_open_option_positions()
+    assert opt.deadline is None
+    assert db.get_open_long_term_positions() == []
+
+
+def test_long_term_entry_never_acquires_a_deadline(tmp_db: Path) -> None:
+    """LOCKED DESIGN regression: even an adversarial LONG_TERM order carrying
+    a hold_deadline produces a genuine long-term position with deadline=None —
+    the entry path never reads the field."""
+    run = pe.execute_plan(
+        SpyBroker(),
+        ExecutionPlan(orders=[
+            _long_term_order(hold_deadline=_NOW + timedelta(days=2)),
+        ]),
+        now=_NOW,
+    )
+    assert run.executions[0].status == "submitted"
+    (pos,) = db.get_open_long_term_positions()
+    assert pos.source == "long_term"
+    assert pos.deadline is None            # unconditionally, by design
+    assert (pos.tp, pos.sl) == (None, None)
 
 
 # ───────────────────────── exit-level recovery ───────────────────────────────

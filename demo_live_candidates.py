@@ -37,7 +37,7 @@ def _seed_fired_signals() -> None:
     swing = db.insert_signal(Signal(
         timestamp=_NOW, ticker="META", asset_class="stock",
         signal_type="ema21_pullback", direction="call", entry_price=480.0,
-        atr=8.0, rsi=55.0,
+        atr=8.0, rsi=55.0, hold_estimate_days=2,   # the scanner's hold window
     ))
     db.insert_trade(Trade(
         signal_id=swing, opened_at=_NOW, outcome="open", track_mode="active",
@@ -70,8 +70,12 @@ def main() -> None:
     print("=== Live candidate source: real fired signals, not samples ===")
     candidates = candidate_source.live_candidates(now=_NOW, mark_considered=True)
     for c in candidates:
+        window = (
+            c.hold_deadline.strftime("%Y-%m-%d %H:%M")
+            if c.hold_deadline else "-"
+        )
         print(f"  {c.ticker:<8} {c.signal_type:<18} {c.asset_class:<7} "
-              f"entry={c.entry:,.0f}")
+              f"entry={c.entry:<9,.0f} hold_deadline={window}")
 
     print("\n=== build_plan: the EXISTING data-only filter still drops "
           "crypto swing ===")
@@ -83,13 +87,19 @@ def main() -> None:
         print(f"  skipped: {s.ticker:<8} {s.signal_type:<18} [{s.stage}] "
               f"{s.reason}")
 
-    print("\n=== execute: the long-term crypto entry submits (paper) ===")
+    print("\n=== execute: fallback + crypto entry submit; the fallback keeps ===")
+    print("=== its ORIGINAL hold window (Phase 20 - a REAL time stop)       ===")
     run = pe.execute_plan(broker, result.plan, now=_NOW)
     for e in run.executions:
         wire = to_alpaca_symbol(e.order.ticker)
         print(f"  {e.order.ticker:<8} {e.order.pool:<10} -> {e.status:<10} "
               f"ref={e.order_ref or '-':<8} wire-symbol={wire}")
-    print(f"  open long-term positions: {len(db.get_open_long_term_positions())}")
+    for pos in db.get_open_long_term_positions():
+        deadline = (
+            pos.deadline.strftime("%Y-%m-%d %H:%M") if pos.deadline else "None"
+        )
+        print(f"  tracked: {pos.ticker:<8} source={pos.source:<14} "
+              f"deadline={deadline}")
 
     print("\n=== considered-tracking: the same signals are never re-planned ===")
     again = candidate_source.live_candidates(now=_NOW)
