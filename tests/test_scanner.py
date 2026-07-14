@@ -116,6 +116,30 @@ def test_log_signal_atr_absent_stays_null(tmp_db: Path) -> None:
     assert signal.atr is None
 
 
+def test_log_signal_persists_rsi_and_absent_stays_null(tmp_db: Path) -> None:
+    """Phase 22 forward-only: rsi reaches its column when supplied; an
+    old-style dict without it persists NULL (today's fallback unchanged)."""
+    with_rsi = scanner.log_signal({
+        "ticker": "GOOGL", "asset_type": "stock",
+        "trade_type": "📆 SWING TRADE", "direction": "CALL 📈",
+        "setup": "EMA21 Pullback", "price": 180.0,
+        "take_profit": 185.0, "stop_loss": 178.0,
+        "rsi": 52.4, "confidence": "High",
+    })
+    without_rsi = scanner.log_signal({
+        "ticker": "META", "asset_type": "stock",
+        "trade_type": "📆 SWING TRADE", "direction": "CALL 📈",
+        "setup": "EMA21 Pullback", "price": 480.0,
+        "take_profit": 496.0, "stop_loss": 468.0, "confidence": "High",
+    })
+    assert with_rsi is not None and without_rsi is not None
+    persisted = db.get_signal_by_id(with_rsi)
+    old_style = db.get_signal_by_id(without_rsi)
+    assert persisted is not None and old_style is not None
+    assert persisted.rsi == 52.4
+    assert old_style.rsi is None
+
+
 def test_log_signal_crypto_hold_estimate_stays_null(tmp_db: Path) -> None:
     sid = scanner.log_signal({
         "ticker": "BTC-USD", "asset_type": "crypto",

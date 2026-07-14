@@ -775,6 +775,7 @@ def log_signal(
         # every row NULL (the ATR gap alone made live SWING candidates
         # unsizeable). Forward-only: absent keys stay NULL, old rows untouched.
         atr=_opt_float(signal, "atr"),
+        rsi=_opt_float(signal, "rsi"),
     )
     signal_id = db.insert_signal(rec)
 
@@ -1369,6 +1370,7 @@ def detect_stock_signals(ticker, df):
             "stop_loss":   0.0,
             "hold_days":  hold_days,
             "atr":        atr,
+            "rsi":        rsi,
         })
         return signals
 
@@ -1388,6 +1390,7 @@ def detect_stock_signals(ticker, df):
             "stop_loss":   0.0,
             "hold_days":  hold_days,
             "atr":        atr,
+            "rsi":        rsi,
         })
         return signals
 
@@ -1411,6 +1414,7 @@ def detect_stock_signals(ticker, df):
             "stop_loss":   sl_call,
             "hold_days":  hold_days,
             "atr":        atr,
+            "rsi":        rsi,
         })
 
     # ── PUT — EMA21 Pullback in downtrend ────────────────────────────────────
@@ -1433,6 +1437,7 @@ def detect_stock_signals(ticker, df):
             "stop_loss":   sl_put,
             "hold_days":  hold_days,
             "atr":        atr,
+            "rsi":        rsi,
         })
 
     # ── Trend Acceleration ────────────────────────────────────────────────────
@@ -1454,6 +1459,7 @@ def detect_stock_signals(ticker, df):
             "stop_loss":   sl_call,
             "hold_days":  hold_days,
             "atr":        atr,
+            "rsi":        rsi,
         })
 
     # ── Higher High Breakout ──────────────────────────────────────────────────
@@ -1474,6 +1480,7 @@ def detect_stock_signals(ticker, df):
             "stop_loss":   sl_call,
             "hold_days":  hold_days,
             "atr":        atr,
+            "rsi":        rsi,
         })
 
     # ── Trend Continuation ─────────────────────────────────────────────────────
@@ -1504,6 +1511,7 @@ def detect_stock_signals(ticker, df):
             "stop_loss":   sl_call,
             "hold_days":  hold_days,
             "atr":        atr,
+            "rsi":        rsi,
         })
 
     return signals
@@ -1558,6 +1566,7 @@ def detect_crypto_signals(ticker, df):
             "stop_loss":   sl_long,
             "hold_days":  "2-8 hours",
             "atr":        atr,
+            "rsi":        rsi,
         })
 
     # ── Momentum Breakout — LONG ──────────────────────────────────────────────
@@ -1579,6 +1588,7 @@ def detect_crypto_signals(ticker, df):
             "stop_loss":   sl_long,
             "hold_days":  "2-8 hours",
             "atr":        atr,
+            "rsi":        rsi,
         })
 
     # ── Overbought Reversal — SHORT ───────────────────────────────────────────
@@ -1600,6 +1610,7 @@ def detect_crypto_signals(ticker, df):
             "stop_loss":   sl_short,
             "hold_days":  "2-8 hours",
             "atr":        atr,
+            "rsi":        rsi,
         })
 
     return signals
