@@ -6,7 +6,7 @@ which are exercised here.
 """
 
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -236,6 +236,101 @@ def test_resolve_still_open_inside_hold_window(
     )
     assert resolved.outcome == "open"
     assert resolved.exit_price is None
+
+
+# ────────────── forward-only safety proof (Phase 21 critical gate) ──────────
+
+
+def test_pre_fix_null_estimate_row_resolves_identically_on_default(
+    tmp_db: Path,
+    fake_candles: Callable[..., pd.DataFrame],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE Phase 21 safety proof: a signal row with NULL hold_estimate_days —
+    the shape of EVERY signal fired before the fix, and of every currently-open
+    trade's row — resolves exactly as it always has: still open inside the
+    30-day stock default, expired at precisely opened_at + 30 days. The fix
+    never touches existing rows, so this behavior is unchanged forever."""
+    opened = datetime(2026, 4, 1, tzinfo=UTC)
+    sid = _make_signal(hold_estimate_days=None)          # pre-Phase-21 row shape
+    tid = _make_trade(sid, opened_at=opened)
+    # Flat candles that never touch TP (110) or SL (95).
+    df = fake_candles(highs=[105, 104, 106], lows=[98, 99, 97], closes=[100, 101, 102])
+    _patch_yf(monkeypatch, df)
+
+    trade  = next(t for t in db.get_open_trades() if t.id == tid)
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+    assert signal.hold_estimate_days is None
+
+    # Day 29: still open — the unchanged default window is still active.
+    still_open = outcomes.resolve_trade(
+        trade, signal, now=opened + timedelta(days=29),
+    )
+    assert still_open.outcome == "open"
+
+    # Past day 30: expired at EXACTLY opened + 30 days — today's behavior.
+    resolved = outcomes.resolve_trade(
+        trade, signal, now=opened + timedelta(days=45),
+    )
+    assert resolved.outcome == "expired"
+    assert resolved.closed_at == opened + timedelta(days=30)
+
+
+def test_post_fix_signal_resolves_on_its_own_real_window(
+    tmp_db: Path,
+    fake_candles: Callable[..., pd.DataFrame],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A signal fired through the REAL fire path (scanner.log_signal) now
+    persists its ATR-based estimate and the resolver settles it against THAT
+    window — not the 30-day default."""
+    from trading_bot import regime, scanner, vix
+
+    def _no_regime(*_a: object, **_k: object) -> object:
+        raise regime.RegimeFetchError("offline")
+
+    def _no_vix(*_a: object, **_k: object) -> object:
+        raise vix.VixFetchError("offline")
+
+    monkeypatch.setattr("trading_bot.regime.get_current_regime", _no_regime)
+    monkeypatch.setattr("trading_bot.vix.get_current_vix", _no_vix)
+
+    sid = scanner.log_signal({
+        "ticker": "GOOGL", "asset_type": "stock",
+        "trade_type": "📆 SWING TRADE", "direction": "CALL 📈",
+        "setup": "EMA21 Pullback", "price": 100.0,
+        "take_profit": 110.0, "stop_loss": 95.0,
+        "hold_days": "1-2 days",                 # the scanner's ATR estimate
+        "confidence": "High",
+    })
+    assert sid is not None
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+    assert signal.hold_estimate_days == 2       # PERSISTED now (outer bound)
+
+    trade = db.get_trade_by_signal_id(sid)
+    assert trade is not None
+    opened = trade.opened_at
+    df = fake_candles(
+        highs=[105, 104, 106], lows=[98, 99, 97], closes=[100, 101, 102],
+        start=opened,
+    )
+    _patch_yf(monkeypatch, df)
+
+    # Inside its own 2-day window: still open.
+    still_open = outcomes.resolve_trade(
+        trade, signal, now=opened + timedelta(days=1),
+    )
+    assert still_open.outcome == "open"
+
+    # Past ITS window (day 3 of 2) — expired at opened + 2 days, where the
+    # old behavior would have held it open for 30.
+    resolved = outcomes.resolve_trade(
+        trade, signal, now=opened + timedelta(days=3),
+    )
+    assert resolved.outcome == "expired"
+    assert resolved.closed_at == opened + timedelta(days=2)
 
 
 # ────────────────────── PnL calculation ──────────────────────
