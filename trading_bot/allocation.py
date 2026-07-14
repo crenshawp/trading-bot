@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from trading_bot import config, risk
 from trading_bot.broker.base import AccountInfo
@@ -67,6 +68,12 @@ class Candidate:
     vol_regime: str = "unknown"        # low | normal | high | unknown
     sentiment_score: float | None = None   # -1..+1 (advisory)
     concentration: str = "unknown"     # Phase 6 label, carried for completeness
+    # Phase 20: the ORIGINAL swing signal's resolver settlement deadline
+    # (signal timestamp + the Phase 1 hold window) — the same moment the paper
+    # trade on this signal expires. Populated by the live candidate source for
+    # SWING-pool candidates only; LONG_TERM/CRYPTO have no time stop by design
+    # and stay None. Carried, never computed here.
+    hold_deadline: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +119,9 @@ class PlannedOrder:
     est_cost: float                # position value (qty × entry)
     dollar_risk: float             # $ at risk if the stop is hit
     score: float
+    # Phase 20: the candidate's hold_deadline, passed through UNCHANGED so the
+    # shares-fallback record inherits the original swing time stop.
+    hold_deadline: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -453,7 +463,7 @@ def allocate(
                 signal_type=c.signal_type,
                 side="buy" if _is_long(c.direction) else "sell",
                 qty=qty, entry=c.entry, est_cost=pv, dollar_risk=dollar_risk,
-                score=rc.score,
+                score=rc.score, hold_deadline=c.hold_deadline,
             ))
             deployed += pv
             cash_remaining -= pv

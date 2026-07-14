@@ -28,11 +28,12 @@ build_plan / allocate / execute need no changes downstream of sourcing.
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from trading_bot import config, db, signal_pairs
-from trading_bot.allocation import Candidate
+from trading_bot import config, db, outcomes, signal_pairs
+from trading_bot.allocation import Candidate, route_pool
 
 
 def _watchlist_status_map() -> dict[str, str]:
@@ -62,7 +63,7 @@ def _to_candidate(
         ticker, signal_type, now=now,
     )
     rsi = row["trade_ind_rsi"] if row["trade_ind_rsi"] is not None else row["rsi"]
-    return Candidate(
+    candidate = Candidate(
         ticker=ticker,
         signal_type=signal_type,
         direction=str(row["direction"]),
@@ -80,6 +81,19 @@ def _to_candidate(
         sentiment_score=row["trade_sentiment_score"],
         concentration=row["trade_ind_concentration"] or "unknown",
     )
+    # Phase 20: SWING-pool candidates carry the signal's EXISTING resolver
+    # settlement deadline (fire timestamp + the Phase 1 hold window) so a
+    # shares-fallback position inherits the original swing time stop.
+    # LONG_TERM/CRYPTO pools have no such window by design — left None.
+    if route_pool(candidate) == config.POOL_SWING:
+        window = outcomes.hold_window_for(
+            row["hold_estimate_days"], candidate.asset_class,
+        )
+        candidate = dataclasses.replace(
+            candidate,
+            hold_deadline=datetime.fromisoformat(str(row["timestamp"])) + window,
+        )
+    return candidate
 
 
 def live_candidates(

@@ -89,12 +89,20 @@ def _check_hit(signal: Signal, high: float, low: float) -> tuple[bool, bool]:
     return (False, False)
 
 
-def _hold_window(signal: Signal) -> timedelta:
-    if signal.hold_estimate_days is not None and signal.hold_estimate_days > 0:
-        return timedelta(days=signal.hold_estimate_days)
-    if signal.asset_class == "crypto":
+def hold_window_for(hold_estimate_days: int | None, asset_class: str) -> timedelta:
+    """THE Phase 1 settlement window: the signal's own hold estimate when it
+    captured one, else the asset-class default. Public since Phase 20 so the
+    live candidate source can carry the EXACT resolver deadline through the
+    plan pipeline — one rule, never re-derived."""
+    if hold_estimate_days is not None and hold_estimate_days > 0:
+        return timedelta(days=hold_estimate_days)
+    if asset_class == "crypto":
         return timedelta(days=_DEFAULT_HOLD_DAYS_CRYPTO)
     return timedelta(days=_DEFAULT_HOLD_DAYS_STOCK)
+
+
+def _hold_window(signal: Signal) -> timedelta:
+    return hold_window_for(signal.hold_estimate_days, signal.asset_class)
 
 
 def _interval(signal: Signal) -> str:
