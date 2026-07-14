@@ -18,8 +18,11 @@ Entry gates (applied by the candidate generator):
      reusing the Phase 6 indicator functions, not reimplementing them;
   3. earnings SOFT wait-window (stocks only) — distinct from the Phase 5 blackout.
 
-Protective exits (this phase, no profit-taking): close on EITHER a trend
+Protective exits (no profit-taking for buy-and-hold): close on EITHER a trend
 breakdown (N consecutive closes below the trend) OR a drawdown-from-entry stop.
+Phase 19: the lifecycle book also tracks Phase 13 SHARES-FALLBACK positions
+(``source='swing_fallback'``) — those keep their ORIGINAL swing TP/SL/deadline
+exits (the Phase 13 trigger logic, reused) and never inherit these rules.
 
 The crypto SWING signals (Oversold Reversal, Momentum Breakout) remain data-only
 FOREVER — they never route to execution (enforced in allocation.build_plan via
@@ -39,8 +42,17 @@ from typing import Any
 import pandas as pd
 import yfinance as yf
 
-from trading_bot import allocation, config, db, earnings, indicators, risk_of_ruin
+from trading_bot import (
+    allocation,
+    config,
+    db,
+    earnings,
+    indicators,
+    options_execution,
+    risk_of_ruin,
+)
 from trading_bot.broker.base import ORDER_TYPE_LIMIT, TIF_DAY, Broker, OrderResult
+from trading_bot.broker.options import OPTION_TYPE_CALL, OPTION_TYPE_PUT
 from trading_bot.models import LongTermCandidate, LongTermPosition, Signal
 
 __all__ = ["LongTermCandidate", "LongTermPosition"]
@@ -461,17 +473,22 @@ def close_long_term_position(
     now: datetime,
     reason: str,
 ) -> OrderResult:
-    """THE long-term closing path — a SELL LIMIT via the Phase 11 equity path.
-    Used by the protective exit watcher AND the Phase 15 emergency shutdown, so
-    there is exactly one closer.
+    """THE lifecycle-book closing path — a closing LIMIT via the Phase 11
+    equity path. Used by the protective exit watcher AND the Phase 15 emergency
+    shutdown, so there is exactly one closer.
+
+    Phase 19: the closing side follows the position's direction — a long
+    closes with a SELL (every genuine long-term row); a short swing-fallback
+    (put-signal shares entry) closes with a BUY.
 
     The position row is marked closed ONLY when the broker accepted the order —
     a rejected close (e.g. market closed) leaves it open so the next cycle
     retries; nothing is recorded closed without a real order.
     """
     limit_price = exit_price if exit_price is not None else position.entry_price
+    side = "buy" if position.direction == "short" else "sell"
     order = broker.submit_order(
-        position.ticker, position.qty, "sell", order_type=ORDER_TYPE_LIMIT,
+        position.ticker, position.qty, side, order_type=ORDER_TYPE_LIMIT,
         limit_price=limit_price, time_in_force=TIF_DAY,
     )
     risk_of_ruin.record_broker_result(order.ok)   # Phase 15 detector
@@ -508,6 +525,21 @@ def _consecutive_closes_below_trend(
         return 0
 
 
+def _swing_fallback_exit(
+    position: LongTermPosition, current_price: float | None, now: datetime,
+) -> ProtectiveExitDecision:
+    """Exit decision for a SWING-FALLBACK row (Phase 19): its OWN persisted
+    swing TP/SL/hold-deadline, evaluated by the Phase 13 swing-exit trigger
+    logic REUSED verbatim (stop checked first, then take-profit, then the
+    deadline) — the long-term trend/drawdown rules are never applied to it.
+    A long orients like a call, a short like a put."""
+    swing = options_execution.evaluate_option_exit(
+        OPTION_TYPE_PUT if position.direction == "short" else OPTION_TYPE_CALL,
+        current_price, position.tp, position.sl, now, position.deadline,
+    )
+    return ProtectiveExitDecision(swing.action, swing.reason)
+
+
 def watch_long_term_positions(
     broker: Broker,
     *,
@@ -516,14 +548,22 @@ def watch_long_term_positions(
     trend_period: int = config.TREND_PERIOD,
     positions: Sequence[LongTermPosition] | None = None,
 ) -> list[ExitAction]:
-    """Check each open long-term position and AUTO-CLOSE the ones that hit a
-    protective-exit condition (trend breakdown or drawdown stop).
+    """Check each open lifecycle-book position and AUTO-CLOSE the ones that hit
+    their exit condition — closing is the one action safe to automate.
 
-    For a closing position it submits a SELL LIMIT via the Phase 11 equity path
-    (marketable at the latest close), records the ``exit_reason``, and marks the
-    row closed. FAIL-SOFT: an error on one position is logged and NEVER blocks the
-    others. ``price_fetch`` is injected (candles per ticker), keeping this
-    testable; ``positions`` defaults to the open book from the DB.
+    Phase 19 branches by ``source``: a genuine ``long_term`` row keeps the
+    EXISTING protective exits (trend breakdown / drawdown stop), completely
+    unchanged; a ``swing_fallback`` row is checked against its OWN persisted
+    swing TP/SL/hold-deadline via :func:`_swing_fallback_exit` — it must never
+    inherit the buy-and-hold rules (a ~2-day swing position under a 25%
+    drawdown stop with no time limit would be silently mismanaged). Neither
+    path affects the other.
+
+    For a closing position it submits a closing LIMIT via the Phase 11 equity
+    path (marketable at the latest close), records the ``exit_reason``, and
+    marks the row closed. FAIL-SOFT: an error on one position is logged and
+    NEVER blocks the others. ``price_fetch`` is injected (candles per ticker),
+    keeping this testable; ``positions`` defaults to the open book from the DB.
     """
     book = positions if positions is not None else db.get_open_long_term_positions()
     actions: list[ExitAction] = []
@@ -534,10 +574,13 @@ def watch_long_term_positions(
                 actions.append(ExitAction(pos, "hold", "no price data"))
                 continue
             current_price = _val(df["Close"], -1)
-            consecutive = _consecutive_closes_below_trend(df, trend_period)
-            decision = evaluate_protective_exit(
-                pos.entry_price, current_price, consecutive,
-            )
+            if pos.source == "swing_fallback":
+                decision = _swing_fallback_exit(pos, current_price, now)
+            else:
+                consecutive = _consecutive_closes_below_trend(df, trend_period)
+                decision = evaluate_protective_exit(
+                    pos.entry_price, current_price, consecutive,
+                )
             if decision.action == "hold":
                 actions.append(ExitAction(pos, "hold", decision.reason))
                 continue
