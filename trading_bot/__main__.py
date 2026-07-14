@@ -1736,18 +1736,21 @@ def cmd_longterm_candidates() -> None:
 
 
 def cmd_longterm_positions() -> None:
-    """Open long-term positions with current drawdown + trend-breakdown status
-    relative to the protective-exit thresholds."""
+    """Open lifecycle-book positions with per-source exit status: genuine
+    long-term rows show drawdown + trend-breakdown vs the protective-exit
+    thresholds; swing-fallback rows (Phase 19) show their OWN swing TP/SL —
+    the levels the watcher actually applies to them."""
     positions = db.get_open_long_term_positions()
     print("OPEN LONG-TERM POSITIONS")
-    print("-" * 92)
+    print("-" * 104)
     if not positions:
         print("  (none)")
         return
     print(
-        f"  {'Ticker':<10} {'Asset':<7} {'Entry':>9} {'Current':>9} "
+        f"  {'Ticker':<10} {'Asset':<7} {'Source':<14} {'Entry':>9} "
+        f"{'Current':>9} "
         f"{'Draw%':>7}/{int(config.MAX_DRAWDOWN_STOP_PCT)} "
-        f"{'Below':>5}/{config.TREND_BREAKDOWN_DAYS}"
+        f"{'Below':>5}/{config.TREND_BREAKDOWN_DAYS}  Swing exits"
     )
     for p in positions:
         df = long_term.fetch_daily_candles(p.ticker)
@@ -1759,11 +1762,22 @@ def cmd_longterm_positions() -> None:
         below = (
             long_term._consecutive_closes_below_trend(df) if df is not None else None
         )
-        draw_txt = "-" if drawdown is None else f"{drawdown:.1f}"
-        below_txt = "-" if below is None else str(below)
+        if p.source == "swing_fallback":
+            # Long-term thresholds do not apply to a swing-fallback position.
+            draw_txt, below_txt = "n/a", "n/a"
+            swing_txt = (
+                f"tp={_fmt_money(p.tp)} sl={_fmt_money(p.sl)} "
+                f"deadline={p.deadline.date().isoformat() if p.deadline else '-'}"
+                + (" (short)" if p.direction == "short" else "")
+            )
+        else:
+            draw_txt = "-" if drawdown is None else f"{drawdown:.1f}"
+            below_txt = "-" if below is None else str(below)
+            swing_txt = "-"
         print(
-            f"  {p.ticker:<10} {p.asset_class:<7} {_fmt_money(p.entry_price):>9} "
-            f"{_fmt_money(current):>9} {draw_txt:>7}   {below_txt:>5}"
+            f"  {p.ticker:<10} {p.asset_class:<7} {p.source:<14} "
+            f"{_fmt_money(p.entry_price):>9} "
+            f"{_fmt_money(current):>9} {draw_txt:>7}   {below_txt:>5}  {swing_txt}"
         )
 
 
