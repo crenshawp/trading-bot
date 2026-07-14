@@ -367,6 +367,49 @@ def test_new_fired_signal_persists_real_atr_and_sizes(
     assert order.qty > 0
 
 
+def test_mixed_old_and_new_signals_only_new_is_plannable(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Section 4's downstream regression: with an old NULL-atr row and a
+    newly fired signal side by side, the plan contains ONLY the new one —
+    the old row keeps today's unsizeable-filtered behavior, untouched."""
+    from trading_bot import regime, scanner, vix
+
+    def _no_regime(*_a: object, **_k: object) -> object:
+        raise regime.RegimeFetchError("offline")
+
+    def _no_vix(*_a: object, **_k: object) -> object:
+        raise vix.VixFetchError("offline")
+
+    monkeypatch.setattr("trading_bot.regime.get_current_regime", _no_regime)
+    monkeypatch.setattr("trading_bot.vix.get_current_vix", _no_vix)
+
+    new_sid = scanner.log_signal({
+        "ticker": "META", "asset_type": "stock",
+        "trade_type": "📆 SWING TRADE", "direction": "CALL 📈",
+        "setup": "EMA21 Pullback", "price": 480.0,
+        "take_profit": 496.0, "stop_loss": 468.0,
+        "hold_days": "1-2 days", "atr": 8.0, "confidence": "High",
+    })
+    assert new_sid is not None
+    new_signal = db.get_signal_by_id(new_sid)
+    assert new_signal is not None
+
+    old_sid = _seed_signal(                      # pre-fix shape: NULL atr
+        ticker="GOOGL", entry=175.0, atr=None, timestamp=new_signal.timestamp,
+    )
+    _seed_trade(old_sid, opened_at=new_signal.timestamp)
+
+    candidates = candidate_source.live_candidates(now=new_signal.timestamp)
+    result = allocation.build_plan(candidates, _ACCOUNT)
+
+    (order,) = result.plan.orders
+    assert order.ticker == "META"                # the new signal is plannable
+    assert [(s.ticker, s.reason) for s in result.skipped] == [
+        ("GOOGL", "unsizeable"),                 # the old row: unchanged
+    ]
+
+
 # ───────────────────────── two-layer crypto-swing guarantee (live data) ──────
 
 

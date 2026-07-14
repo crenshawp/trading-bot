@@ -496,20 +496,14 @@ def test_fired_signal_window_reaches_shares_fallback_deadline(
         "trade_type": "📆 SWING TRADE", "direction": "CALL 📈",
         "setup": "EMA21 Pullback", "price": 480.0,
         "take_profit": 496.0, "stop_loss": 468.0,
-        "hold_days": "3-5 days", "confidence": "High",
+        "hold_days": "3-5 days", "atr": 8.0, "confidence": "High",
     })
     assert sid is not None
-    # Separate PRE-EXISTING gap (out of Phase 21 scope): log_signal doesn't
-    # persist atr either, and Phase 7 sizing needs it. Supply it directly so
-    # this test exercises the hold-window plumbing, not the atr gap.
-    conn = db.get_connection()
-    try:
-        conn.execute("UPDATE signals SET atr = ? WHERE id = ?", (8.0, sid))
-        conn.commit()
-    finally:
-        conn.close()
+    # Phase 22 removed the SQL atr workaround this test once needed: the fire
+    # path now persists atr itself, so the whole chain runs naturally.
     signal = db.get_signal_by_id(sid)
     assert signal is not None
+    assert signal.atr == 8.0
 
     candidates = candidate_source.live_candidates(now=signal.timestamp)
     result = allocation.build_plan(
