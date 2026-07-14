@@ -279,6 +279,39 @@ def test_hold_deadline_survives_allocation_into_planned_order(
     assert order.hold_deadline == _NOW + timedelta(days=2)   # pass-through
 
 
+def test_fired_signal_carries_tightened_window_downstream(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 21 integration: a signal fired through the REAL fire path
+    (scanner.log_signal) now persists its estimate, so the Phase 20
+    hold_deadline reflects the signal's own 5-day intent — tightened from the
+    30-day default every pre-fix signal fell back to."""
+    from trading_bot import regime, scanner, vix
+
+    def _no_regime(*_a: object, **_k: object) -> object:
+        raise regime.RegimeFetchError("offline")
+
+    def _no_vix(*_a: object, **_k: object) -> object:
+        raise vix.VixFetchError("offline")
+
+    monkeypatch.setattr("trading_bot.regime.get_current_regime", _no_regime)
+    monkeypatch.setattr("trading_bot.vix.get_current_vix", _no_vix)
+
+    sid = scanner.log_signal({
+        "ticker": "META", "asset_type": "stock",
+        "trade_type": "📆 SWING TRADE", "direction": "CALL 📈",
+        "setup": "EMA21 Pullback", "price": 480.0,
+        "take_profit": 496.0, "stop_loss": 468.0,
+        "hold_days": "3-5 days", "confidence": "High",
+    })
+    assert sid is not None
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+
+    (c,) = candidate_source.live_candidates(now=signal.timestamp)
+    assert c.hold_deadline == signal.timestamp + timedelta(days=5)   # not +30
+
+
 # ───────────────────────── two-layer crypto-swing guarantee (live data) ──────
 
 
