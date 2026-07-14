@@ -42,10 +42,22 @@ def _seed_fired_signals() -> None:
         entry_price=190.0,
     ))
 
+    # A second OLD-STYLE row INSIDE the window: fired pre-Phase 22, so its atr
+    # is NULL — Phase 7 sizing can't size it and the plan skips it as
+    # "unsizeable" (exactly how every live SWING signal behaved before the fix).
+    old_style = db.insert_signal(Signal(
+        timestamp=_NOW, ticker="GS", asset_class="stock",
+        signal_type="ema21_pullback", direction="call", entry_price=700.0,
+    ))
+    db.insert_trade(Trade(
+        signal_id=old_style, opened_at=_NOW, outcome="open",
+        track_mode="active",
+    ))
+
     swing = db.insert_signal(Signal(
         timestamp=_NOW, ticker="META", asset_class="stock",
         signal_type="ema21_pullback", direction="call", entry_price=480.0,
-        atr=8.0, rsi=55.0,
+        atr=8.0, rsi=55.0,      # what log_signal persists since Phase 22
         hold_estimate_days=2,   # what log_signal persists since Phase 21
     ))
     db.insert_trade(Trade(
@@ -100,8 +112,8 @@ def main() -> None:
         print(f"  {c.ticker:<8} {c.signal_type:<18} {c.asset_class:<7} "
               f"entry={c.entry:<9,.0f} hold_deadline={window}")
 
-    print("\n=== build_plan: the EXISTING data-only filter still drops "
-          "crypto swing ===")
+    print("\n=== build_plan: new signal (real ATR) plans; old NULL-atr row ===")
+    print("=== is skipped unsizeable; data-only crypto swing still drops  ===")
     result = allocation.build_plan(candidates, broker.get_account())
     for o in result.plan.orders:
         print(f"  planned: {o.ticker:<8} {o.pool:<10} qty={o.qty:.4f} "
