@@ -726,6 +726,28 @@ def test_reconcile_sums_multiple_open_rows_per_symbol(tmp_db: Path) -> None:
     assert broker.reconcile(b).divergences == []
 
 
+def test_reconcile_finds_shares_fallback_broker_tracked(tmp_db: Path) -> None:
+    """Phase 19 closes the gap Phase 18 surfaced: a shares-fallback position
+    is now in the internal lifecycle book, so reconciliation sees it as
+    tracked — no longer a broker_only divergence."""
+    from trading_bot import options_execution as oe
+
+    b = FakeBroker(auto_fill=True)           # fill creates the broker position
+    decision = oe.choose_execution(
+        "call", 300.0, "AAPL", 100.0, [],
+        ref_date=datetime(2026, 1, 1, tzinfo=UTC).date(),
+    )
+    assert decision.vehicle == oe.VEHICLE_SHARES
+    order, _pid = oe.execute_decision(
+        b, decision, opened_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    assert order.ok is True
+
+    report = broker.reconcile(b)
+    assert report.internal_symbols == ["AAPL"]   # tracked internally now
+    assert report.divergences == []              # not broker_only anymore
+
+
 def test_reconcile_closed_positions_are_out_of_scope(tmp_db: Path) -> None:
     db.insert_long_term_position(LongTermPosition(
         ticker="AAPL", asset_class="stock", entry_price=100.0,

@@ -456,6 +456,166 @@ def test_watcher_one_error_does_not_block_others(tmp_db: Path) -> None:
     assert by_ticker["BAD"] == "error"
 
 
+# ───────────── swing-fallback rows keep swing exits (Phase 19) ──────────────
+
+
+def _seed_swing_fallback(
+    ticker: str = "META", entry: float = 480.0, qty: float = 20.0, *,
+    tp: float | None = 500.0, sl: float | None = 465.0,
+    deadline: datetime | None = None, direction: str = "long",
+) -> int:
+    return db.insert_long_term_position(LongTermPosition(
+        ticker=ticker, asset_class="stock", entry_price=entry,
+        entry_date=datetime(2026, 1, 1, tzinfo=UTC), qty=qty, status="open",
+        source="swing_fallback", direction=direction, tp=tp, sl=sl,
+        deadline=deadline,
+    ))
+
+
+def test_swing_fallback_closes_on_its_own_take_profit(tmp_db: Path) -> None:
+    """+4.4% would be a HOLD under long-term rules — the swing TP closes it."""
+    _seed_swing_fallback(tp=500.0, sl=465.0)
+    actions = long_term.watch_long_term_positions(
+        FakeBroker(), price_fetch=lambda _t: _flat_df(501.0),
+        now=datetime(2026, 1, 3, tzinfo=UTC),
+    )
+    assert actions[0].action == "close" and actions[0].reason == "take_profit"
+    closed = db.get_long_term_positions()[0]
+    assert closed.status == "closed" and closed.exit_reason == "take_profit"
+
+
+def test_swing_fallback_closes_on_its_own_stop_loss(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """-3.3% is nowhere near the 25% long-term drawdown stop — the swing SL
+    closes it anyway, with a SELL via the equity path."""
+    _seed_swing_fallback(tp=500.0, sl=465.0)
+    b = FakeBroker()
+    calls: list[str] = []
+    original = b.submit_order
+
+    def spy(symbol: str, qty: float, side: str, **kw: object) -> object:
+        calls.append(side)
+        return original(symbol, qty, side, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(b, "submit_order", spy)
+    actions = long_term.watch_long_term_positions(
+        b, price_fetch=lambda _t: _flat_df(464.0),
+        now=datetime(2026, 1, 3, tzinfo=UTC),
+    )
+    assert actions[0].action == "close" and actions[0].reason == "stop_loss"
+    assert calls == ["sell"]
+
+
+def test_swing_fallback_never_evaluates_longterm_rules(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 27% drawdown WOULD trip the long-term drawdown stop — but a
+    swing-fallback position holds because its own SL is lower, and the
+    long-term trigger functions are never even called for it."""
+    _seed_swing_fallback(entry=480.0, tp=1_000.0, sl=100.0)
+    protective_calls: list[object] = []
+    trend_calls: list[object] = []
+    original_protective = long_term.evaluate_protective_exit
+    original_trend = long_term._consecutive_closes_below_trend
+    monkeypatch.setattr(
+        long_term, "evaluate_protective_exit",
+        lambda *a, **k: (protective_calls.append(a), original_protective(*a, **k))[1],
+    )
+    monkeypatch.setattr(
+        long_term, "_consecutive_closes_below_trend",
+        lambda *a, **k: (trend_calls.append(a), original_trend(*a, **k))[1],
+    )
+
+    actions = long_term.watch_long_term_positions(
+        FakeBroker(), price_fetch=lambda _t: _flat_df(350.0),   # -27% from entry
+        now=datetime(2026, 1, 3, tzinfo=UTC),
+    )
+    assert actions[0].action == "hold"           # swing SL (100) not hit
+    assert protective_calls == []                # long-term rules never ran
+    assert trend_calls == []
+    assert len(db.get_open_long_term_positions()) == 1
+
+
+def test_swing_fallback_hold_deadline_closes_like_a_swing(tmp_db: Path) -> None:
+    _seed_swing_fallback(
+        tp=500.0, sl=465.0, deadline=datetime(2026, 1, 4, tzinfo=UTC),
+    )
+    actions = long_term.watch_long_term_positions(
+        FakeBroker(), price_fetch=lambda _t: _flat_df(481.0),   # between TP/SL
+        now=datetime(2026, 1, 5, tzinfo=UTC),                   # past deadline
+    )
+    assert actions[0].action == "close" and actions[0].reason == "hold_deadline"
+    closed = db.get_long_term_positions()[0]
+    assert closed.exit_reason == "hold_deadline"
+
+
+def test_swing_fallback_short_closes_with_buy(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A put-signal fallback SOLD shares; its stop sits ABOVE entry and the
+    close must BUY the shares back."""
+    _seed_swing_fallback(direction="short", tp=460.0, sl=495.0)
+    b = FakeBroker()
+    calls: list[str] = []
+    original = b.submit_order
+
+    def spy(symbol: str, qty: float, side: str, **kw: object) -> object:
+        calls.append(side)
+        return original(symbol, qty, side, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(b, "submit_order", spy)
+    actions = long_term.watch_long_term_positions(
+        b, price_fetch=lambda _t: _flat_df(496.0),   # above the short's stop
+        now=datetime(2026, 1, 3, tzinfo=UTC),
+    )
+    assert actions[0].action == "close" and actions[0].reason == "stop_loss"
+    assert calls == ["buy"]
+
+
+def test_swing_fallback_without_levels_holds(tmp_db: Path) -> None:
+    """Today's execute path passes deadline=None (no hold window on a
+    PlannedOrder yet); with no TP/SL either, the watcher holds — it never
+    falls back to the long-term rules."""
+    _seed_swing_fallback(tp=None, sl=None, deadline=None)
+    actions = long_term.watch_long_term_positions(
+        FakeBroker(), price_fetch=lambda _t: _flat_df(350.0),   # -27%
+        now=datetime(2026, 1, 3, tzinfo=UTC),
+    )
+    assert actions[0].action == "hold"
+
+
+def test_mixed_book_neither_path_affects_the_other(tmp_db: Path) -> None:
+    """Regression for genuine long-term behavior: in a mixed book, the
+    long_term row still closes on its drawdown stop while the swing-fallback
+    row (down just as far but above its own SL) holds."""
+    _seed_position("HOLD5", 100.0)                      # genuine long-term
+    _seed_swing_fallback(ticker="SWNG", entry=100.0, tp=200.0, sl=10.0)
+
+    actions = long_term.watch_long_term_positions(
+        FakeBroker(), price_fetch=lambda _t: _flat_df(70.0),   # -30% for both
+        now=datetime(2026, 1, 5, tzinfo=UTC),
+    )
+    by_ticker = {a.position.ticker: (a.action, a.reason) for a in actions}
+    assert by_ticker["HOLD5"] == ("close", "drawdown_stop")   # unchanged rules
+    assert by_ticker["SWNG"] == ("hold", "holding")           # its own SL wins
+
+
+def test_cli_longterm_positions_shows_source(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import __main__ as m
+    _seed_position("AAPL", 100.0)
+    _seed_swing_fallback(ticker="META", tp=500.0, sl=465.0)
+    monkeypatch.setattr(m.long_term, "fetch_daily_candles", lambda _t: _flat_df(99.0))
+    m.cmd_longterm_positions()
+    out = capsys.readouterr().out
+    assert "long_term" in out
+    assert "swing_fallback" in out
+    assert "tp=" in out and "sl=" in out    # the levels the watcher applies
+
+
 # ───────────────────────── position persistence round-trip ──────────────────
 
 

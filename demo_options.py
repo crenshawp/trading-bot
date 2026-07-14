@@ -4,9 +4,11 @@ Run with: ``python demo_options.py``
 
 No network whatsoever: hand-built contract fixtures + a :class:`FakeBroker` + a
 throwaway SQLite database. It shows the full->undersized->shares execution
-hierarchy, submitting + recording an option position, and the manual exit
-watcher closing a position when the underlying hits take-profit. The real path
-uses ``AlpacaOptionsClient`` for the chain and ``AlpacaBroker`` for orders
+hierarchy, submitting + recording an option position, the manual exit watcher
+closing a position when the underlying hits take-profit, and (Phase 19) a
+SHARES-FALLBACK position tracked in the long-term lifecycle book yet exiting
+on its OWN swing TP/SL — never the buy-and-hold trend/drawdown rules. The real
+path uses ``AlpacaOptionsClient`` for the chain and ``AlpacaBroker`` for orders
 against the PAPER endpoint — only the data sources change here.
 """
 
@@ -20,7 +22,9 @@ from trading_bot import config
 
 config.DB_PATH = Path(tempfile.mkdtemp()) / "demo_options.db"
 
-from trading_bot import db  # noqa: E402
+import pandas as pd  # noqa: E402
+
+from trading_bot import db, long_term  # noqa: E402
 from trading_bot import options_execution as oe  # noqa: E402
 from trading_bot.broker.fake import FakeBroker  # noqa: E402
 from trading_bot.broker.options import OptionContract  # noqa: E402
@@ -84,6 +88,33 @@ def main() -> None:
             f"pnl=${(a.pnl_dollars or 0.0):,.0f}"
         )
     print(f"  open positions remaining: {len(db.get_open_option_positions())}")
+
+    print("\n=== Phase 19: shares fallback is TRACKED, exits on SWING rules ===")
+    # $300 cannot buy a $500 contract -> fractional-share fallback fires...
+    dec = oe.choose_execution("call", 300.0, "AAPL", 100.0, chain, ref_date=_REF)
+    _order, pid = oe.execute_decision(
+        broker, dec, opened_at=datetime(2026, 1, 1, tzinfo=UTC),
+        tp=110.0, sl=95.0, deadline=datetime(2026, 1, 3, tzinfo=UTC),
+    )
+    (pos,) = [p for p in db.get_open_long_term_positions() if p.id == pid]
+    print(
+        f"  tracked: {pos.ticker} qty={pos.qty:g} source={pos.source} "
+        f"tp={pos.tp} sl={pos.sl} deadline={pos.deadline:%Y-%m-%d}"
+    )
+    # ...and the lifecycle watcher applies ITS swing TP (a +10% move that the
+    # long-term trend/drawdown rules would simply have held through).
+    flat = pd.DataFrame({
+        "Open": [111.0] * 5, "High": [111.0] * 5, "Low": [111.0] * 5,
+        "Close": [111.0] * 5, "Volume": [1_000_000] * 5,
+    })
+    for action in long_term.watch_long_term_positions(
+        broker, price_fetch=lambda _t: flat,
+        now=datetime(2026, 1, 2, tzinfo=UTC),
+    ):
+        print(
+            f"  watcher: {action.position.ticker} action={action.action} "
+            f"reason={action.reason}"
+        )
 
 
 if __name__ == "__main__":

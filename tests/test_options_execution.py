@@ -250,6 +250,48 @@ def test_execute_decision_shares_records_swing_fallback_not_option(
     assert pos.source == "swing_fallback"
 
 
+def test_shares_fallback_persists_original_swing_exit_data(tmp_db: Path) -> None:
+    deadline = datetime(2026, 1, 3, tzinfo=UTC)
+    dec = oe.choose_execution("call", 300.0, "AAPL", 100.0, [], ref_date=_REF)
+    order, pid = oe.execute_decision(
+        FakeBroker(), dec, opened_at=_OPENED, tp=110.0, sl=95.0,
+        deadline=deadline,
+    )
+    assert order.ok is True and pid is not None
+    (pos,) = db.get_open_long_term_positions()
+    assert pos.ticker == "AAPL"
+    assert pos.direction == "long"
+    assert pos.qty == 3.0                    # $300 / $100
+    assert pos.entry_price == 100.0          # est_cost / qty
+    assert (pos.tp, pos.sl) == (110.0, 95.0)  # ORIGINAL swing levels, persisted
+    assert pos.deadline == deadline
+
+
+def test_short_shares_fallback_records_short_direction(tmp_db: Path) -> None:
+    dec = oe.choose_execution("short", 300.0, "AAPL", 100.0, [], ref_date=_REF)
+    assert dec.side == "sell"
+    order, _pid = oe.execute_decision(
+        FakeBroker(), dec, opened_at=_OPENED, tp=90.0, sl=105.0,
+    )
+    assert order.ok is True
+    (pos,) = db.get_open_long_term_positions()
+    assert pos.direction == "short"          # its close must BUY
+
+
+def test_rejected_shares_fallback_records_nothing(tmp_db: Path) -> None:
+    dec = oe.choose_execution("call", 300.0, "AAPL", 100.0, [], ref_date=_REF)
+    order, pid = oe.execute_decision(
+        FakeBroker(reject_reason="market closed"), dec, opened_at=_OPENED,
+    )
+    assert order.ok is False and pid is None
+    assert db.get_open_long_term_positions() == []
+
+
+def test_record_shares_position_ignores_non_shares_decisions(tmp_db: Path) -> None:
+    assert oe.record_shares_position(_decision_full(), opened_at=_OPENED) is None
+    assert db.get_open_long_term_positions() == []
+
+
 def test_update_option_position_close_round_trip(tmp_db: Path) -> None:
     pid = db.insert_option_position(OptionPosition(
         symbol="X260116C00150000", underlying="X", option_type="call",
