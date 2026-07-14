@@ -140,10 +140,25 @@ class LongTermCandidate:
     entry_rationale: str = ""
 
 
+# Phase 19: where a long_term_positions row came from. 'long_term' is the
+# genuine Phase 14 buy-and-hold entry; 'swing_fallback' is a Phase 13 options
+# hierarchy third-rung shares position — it carries SWING intent and keeps its
+# ORIGINAL tp/sl/deadline exit rules, never the trend/drawdown rules.
+VALID_POSITION_SOURCES: frozenset[str] = frozenset({"long_term", "swing_fallback"})
+VALID_POSITION_DIRECTIONS: frozenset[str] = frozenset({"long", "short"})
+
+
 @dataclass(frozen=True)
 class LongTermPosition:
-    """An open/closed buy-and-hold position (Phase 14; no tight stop — protective
-    exit only)."""
+    """An open/closed position in the long-term lifecycle book.
+
+    Phase 14 rows (``source='long_term'``) are buy-and-hold: no tight stop,
+    protective trend-breakdown / drawdown exits only. Phase 19 rows
+    (``source='swing_fallback'``) are Phase 13 shares-fallback SWING positions
+    tracked in this table for lifecycle/reconciliation — they carry their
+    ORIGINAL swing ``tp``/``sl``/``deadline`` and the watcher applies THOSE,
+    never the long-term rules. ``direction`` is 'short' when a put-signal
+    fallback sold shares (its close must BUY)."""
 
     ticker: str
     asset_class: str
@@ -153,7 +168,14 @@ class LongTermPosition:
     status: str = "open"           # 'open' | 'closed'
     exit_price: float | None = None
     exit_date: datetime | None = None
-    exit_reason: str | None = None  # trend_breakdown | drawdown_stop
+    # long_term: trend_breakdown | drawdown_stop | emergency_shutdown
+    # swing_fallback: take_profit | stop_loss | hold_deadline | emergency_shutdown
+    exit_reason: str | None = None
+    source: str = "long_term"      # 'long_term' | 'swing_fallback' (Phase 19)
+    direction: str = "long"        # 'long' | 'short' (Phase 19)
+    tp: float | None = None        # swing_fallback only: original swing levels
+    sl: float | None = None
+    deadline: datetime | None = None
     id: int | None = None
 
 

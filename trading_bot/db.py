@@ -21,6 +21,8 @@ from trading_bot.models import (
     VALID_OUTCOMES,
     VALID_PAIR_STATUSES,
     VALID_PLAN_EXECUTION_STATUSES,
+    VALID_POSITION_DIRECTIONS,
+    VALID_POSITION_SOURCES,
     VALID_PREDICTION_DIRECTIONS,
     VALID_PREDICTION_OUTCOMES,
     VALID_TRACK_MODES,
@@ -45,6 +47,8 @@ from trading_bot.models import (
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
+# Version 22 (Phase 19) — adds long_term_positions.source/direction/tp/sl/
+#                          deadline (shares-fallback lifecycle tracking).
 # Version 21 (Phase 17) — adds signals.considered_at (live-candidate sourcing).
 # Version 20 (Phase 16) — adds the plan_executions table (execution audit trail).
 # Version 19 (Phase 15) — adds the equity_snapshots table (drawdown tracking).
@@ -56,7 +60,7 @@ from trading_bot.models import (
 # Version 13 (Phase 6) — adds trades.ind_* advisory indicator-family columns.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -711,6 +715,33 @@ def _migrate_to_v21(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE signals ADD COLUMN considered_at TEXT")
 
 
+def _migrate_to_v22(conn: sqlite3.Connection) -> None:
+    """Phase 19 migration step: shares-fallback tracking on long_term_positions.
+
+    ``source`` distinguishes a genuine buy-and-hold entry ('long_term', the
+    default — existing rows backfill to it) from a Phase 13 shares-fallback
+    position ('swing_fallback'), which carries SWING intent and must keep its
+    ORIGINAL exit rules. ``tp``/``sl``/``deadline`` persist those original
+    swing exit levels (NULL on genuine long-term rows); ``direction`` records
+    the position side ('long' default; a put-signal fallback shorts, so its
+    close must BUY). SQLite has no ALTER ADD CHECK — the valid sets are
+    enforced by ``insert_long_term_position``.
+    """
+    cur = conn.execute("PRAGMA table_info(long_term_positions)")
+    cols = {str(row[1]) for row in cur.fetchall()}
+    for column, coltype in (
+        ("source", "TEXT NOT NULL DEFAULT 'long_term'"),
+        ("direction", "TEXT NOT NULL DEFAULT 'long'"),
+        ("tp", "REAL"),
+        ("sl", "REAL"),
+        ("deadline", "TEXT"),
+    ):
+        if column not in cols:
+            conn.execute(
+                f"ALTER TABLE long_term_positions ADD COLUMN {column} {coltype}"
+            )
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -736,6 +767,7 @@ def init_db() -> None:
         _migrate_to_v19(conn)
         _migrate_to_v20(conn)
         _migrate_to_v21(conn)
+        _migrate_to_v22(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -2738,14 +2770,25 @@ def update_option_position(position_id: int, **fields: Any) -> None:
 
 
 def insert_long_term_position(pos: LongTermPosition) -> int:
-    """Insert a buy-and-hold position and return its id."""
+    """Insert a position into the long-term lifecycle book and return its id."""
     if pos.status not in ("open", "closed"):
         raise ValueError(f"Invalid status '{pos.status}'")
+    if pos.source not in VALID_POSITION_SOURCES:
+        raise ValueError(
+            f"Invalid source '{pos.source}' "
+            f"(expected one of {sorted(VALID_POSITION_SOURCES)})"
+        )
+    if pos.direction not in VALID_POSITION_DIRECTIONS:
+        raise ValueError(
+            f"Invalid direction '{pos.direction}' "
+            f"(expected one of {sorted(VALID_POSITION_DIRECTIONS)})"
+        )
     sql = """
         INSERT INTO long_term_positions (
             ticker, asset_class, entry_price, entry_date, qty, status,
-            exit_price, exit_date, exit_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            exit_price, exit_date, exit_reason, source, direction, tp, sl,
+            deadline
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = (
         pos.ticker,
@@ -2757,6 +2800,11 @@ def insert_long_term_position(pos: LongTermPosition) -> int:
         pos.exit_price,
         pos.exit_date.isoformat() if pos.exit_date is not None else None,
         pos.exit_reason,
+        pos.source,
+        pos.direction,
+        pos.tp,
+        pos.sl,
+        pos.deadline.isoformat() if pos.deadline is not None else None,
     )
     conn = get_connection()
     try:
@@ -2783,6 +2831,13 @@ def _row_to_long_term_position(row: sqlite3.Row) -> LongTermPosition:
             datetime.fromisoformat(row["exit_date"]) if row["exit_date"] else None
         ),
         exit_reason=row["exit_reason"],
+        source=str(row["source"]),
+        direction=str(row["direction"]),
+        tp=row["tp"],
+        sl=row["sl"],
+        deadline=(
+            datetime.fromisoformat(row["deadline"]) if row["deadline"] else None
+        ),
         id=int(row["id"]),
     )
 

@@ -29,7 +29,7 @@ from trading_bot.broker.options import (
     OPTION_TYPE_PUT,
     OptionContract,
 )
-from trading_bot.models import OptionPosition
+from trading_bot.models import LongTermPosition, OptionPosition
 
 VEHICLE_OPTION_FULL = "option_full"
 VEHICLE_OPTION_UNDERSIZED = "option_undersized"
@@ -316,6 +316,43 @@ def record_option_position(
     return db.insert_option_position(pos)
 
 
+def record_shares_position(
+    decision: ExecutionDecision,
+    *,
+    opened_at: datetime,
+    tp: float | None = None,
+    sl: float | None = None,
+    deadline: datetime | None = None,
+) -> int | None:
+    """Persist a SHARES-FALLBACK position into the long-term lifecycle book
+    (Phase 19). Returns the row id, or None for a non-shares decision.
+
+    The third rung of the execution hierarchy submits a real order but had no
+    lifecycle tracking (Phase 18's reconciliation fix surfaced it as an
+    untracked ``broker_only`` position). It is tagged into
+    ``long_term_positions`` with ``source='swing_fallback'`` and its ORIGINAL
+    swing ``tp``/``sl``/``deadline`` — the position carries SWING intent, and
+    the Phase 14 watcher applies THESE levels to it, never the long-term
+    trend/drawdown rules. ``direction='short'`` records a put-signal fallback
+    (a SELL entry, whose close must BUY).
+    """
+    if decision.vehicle != VEHICLE_SHARES or decision.qty <= 0.0:
+        return None
+    return db.insert_long_term_position(LongTermPosition(
+        ticker=decision.symbol,
+        asset_class="crypto" if decision.symbol.endswith("-USD") else "stock",
+        entry_price=decision.est_cost / decision.qty,
+        entry_date=opened_at,
+        qty=decision.qty,
+        status="open",
+        source="swing_fallback",
+        direction="short" if decision.side == "sell" else "long",
+        tp=tp,
+        sl=sl,
+        deadline=deadline,
+    ))
+
+
 def execute_decision(
     broker: Broker,
     decision: ExecutionDecision,
@@ -327,15 +364,22 @@ def execute_decision(
     deadline: datetime | None = None,
     time_in_force: str = TIF_DAY,
 ) -> tuple[OrderResult, int | None]:
-    """Submit the decision and, for a successful OPTION order, persist the
-    position. Returns ``(order_result, option_position_id | None)``. A share
-    fallback submits via the same path but records no option position."""
+    """Submit the decision and, on a broker-accepted order, persist the
+    position: an OPTION records into ``option_positions``; a SHARES FALLBACK
+    records into the long-term lifecycle book with its original swing exit
+    data (Phase 19 — previously untracked). Returns ``(order_result,
+    position_row_id | None)`` — the id belongs to whichever table matches the
+    vehicle. A rejected/errored order records nothing anywhere."""
     order = submit_execution_order(broker, decision, time_in_force=time_in_force)
     position_id: int | None = None
     if order.ok and decision.contract is not None:
         position_id = record_option_position(
             decision, order, opened_at=opened_at, signal_id=signal_id,
             tp=tp, sl=sl, deadline=deadline,
+        )
+    elif order.ok and decision.vehicle == VEHICLE_SHARES:
+        position_id = record_shares_position(
+            decision, opened_at=opened_at, tp=tp, sl=sl, deadline=deadline,
         )
     return order, position_id
 

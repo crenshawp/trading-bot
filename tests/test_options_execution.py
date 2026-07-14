@@ -232,15 +232,22 @@ def test_execute_decision_records_option_position(tmp_db: Path) -> None:
     assert p.tp == 110.0 and p.sl == 95.0 and p.outcome == "open"
 
 
-def test_execute_decision_shares_records_no_option_position(tmp_db: Path) -> None:
-    # $300 capital / $500 per contract -> shares fallback -> no option row.
+def test_execute_decision_shares_records_swing_fallback_not_option(
+    tmp_db: Path,
+) -> None:
+    # $300 capital / $500 per contract -> shares fallback -> no option row;
+    # Phase 19: the position is tracked in the long-term lifecycle book with
+    # source='swing_fallback' instead of vanishing.
     dec = oe.choose_execution(
         "call", 300.0, "AAPL", 100.0, [_contract(0.70)], ref_date=_REF,
     )
     assert dec.vehicle == oe.VEHICLE_SHARES
     order, pid = oe.execute_decision(FakeBroker(), dec, opened_at=_OPENED)
-    assert order.ok is True and pid is None
+    assert order.ok is True and pid is not None
     assert db.get_open_option_positions() == []
+    (pos,) = db.get_open_long_term_positions()
+    assert pos.id == pid
+    assert pos.source == "swing_fallback"
 
 
 def test_update_option_position_close_round_trip(tmp_db: Path) -> None:
