@@ -776,6 +776,9 @@ def log_signal(
         # unsizeable). Forward-only: absent keys stay NULL, old rows untouched.
         atr=_opt_float(signal, "atr"),
         rsi=_opt_float(signal, "rsi"),
+        ema21=_opt_float(signal, "ema21"),
+        bb_upper=_opt_float(signal, "bb_upper"),
+        bb_lower=_opt_float(signal, "bb_lower"),
     )
     signal_id = db.insert_signal(rec)
 
@@ -1371,6 +1374,7 @@ def detect_stock_signals(ticker, df):
             "hold_days":  hold_days,
             "atr":        atr,
             "rsi":        rsi,
+            "ema21":      ema21,
         })
         return signals
 
@@ -1391,6 +1395,7 @@ def detect_stock_signals(ticker, df):
             "hold_days":  hold_days,
             "atr":        atr,
             "rsi":        rsi,
+            "ema21":      ema21,
         })
         return signals
 
@@ -1415,6 +1420,7 @@ def detect_stock_signals(ticker, df):
             "hold_days":  hold_days,
             "atr":        atr,
             "rsi":        rsi,
+            "ema21":      ema21,
         })
 
     # ── PUT — EMA21 Pullback in downtrend ────────────────────────────────────
@@ -1438,6 +1444,7 @@ def detect_stock_signals(ticker, df):
             "hold_days":  hold_days,
             "atr":        atr,
             "rsi":        rsi,
+            "ema21":      ema21,
         })
 
     # ── Trend Acceleration ────────────────────────────────────────────────────
@@ -1460,6 +1467,7 @@ def detect_stock_signals(ticker, df):
             "hold_days":  hold_days,
             "atr":        atr,
             "rsi":        rsi,
+            "ema21":      ema21,
         })
 
     # ── Higher High Breakout ──────────────────────────────────────────────────
@@ -1481,6 +1489,7 @@ def detect_stock_signals(ticker, df):
             "hold_days":  hold_days,
             "atr":        atr,
             "rsi":        rsi,
+            "ema21":      ema21,
         })
 
     # ── Trend Continuation ─────────────────────────────────────────────────────
@@ -1512,6 +1521,7 @@ def detect_stock_signals(ticker, df):
             "hold_days":  hold_days,
             "atr":        atr,
             "rsi":        rsi,
+            "ema21":      ema21,
         })
 
     return signals
@@ -1567,6 +1577,8 @@ def detect_crypto_signals(ticker, df):
             "hold_days":  "2-8 hours",
             "atr":        atr,
             "rsi":        rsi,
+            "bb_upper":   bb_upper,
+            "bb_lower":   bb_lower,
         })
 
     # ── Momentum Breakout — LONG ──────────────────────────────────────────────
@@ -1589,6 +1601,8 @@ def detect_crypto_signals(ticker, df):
             "hold_days":  "2-8 hours",
             "atr":        atr,
             "rsi":        rsi,
+            "bb_upper":   bb_upper,
+            "bb_lower":   bb_lower,
         })
 
     # ── Overbought Reversal — SHORT ───────────────────────────────────────────
@@ -1611,6 +1625,8 @@ def detect_crypto_signals(ticker, df):
             "hold_days":  "2-8 hours",
             "atr":        atr,
             "rsi":        rsi,
+            "bb_upper":   bb_upper,
+            "bb_lower":   bb_lower,
         })
 
     return signals

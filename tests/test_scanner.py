@@ -140,6 +140,56 @@ def test_log_signal_persists_rsi_and_absent_stays_null(tmp_db: Path) -> None:
     assert old_style.rsi is None
 
 
+def test_log_signal_persists_ema21_and_absent_stays_null(tmp_db: Path) -> None:
+    """Phase 22 forward-only: ema21 (stock-computed, no consumer — record
+    completeness) reaches its column when supplied; absent persists NULL."""
+    with_ema = scanner.log_signal({
+        "ticker": "GOOGL", "asset_type": "stock",
+        "trade_type": "📆 SWING TRADE", "direction": "CALL 📈",
+        "setup": "EMA21 Pullback", "price": 180.0,
+        "take_profit": 185.0, "stop_loss": 178.0,
+        "ema21": 179.3, "confidence": "High",
+    })
+    without_ema = scanner.log_signal({
+        "ticker": "META", "asset_type": "stock",
+        "trade_type": "📆 SWING TRADE", "direction": "CALL 📈",
+        "setup": "EMA21 Pullback", "price": 480.0,
+        "take_profit": 496.0, "stop_loss": 468.0, "confidence": "High",
+    })
+    assert with_ema is not None and without_ema is not None
+    persisted = db.get_signal_by_id(with_ema)
+    old_style = db.get_signal_by_id(without_ema)
+    assert persisted is not None and old_style is not None
+    assert persisted.ema21 == 179.3
+    assert old_style.ema21 is None
+
+
+def test_log_signal_persists_bollinger_bands_and_absent_stays_null(
+    tmp_db: Path,
+) -> None:
+    """Phase 22 forward-only: the crypto detector's BB values reach their
+    columns when supplied; absent persists NULL."""
+    with_bb = scanner.log_signal({
+        "ticker": "BTC-USD", "asset_type": "crypto",
+        "trade_type": "⚡ CRYPTO TRADE", "direction": "LONG 📈",
+        "setup": "Oversold Reversal", "price": 50_000.0,
+        "take_profit": 51_000.0, "stop_loss": 49_500.0,
+        "bb_upper": 51_200.0, "bb_lower": 49_100.0, "confidence": "High",
+    })
+    without_bb = scanner.log_signal({
+        "ticker": "ETH-USD", "asset_type": "crypto",
+        "trade_type": "⚡ CRYPTO TRADE", "direction": "LONG 📈",
+        "setup": "Oversold Reversal", "price": 3_400.0,
+        "take_profit": 3_500.0, "stop_loss": 3_350.0, "confidence": "High",
+    })
+    assert with_bb is not None and without_bb is not None
+    persisted = db.get_signal_by_id(with_bb)
+    old_style = db.get_signal_by_id(without_bb)
+    assert persisted is not None and old_style is not None
+    assert (persisted.bb_upper, persisted.bb_lower) == (51_200.0, 49_100.0)
+    assert old_style.bb_upper is None and old_style.bb_lower is None
+
+
 def test_log_signal_crypto_hold_estimate_stays_null(tmp_db: Path) -> None:
     sid = scanner.log_signal({
         "ticker": "BTC-USD", "asset_type": "crypto",
