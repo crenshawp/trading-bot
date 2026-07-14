@@ -170,6 +170,19 @@ def _hold_window_days(signal: dict) -> int:
     return config.EARNINGS_BLACKOUT_DEFAULT_DAYS
 
 
+def _opt_float(signal: dict, key: str) -> float | None:
+    """Optional float from the legacy signal dict — None when absent or
+    malformed (Phase 22). Fail-soft: a bad value must never block signal
+    capture; NULL keeps whatever default/fallback the consumer has today."""
+    value = signal.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _hold_estimate_from(signal: dict) -> int | None:
     """The DAYS-denominated hold estimate to PERSIST on the signal row
     (Phase 21): ``"3-5 days"`` -> 5, the window's outer bound (matching
@@ -757,6 +770,11 @@ def log_signal(
         # 30-day default instead of its own 1-5 day intent). Forward-only:
         # existing rows are never touched and NULL still means the default.
         hold_estimate_days=_hold_estimate_from(signal),
+        # Phase 22 (signal field audit): persist the fire-time indicator values
+        # the detectors ALREADY compute — they were silently dropped, leaving
+        # every row NULL (the ATR gap alone made live SWING candidates
+        # unsizeable). Forward-only: absent keys stay NULL, old rows untouched.
+        atr=_opt_float(signal, "atr"),
     )
     signal_id = db.insert_signal(rec)
 
@@ -1350,6 +1368,7 @@ def detect_stock_signals(ticker, df):
             "take_profit": 0.0,
             "stop_loss":   0.0,
             "hold_days":  hold_days,
+            "atr":        atr,
         })
         return signals
 
@@ -1368,6 +1387,7 @@ def detect_stock_signals(ticker, df):
             "take_profit": 0.0,
             "stop_loss":   0.0,
             "hold_days":  hold_days,
+            "atr":        atr,
         })
         return signals
 
@@ -1390,6 +1410,7 @@ def detect_stock_signals(ticker, df):
             "take_profit": tp_call,
             "stop_loss":   sl_call,
             "hold_days":  hold_days,
+            "atr":        atr,
         })
 
     # ── PUT — EMA21 Pullback in downtrend ────────────────────────────────────
@@ -1411,6 +1432,7 @@ def detect_stock_signals(ticker, df):
             "take_profit": tp_put,
             "stop_loss":   sl_put,
             "hold_days":  hold_days,
+            "atr":        atr,
         })
 
     # ── Trend Acceleration ────────────────────────────────────────────────────
@@ -1431,6 +1453,7 @@ def detect_stock_signals(ticker, df):
             "take_profit": tp_call,
             "stop_loss":   sl_call,
             "hold_days":  hold_days,
+            "atr":        atr,
         })
 
     # ── Higher High Breakout ──────────────────────────────────────────────────
@@ -1450,6 +1473,7 @@ def detect_stock_signals(ticker, df):
             "take_profit": tp_call,
             "stop_loss":   sl_call,
             "hold_days":  hold_days,
+            "atr":        atr,
         })
 
     # ── Trend Continuation ─────────────────────────────────────────────────────
@@ -1479,6 +1503,7 @@ def detect_stock_signals(ticker, df):
             "take_profit": tp_call,
             "stop_loss":   sl_call,
             "hold_days":  hold_days,
+            "atr":        atr,
         })
 
     return signals
@@ -1532,6 +1557,7 @@ def detect_crypto_signals(ticker, df):
             "take_profit": tp_long,
             "stop_loss":   sl_long,
             "hold_days":  "2-8 hours",
+            "atr":        atr,
         })
 
     # ── Momentum Breakout — LONG ──────────────────────────────────────────────
@@ -1552,6 +1578,7 @@ def detect_crypto_signals(ticker, df):
             "take_profit": tp_long,
             "stop_loss":   sl_long,
             "hold_days":  "2-8 hours",
+            "atr":        atr,
         })
 
     # ── Overbought Reversal — SHORT ───────────────────────────────────────────
@@ -1572,6 +1599,7 @@ def detect_crypto_signals(ticker, df):
             "take_profit": tp_short,
             "stop_loss":   sl_short,
             "hold_days":  "2-8 hours",
+            "atr":        atr,
         })
 
     return signals

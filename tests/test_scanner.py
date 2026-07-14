@@ -85,6 +85,37 @@ def test_log_signal_persists_stock_hold_estimate(tmp_db: Path) -> None:
     assert signal.hold_estimate_days == 5
 
 
+def test_log_signal_persists_atr(tmp_db: Path) -> None:
+    """Phase 22: the ATR the signal's own TP/SL derive from now reaches its
+    column instead of being dropped."""
+    sid = scanner.log_signal({
+        "ticker": "GOOGL", "asset_type": "stock",
+        "trade_type": "📆 SWING TRADE", "direction": "CALL 📈",
+        "setup": "EMA21 Pullback", "price": 180.0,
+        "take_profit": 185.0, "stop_loss": 178.0,
+        "hold_days": "3-5 days", "atr": 3.2, "confidence": "High",
+    })
+    assert sid is not None
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+    assert signal.atr == 3.2
+
+
+def test_log_signal_atr_absent_stays_null(tmp_db: Path) -> None:
+    """Forward-only: a dict without atr (any old-style caller) persists NULL —
+    exactly today's behavior, no invented value."""
+    sid = scanner.log_signal({
+        "ticker": "GOOGL", "asset_type": "stock",
+        "trade_type": "📆 SWING TRADE", "direction": "CALL 📈",
+        "setup": "EMA21 Pullback", "price": 180.0,
+        "take_profit": 185.0, "stop_loss": 178.0, "confidence": "High",
+    })
+    assert sid is not None
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+    assert signal.atr is None
+
+
 def test_log_signal_crypto_hold_estimate_stays_null(tmp_db: Path) -> None:
     sid = scanner.log_signal({
         "ticker": "BTC-USD", "asset_type": "crypto",

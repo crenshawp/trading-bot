@@ -312,6 +312,61 @@ def test_fired_signal_carries_tightened_window_downstream(
     assert c.hold_deadline == signal.timestamp + timedelta(days=5)   # not +30
 
 
+# ───────────────────────── ATR forward-only proof (Phase 22) ─────────────────
+
+
+def test_old_null_atr_row_is_still_filtered_unsizeable(tmp_db: Path) -> None:
+    """THE Phase 22 forward-only proof for atr: a pre-fix signal row (NULL
+    atr — the shape of every existing row) still produces an unsizeable
+    candidate that build_plan filters out, exactly as today. No backfill,
+    no behavior change for existing data."""
+    sid = _seed_signal(atr=None)
+    _seed_trade(sid)
+    (candidate,) = _live()
+    assert candidate.atr is None
+    result = allocation.build_plan([candidate], _ACCOUNT)
+    assert result.plan.orders == []
+    (skip,) = result.skipped
+    assert skip.reason == "unsizeable"          # identical to pre-fix behavior
+
+
+def test_new_fired_signal_persists_real_atr_and_sizes(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A signal fired through the REAL path now carries its ATR into a
+    sizeable candidate — the gap that kept every live SWING signal out of
+    execution is closed."""
+    from trading_bot import regime, scanner, vix
+
+    def _no_regime(*_a: object, **_k: object) -> object:
+        raise regime.RegimeFetchError("offline")
+
+    def _no_vix(*_a: object, **_k: object) -> object:
+        raise vix.VixFetchError("offline")
+
+    monkeypatch.setattr("trading_bot.regime.get_current_regime", _no_regime)
+    monkeypatch.setattr("trading_bot.vix.get_current_vix", _no_vix)
+
+    sid = scanner.log_signal({
+        "ticker": "META", "asset_type": "stock",
+        "trade_type": "📆 SWING TRADE", "direction": "CALL 📈",
+        "setup": "EMA21 Pullback", "price": 480.0,
+        "take_profit": 496.0, "stop_loss": 468.0,
+        "hold_days": "1-2 days", "atr": 8.0, "confidence": "High",
+    })
+    assert sid is not None
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+    assert signal.atr == 8.0                    # persisted at fire
+
+    (candidate,) = candidate_source.live_candidates(now=signal.timestamp)
+    assert candidate.atr == 8.0
+    result = allocation.build_plan([candidate], _ACCOUNT)
+    (order,) = result.plan.orders               # sizeable and PLANNED
+    assert order.ticker == "META"
+    assert order.qty > 0
+
+
 # ───────────────────────── two-layer crypto-swing guarantee (live data) ──────
 
 
