@@ -217,8 +217,13 @@ MAX_SPREAD_PCT: float = 10.0        # max bid-ask spread as % of mid price
 LONGTERM_STOCK_SIGNAL = "long_term_stock"
 LONGTERM_CRYPTO_SIGNAL = "long_term_crypto"
 # The crypto SWING signals are data-only FOREVER — never routed to execution.
+# Phase 23 audit: overbought_reversal (the detector's third crypto swing setup,
+# a SHORT) was missing from this set — leaving it out both counted its losses
+# toward the Tier 1 breaker AND let route_pool's crypto fallback send it to the
+# CRYPTO execution pool (where the long-term entry path would BUY on a short
+# signal). Membership here seals both: build_plan drops it, Tier 1 ignores it.
 DATA_ONLY_SIGNAL_TYPES: frozenset[str] = frozenset(
-    {"oversold_reversal", "momentum_breakout"}
+    {"oversold_reversal", "momentum_breakout", "overbought_reversal"}
 )
 LONGTERM_STOCK_UNIVERSE: tuple[str, ...] = (
     "BLK", "GOOGL", "META", "GS", "NOW", "AMZN", "LLY", "TSLA",

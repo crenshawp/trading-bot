@@ -2945,22 +2945,33 @@ def get_latest_equity() -> float | None:
 
 
 def get_recent_resolved_outcomes(limit: int = 50) -> list[str]:
-    """The most recent RESOLVED outcomes ('win'/'loss'), newest first.
+    """The most recent REAL-EXECUTION resolved outcomes, newest first.
 
     The same canonical resolved definition every gating subsystem uses
     (``outcome IN ('win','loss')`` — expired/open excluded), ordered by
     ``closed_at`` so the Phase 15 consecutive-loss streak reads the true
-    trailing run. Active track only — shadow losses are not real losses.
+    trailing run. Scope (Phase 23, mirroring Phase 18's reconciliation fix):
+    active track only — shadow losses are not real losses — AND the data-only
+    crypto swing signal types are excluded entirely. Those fire with
+    ``track_mode='active'`` but can NEVER route to execution (the Phase 14
+    permanent boundary), so their hourly paper losses must not pause real
+    swing/long-term entry via the Tier 1 breaker.
     """
+    # The interpolation is literal '?' placeholders only; values bind below.
+    data_only = sorted(config.DATA_ONLY_SIGNAL_TYPES)
+    placeholders = ", ".join("?" for _ in data_only)
+    sql = (
+        "SELECT trades.outcome FROM trades "
+        "JOIN signals ON signals.id = trades.signal_id "
+        "WHERE trades.outcome IN ('win','loss') "
+        "  AND trades.track_mode = 'active' "
+        "  AND trades.closed_at IS NOT NULL "
+        f"  AND signals.signal_type NOT IN ({placeholders}) "  # noqa: S608
+        "ORDER BY trades.closed_at DESC, trades.id DESC LIMIT ?"
+    )
     conn = get_connection()
     try:
-        rows = conn.execute(
-            "SELECT outcome FROM trades "
-            "WHERE outcome IN ('win','loss') AND track_mode = 'active' "
-            "  AND closed_at IS NOT NULL "
-            "ORDER BY closed_at DESC, id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        rows = conn.execute(sql, [*data_only, limit]).fetchall()
     finally:
         conn.close()
     return [str(r["outcome"]) for r in rows]

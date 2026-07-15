@@ -154,7 +154,10 @@ def current_drawdown_pct() -> float | None:
     """Peak-to-trough drawdown % from the equity snapshots, or None if no data.
 
     Reads EQUITY (which already reflects unrealized losses on open positions),
-    not closed-trade PnL alone.
+    not closed-trade PnL alone. Phase 23 scope audit: ALREADY correctly scoped
+    — account equity moves only on broker-tracked positions; signal-tracking
+    trades never touch it (``pnl_dollars`` is always None), so no change was
+    needed here.
     """
     peak = db.get_equity_peak()
     latest = db.get_latest_equity()
@@ -167,7 +170,11 @@ def current_drawdown_pct() -> float | None:
 
 
 def consecutive_losses() -> int:
-    """The trailing run of resolved LOSSES (newest-first, active book)."""
+    """The trailing run of resolved REAL-EXECUTION losses, newest first.
+
+    Phase 23 scope audit: the source query excludes shadow-tracked trades AND
+    the data-only crypto swing signals — paper losses from a subsystem that
+    can never touch capital must not pause real swing/long-term entry."""
     streak = 0
     for outcome in db.get_recent_resolved_outcomes(limit=max(
         config.MAX_CONSECUTIVE_LOSSES * 2, 20,
