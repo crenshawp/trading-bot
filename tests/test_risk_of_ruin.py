@@ -146,6 +146,21 @@ def test_tier1_trips_at_exactly_seven_losses(tmp_db: Path) -> None:
     assert "PAUSED" in rec.calls[0][0]
 
 
+def test_get_recent_resolved_outcomes_excludes_each_data_only_type(
+    tmp_db: Path,
+) -> None:
+    """Query-level proof: every data-only signal type is excluded at the
+    source; real stock swing outcomes still flow."""
+    for i, signal_type in enumerate(sorted(config.DATA_ONLY_SIGNAL_TYPES)):
+        _seed_resolved(
+            ["loss"], signal_type=signal_type, asset_class="crypto",
+            ticker_prefix=f"X{i}-", start_minute=i,
+        )
+    _seed_resolved(["win"], ticker_prefix="REAL-", start_minute=50)
+
+    assert db.get_recent_resolved_outcomes() == ["win"]
+
+
 # ─────────────── Tier 1 scope (Phase 23): data-only losses never count ──────
 
 
@@ -206,6 +221,37 @@ def test_mixed_streak_counts_only_real_losses(tmp_db: Path) -> None:
     assert ror.consecutive_losses() == 7
     result = ror.evaluate_tier1(notifier=_Recorder())
     assert result.tripped is True and result.trigger == "consecutive_losses"
+
+
+def test_pre_existing_pause_is_not_auto_cleared_by_scope_fix(
+    tmp_db: Path,
+) -> None:
+    """A pause tripped BEFORE this fix (e.g. by data-only noise) stays paused:
+    the scope change alters what COUNTS, never the persisted state. Clearing
+    still requires the explicit operator token, per Phase 15's design."""
+    # Simulate the pre-fix trip: revoked entry + paused state, and a book
+    # whose only losses are data-only (which the scoped counter now ignores).
+    ror.revoke("new_position_entry", "tier1: 13 consecutive losses")
+    ror._set_state(ror.STATE_PAUSED)
+    _seed_resolved(
+        ["loss"] * 8, signal_type="oversold_reversal", asset_class="crypto",
+        ticker_prefix="D-",
+    )
+    assert ror.consecutive_losses() == 0            # scoped counter is calm...
+
+    result = ror.evaluate_tier1(notifier=_Recorder())
+    assert result.state == ror.STATE_PAUSED         # ...but the pause HOLDS
+    assert ror.is_entry_authorized() is False       # still revoked
+    assert ror.get_state() == ror.STATE_PAUSED
+
+    # Only the explicit operator token clears it — exactly as before.
+    ok, _msg = ror.reauthorize("wrong-token")
+    assert ok is False
+    assert ror.get_state() == ror.STATE_PAUSED
+    ok, _msg = ror.reauthorize(config.ROR_REAUTHORIZE_TOKEN)
+    assert ok is True
+    assert ror.is_entry_authorized() is True
+    assert ror.get_state() == ror.STATE_NORMAL
 
 
 # ───────────────────────── Tier 1: drawdown (incl. unrealized) ──────────────

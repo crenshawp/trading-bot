@@ -349,6 +349,23 @@ def test_build_plan_drops_data_only_crypto_swing_signals() -> None:
     assert "data-only" in drop.reason
 
 
+def test_build_plan_drops_overbought_reversal_short(tmp_db: Path) -> None:
+    """Phase 23 boundary seal: the detector's third crypto swing setup (a
+    SHORT) was missing from the data-only set — route_pool's crypto fallback
+    would have sent it to the CRYPTO pool, where the long-term entry path
+    submits a BUY. It must be dropped before routing like its siblings."""
+    acct = AccountInfo(ok=True, equity=100_000.0, cash=100_000.0)
+    short_swing = _candidate(
+        ticker="BTC-USD", signal_type="overbought_reversal",
+        asset_class="crypto", direction="short", expectancy=0.9, atr=1_500.0,
+        entry=64_000.0,
+    )
+    res = allocation.build_plan([short_swing], acct)
+    assert res.plan.orders == []                       # never planned
+    (drop,) = res.skipped
+    assert "data-only" in drop.reason
+
+
 def test_build_plan_long_term_uses_diversification_sizing() -> None:
     # LONG_TERM pool capital = 30% of $100k = $30k; a 15% weight = $4500 (NOT
     # ATR/stop sizing — the candidate has no ATR).

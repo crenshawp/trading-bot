@@ -33,10 +33,14 @@ def test_longterm_config_defaults() -> None:
 
 def test_crypto_swing_signals_are_data_only_and_unrouted() -> None:
     # The crypto SWING signals must be data-only AND absent from the routing map.
+    # Phase 23 sealed overbought_reversal (the detector's third setup) — it was
+    # missing, letting route_pool's crypto fallback send a SHORT to execution.
     assert "oversold_reversal" in config.DATA_ONLY_SIGNAL_TYPES
     assert "momentum_breakout" in config.DATA_ONLY_SIGNAL_TYPES
+    assert "overbought_reversal" in config.DATA_ONLY_SIGNAL_TYPES
     assert "oversold_reversal" not in config.SIGNAL_TYPE_TO_POOL
     assert "momentum_breakout" not in config.SIGNAL_TYPE_TO_POOL
+    assert "overbought_reversal" not in config.SIGNAL_TYPE_TO_POOL
     # The long-term signals ARE routed, to their pools.
     assert config.SIGNAL_TYPE_TO_POOL[config.LONGTERM_STOCK_SIGNAL] == config.POOL_LONG_TERM
     assert config.SIGNAL_TYPE_TO_POOL[config.LONGTERM_CRYPTO_SIGNAL] == config.POOL_CRYPTO
