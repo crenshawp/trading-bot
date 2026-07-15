@@ -59,15 +59,26 @@ def test_equity_snapshot_empty_returns_none(tmp_db: Path) -> None:
 # ───────────────────────── recent resolved outcomes (streak source) ─────────
 
 
-def _seed_resolved(outcomes: list[str], *, track_mode: str = "active") -> None:
+def _seed_resolved(
+    outcomes: list[str],
+    *,
+    track_mode: str = "active",
+    signal_type: str = "ema21_pullback",
+    asset_class: str = "stock",
+    ticker_prefix: str = "T",
+    start_minute: int = 0,
+) -> None:
+    """Seed resolved trades chronologically. ``start_minute`` orders separate
+    seeding calls against each other (later minutes close later)."""
     for i, outcome in enumerate(outcomes):
-        ts = _TS + timedelta(minutes=i)
+        ts = _TS + timedelta(minutes=start_minute + i)
         sid = db.insert_signal(Signal(
-            timestamp=ts, ticker=f"T{i}", asset_class="stock",
-            signal_type="ema21_pullback", direction="call", entry_price=100.0,
+            timestamp=ts, ticker=f"{ticker_prefix}{i}", asset_class=asset_class,
+            signal_type=signal_type, direction="call", entry_price=100.0,
         ))
         db.insert_trade(Trade(
-            signal_id=sid, opened_at=ts, closed_at=ts + timedelta(days=1),
+            signal_id=sid, opened_at=ts,
+            closed_at=ts + timedelta(days=1),
             outcome=outcome, pnl_pct=1.0 if outcome == "win" else -1.0,
             track_mode=track_mode,
         ))
@@ -133,6 +144,68 @@ def test_tier1_trips_at_exactly_seven_losses(tmp_db: Path) -> None:
     assert ror.get_state() == ror.STATE_PAUSED
     assert len(rec.calls) == 1
     assert "PAUSED" in rec.calls[0][0]
+
+
+# ─────────────── Tier 1 scope (Phase 23): data-only losses never count ──────
+
+
+def test_data_only_losing_streak_does_not_trip_tier1(tmp_db: Path) -> None:
+    """The observed failure mode: a losing streak living entirely in the
+    data-only crypto swing signals — active-track but permanently barred from
+    execution — must NOT pause real entry. All three detector setups covered,
+    well past the 7-loss threshold."""
+    for i, signal_type in enumerate(
+        ("oversold_reversal", "momentum_breakout", "overbought_reversal")
+    ):
+        _seed_resolved(
+            ["loss"] * 4, signal_type=signal_type, asset_class="crypto",
+            ticker_prefix=f"C{i}-", start_minute=i * 10,
+        )
+
+    assert ror.consecutive_losses() == 0            # invisible to the breaker
+    rec = _Recorder()
+    result = ror.evaluate_tier1(notifier=rec)
+    assert result.tripped is False
+    assert ror.is_entry_authorized() is True        # real entry NOT paused
+    assert ror.get_state() == ror.STATE_NORMAL
+    assert rec.calls == []
+
+
+def test_real_losing_streak_of_same_length_still_trips(tmp_db: Path) -> None:
+    """The same streak length in REAL (active, executable) trades trips the
+    breaker exactly as it always has — the scope fix removed noise, not the
+    protection."""
+    _seed_resolved(["win"] + ["loss"] * 7)          # identical to the pre-fix case
+    rec = _Recorder()
+    result = ror.evaluate_tier1(notifier=rec)
+    assert result.tripped is True and result.trigger == "consecutive_losses"
+    assert result.losses == 7
+    assert ror.is_entry_authorized() is False
+    assert ror.get_state() == ror.STATE_PAUSED
+
+
+def test_mixed_streak_counts_only_real_losses(tmp_db: Path) -> None:
+    """Interleaved data-only and real losses: only the real ones count toward
+    the threshold. Six real losses + a pile of newer data-only losses stays
+    below the 7-loss trip."""
+    _seed_resolved(
+        ["loss"] * 6, ticker_prefix="REAL-", start_minute=0,      # real: 6
+    )
+    _seed_resolved(
+        ["loss"] * 5, signal_type="oversold_reversal", asset_class="crypto",
+        ticker_prefix="DATA-", start_minute=100,                  # newer, data-only
+    )
+
+    assert ror.consecutive_losses() == 6            # the real run only
+    result = ror.evaluate_tier1(notifier=_Recorder())
+    assert result.tripped is False                  # 6 < 7 — no trip
+    assert ror.is_entry_authorized() is True
+
+    # One more REAL loss (newest of all) completes a real 7-run: trips.
+    _seed_resolved(["loss"], ticker_prefix="REAL7-", start_minute=200)
+    assert ror.consecutive_losses() == 7
+    result = ror.evaluate_tier1(notifier=_Recorder())
+    assert result.tripped is True and result.trigger == "consecutive_losses"
 
 
 # ───────────────────────── Tier 1: drawdown (incl. unrealized) ──────────────
