@@ -69,3 +69,29 @@ verified in Phases 19–20 test suites. No instance of the pattern found.
      already use it for different shapes).
 - **No backfill of any existing row, for any field, ever.** NULL keeps meaning
   today's default/fallback everywhere.
+
+---
+
+## Phase 24 addendum: earnings/news grade semantics
+
+Phase 24 resolves the two grade-to-boolean findings above without widening any
+gate. The existing integer columns become forward-looking grade stores; legacy
+`0` rows are read as `UNKNOWN` and remain non-blocking. Existing rows are not
+backfilled.
+
+| Field | Grade | Meaning at detection | Fire/allocation behavior |
+|---|---|---|---|
+| `earnings_risk` | `HIGH` | Known earnings date is at most 7 days away | The legacy detector emits a warning and returns, so no trade signal is persisted. Independently, Phase 5 suppresses a signal when the known date is inside its actual hold window. A stored HIGH value is the **only** grade that maps to `Candidate.earnings_blackout=True`. |
+| `earnings_risk` | `MEDIUM` | Known earnings date is 8–14 days away | Advisory-only. Persisted for visibility; does not block allocation. |
+| `earnings_risk` | `LOW` | Earnings is more than 14 days away, or the ticker is an ETF | Advisory-only; does not block allocation. |
+| `earnings_risk` | `UNKNOWN` | Calendar/date unavailable or lookup failed | Fail-open, persisted for visibility; does not block allocation. |
+| `news_risk` | `HIGH` | At least one headline contains a configured high-risk keyword | The detector emits a warning and returns, unchanged. The stored column has no downstream decision consumer. |
+| `news_risk` | `MEDIUM` | No HIGH hit; at least one configured caution keyword | Advisory-only and persisted. |
+| `news_risk` | `LOW` | Headlines exist but contain no configured risk keyword | Advisory-only and persisted. |
+| `news_risk` | `UNKNOWN` | No articles or lookup failed | Fail-open and persisted. |
+
+The persisted value retains the full computed text (for example,
+`MEDIUM — Earnings in 10 days`); gate classification uses only its normalized
+leading grade. This keeps the explanation visible while making the boundary
+explicit. HIGH suppression and Phase 5's hold-window blackout logic are not
+changed by persistence.
