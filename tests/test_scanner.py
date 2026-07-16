@@ -376,6 +376,40 @@ def test_medium_earnings_grade_persists_but_does_not_suppress(
     assert persisted.earnings_risk == "MEDIUM — Earnings in 10 days"
 
 
+def test_high_news_grade_still_suppresses_trade_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(scanner, "check_earnings_risk", lambda _ticker: "LOW")
+    monkeypatch.setattr(
+        scanner, "check_news_risk", lambda _ticker: "HIGH — 2 high-risk articles",
+    )
+
+    signals = scanner.detect_stock_signals("META", _risk_grade_detector_frame())
+
+    assert len(signals) == 1
+    assert signals[0]["direction"] == "⚠️ WARNING"
+    assert signals[0]["setup"] == "High Risk News"
+
+
+def test_medium_news_grade_persists_but_has_no_post_fire_gate(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _offline_context(monkeypatch)
+    monkeypatch.setattr(scanner, "check_earnings_risk", lambda _ticker: "LOW")
+    monkeypatch.setattr(
+        scanner, "check_news_risk", lambda _ticker: "MEDIUM — 1 medium-risk article",
+    )
+
+    signals = scanner.detect_stock_signals("META", _risk_grade_detector_frame())
+    trade_signals = [s for s in signals if s["direction"] != "⚠️ WARNING"]
+    assert trade_signals
+    sid = scanner.log_signal(trade_signals[0])
+    assert sid is not None
+    persisted = db.get_signal_by_id(sid)
+    assert persisted is not None
+    assert persisted.news_risk == "MEDIUM — 1 medium-risk article"
+
+
 # ───────────────────────── _load_secrets ─────────────────────────
 
 

@@ -38,13 +38,14 @@ def _seed_signal(
     atr: float | None = 8.0,
     rsi: float | None = 55.0,
     earnings_risk: str | bool = "UNKNOWN",
+    news_risk: str | bool = "UNKNOWN",
     timestamp: datetime = _NOW,
     hold_days: int | None = None,
 ) -> int:
     return db.insert_signal(Signal(
         timestamp=timestamp, ticker=ticker, asset_class=asset_class,
         signal_type=signal_type, direction=direction, entry_price=entry,
-        atr=atr, rsi=rsi, earnings_risk=earnings_risk,
+        atr=atr, rsi=rsi, earnings_risk=earnings_risk, news_risk=news_risk,
         hold_estimate_days=hold_days,
     ))
 
@@ -224,6 +225,45 @@ def test_only_high_earnings_grade_blackout_gates(
     _seed_trade(sid)
     (candidate,) = _live()
     assert candidate.earnings_blackout is expected_blackout
+
+
+def test_news_grade_is_persisted_but_not_a_candidate_gate(tmp_db: Path) -> None:
+    sid = _seed_signal(news_risk="HIGH — synthetic stored grade")
+    _seed_trade(sid)
+
+    persisted = db.get_signal_by_id(sid)
+    assert persisted is not None
+    assert persisted.news_risk == "HIGH — synthetic stored grade"
+    (candidate,) = _live()
+
+    # Candidate has no news-risk field and its only risk gate remains the
+    # unchanged HIGH-only earnings blackout boundary.
+    assert candidate.earnings_blackout is False
+    assert "news_risk" not in candidate.__dataclass_fields__
+
+
+def test_legacy_zero_news_row_remains_unknown_and_non_decisional(
+    tmp_db: Path,
+) -> None:
+    """Forward-only proof: old news=0 rows are neither rewritten nor gated."""
+    sid = _seed_signal()
+    _seed_trade(sid)
+    conn = db.get_connection()
+    try:
+        conn.execute("UPDATE signals SET news_risk = 0 WHERE id = ?", (sid,))
+        conn.commit()
+        raw = conn.execute(
+            "SELECT news_risk FROM signals WHERE id = ?", (sid,),
+        ).fetchone()["news_risk"]
+    finally:
+        conn.close()
+
+    assert str(raw) == "0"
+    persisted = db.get_signal_by_id(sid)
+    assert persisted is not None
+    assert persisted.news_risk == "UNKNOWN"
+    (candidate,) = _live()
+    assert candidate.earnings_blackout is False
 
 
 def test_candidate_rsi_falls_back_to_signal_column(tmp_db: Path) -> None:

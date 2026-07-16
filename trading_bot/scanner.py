@@ -780,6 +780,7 @@ def log_signal(
         bb_upper=_opt_float(signal, "bb_upper"),
         bb_lower=_opt_float(signal, "bb_lower"),
         earnings_risk=str(signal.get("earnings_risk", "UNKNOWN")),
+        news_risk=str(signal.get("news_risk", "UNKNOWN")),
     )
     signal_id = db.insert_signal(rec)
 
@@ -1525,11 +1526,12 @@ def detect_stock_signals(ticker, df):
             "ema21":      ema21,
         })
 
-    # Preserve the detector's already-computed grade on every trade signal.
+    # Preserve the detector's already-computed grades on every trade signal.
     # HIGH returned above as a warning and never reaches log_signal; MEDIUM,
     # LOW and UNKNOWN are advisory-only and now survive to the signal row.
     for signal in signals:
         signal["earnings_risk"] = earnings_risk
+        signal["news_risk"] = news_risk
 
     return signals
 
