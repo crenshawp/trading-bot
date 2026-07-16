@@ -37,7 +37,7 @@ def _seed_signal(
     entry: float = 480.0,
     atr: float | None = 8.0,
     rsi: float | None = 55.0,
-    earnings_risk: bool = False,
+    earnings_risk: str | bool = "UNKNOWN",
     timestamp: datetime = _NOW,
     hold_days: int | None = None,
 ) -> int:
@@ -184,6 +184,46 @@ def test_candidate_maps_trade_context_and_gates(tmp_db: Path) -> None:
     assert c.sentiment_score == 0.4
     assert c.concentration == "diversified"
     assert c.ticker_active is True
+
+
+def test_legacy_zero_earnings_row_remains_non_blocking(tmp_db: Path) -> None:
+    """Phase 24 is forward-only: the raw legacy 0 is not rewritten or gated."""
+    sid = _seed_signal()
+    _seed_trade(sid)
+    conn = db.get_connection()
+    try:
+        conn.execute("UPDATE signals SET earnings_risk = 0 WHERE id = ?", (sid,))
+        conn.commit()
+        raw = conn.execute(
+            "SELECT earnings_risk FROM signals WHERE id = ?", (sid,),
+        ).fetchone()["earnings_risk"]
+    finally:
+        conn.close()
+
+    # Fresh v23 DBs have TEXT affinity (so SQLite returns "0"); deployed
+    # pre-v23 DBs retain INTEGER affinity and return 0. Both normalize the
+    # same way and the candidate pull never rewrites either representation.
+    assert str(raw) == "0"
+    (candidate,) = _live()
+    assert candidate.earnings_blackout is False
+
+
+@pytest.mark.parametrize(
+    ("stored_grade", "expected_blackout"),
+    [
+        ("HIGH — Earnings in 2 days", True),
+        ("MEDIUM — Earnings in 10 days", False),
+        ("LOW", False),
+        ("UNKNOWN", False),
+    ],
+)
+def test_only_high_earnings_grade_blackout_gates(
+    tmp_db: Path, stored_grade: str, expected_blackout: bool,
+) -> None:
+    sid = _seed_signal(earnings_risk=stored_grade)
+    _seed_trade(sid)
+    (candidate,) = _live()
+    assert candidate.earnings_blackout is expected_blackout
 
 
 def test_candidate_rsi_falls_back_to_signal_column(tmp_db: Path) -> None:

@@ -237,7 +237,7 @@ def test_log_signal_handles_missing_indicators(tmp_db: Path) -> None:
     assert row.rsi is None
     assert row.atr is None
     assert row.macd is None
-    assert row.earnings_risk is False
+    assert row.earnings_risk == "UNKNOWN"
 
 
 def test_log_signal_normalizes_signal_type(tmp_db: Path) -> None:
@@ -330,6 +330,50 @@ def test_log_signal_skips_warning_entries(tmp_db: Path) -> None:
     })
     assert sid is None
     assert db.get_signals() == []
+
+
+def _risk_grade_detector_frame() -> object:
+    import pandas as pd
+
+    row = {
+        "Close": 100.0, "RSI": 50.0, "ATR": 2.0, "Volume": 100.0,
+        "Vol_MA20": 100.0, "EMA21": 100.0, "EMA50": 90.0,
+        "Slope": 0.0, "ROC_Accel": 1.0, "Slope_Accel": 0.0,
+        "High_20": 110.0,
+    }
+    return pd.DataFrame([row, row])
+
+
+def test_high_earnings_grade_still_suppresses_trade_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        scanner, "check_earnings_risk", lambda _ticker: "HIGH — Earnings in 2 days",
+    )
+    signals = scanner.detect_stock_signals("META", _risk_grade_detector_frame())
+    assert len(signals) == 1
+    assert signals[0]["direction"] == "⚠️ WARNING"
+    assert signals[0]["setup"] == "Earnings Risk"
+
+
+def test_medium_earnings_grade_persists_but_does_not_suppress(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _offline_context(monkeypatch)
+    monkeypatch.setattr(
+        scanner, "check_earnings_risk",
+        lambda _ticker: "MEDIUM — Earnings in 10 days",
+    )
+    monkeypatch.setattr(scanner, "check_news_risk", lambda _ticker: "LOW")
+
+    signals = scanner.detect_stock_signals("META", _risk_grade_detector_frame())
+    trade_signals = [s for s in signals if s["direction"] != "⚠️ WARNING"]
+    assert trade_signals
+    sid = scanner.log_signal(trade_signals[0])
+    assert sid is not None
+    persisted = db.get_signal_by_id(sid)
+    assert persisted is not None
+    assert persisted.earnings_risk == "MEDIUM — Earnings in 10 days"
 
 
 # ───────────────────────── _load_secrets ─────────────────────────

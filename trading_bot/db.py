@@ -35,6 +35,7 @@ from trading_bot.models import (
     Prediction,
     Signal,
     Trade,
+    normalize_risk_text,
 )
 
 # Version 12 (Phase 5) — adds trades sentiment columns (advisory news context).
@@ -47,6 +48,7 @@ from trading_bot.models import (
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
+# Version 23 (Phase 24) — signals earnings/news risk store full text grades.
 # Version 22 (Phase 19) — adds long_term_positions.source/direction/tp/sl/
 #                          deadline (shares-fallback lifecycle tracking).
 # Version 21 (Phase 17) — adds signals.considered_at (live-candidate sourcing).
@@ -60,7 +62,7 @@ from trading_bot.models import (
 # Version 13 (Phase 6) — adds trades.ind_* advisory indicator-family columns.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -81,8 +83,8 @@ CREATE TABLE IF NOT EXISTS signals (
     bb_upper REAL,
     bb_lower REAL,
     hold_estimate_days INTEGER,
-    earnings_risk INTEGER NOT NULL DEFAULT 0,
-    news_risk INTEGER NOT NULL DEFAULT 0,
+    earnings_risk TEXT NOT NULL DEFAULT 'UNKNOWN',
+    news_risk TEXT NOT NULL DEFAULT 'UNKNOWN',
     raw_indicators_json TEXT
 );
 
@@ -742,6 +744,18 @@ def _migrate_to_v22(conn: sqlite3.Connection) -> None:
             )
 
 
+def _migrate_to_v23(_conn: sqlite3.Connection) -> None:
+    """Phase 24: earnings/news risk columns now store full text grades.
+
+    Existing columns have SQLite INTEGER affinity, which still accepts TEXT;
+    changing affinity would require rebuilding the referenced ``signals``
+    table. Deliberately do not rebuild or backfill it: legacy 0/1 rows remain
+    byte-for-byte unchanged and are normalized on read. Fresh databases use
+    the TEXT declaration in ``_SCHEMA_SQL``.
+    """
+    return None
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -768,6 +782,7 @@ def init_db() -> None:
         _migrate_to_v20(conn)
         _migrate_to_v21(conn)
         _migrate_to_v22(conn)
+        _migrate_to_v23(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -841,8 +856,8 @@ def insert_signal(signal: Signal) -> int:
         signal.bb_upper,
         signal.bb_lower,
         signal.hold_estimate_days,
-        int(signal.earnings_risk),
-        int(signal.news_risk),
+        normalize_risk_text(signal.earnings_risk),
+        normalize_risk_text(signal.news_risk),
         signal.raw_indicators_json,
     )
     conn = get_connection()
@@ -886,8 +901,8 @@ def _row_to_signal(row: sqlite3.Row) -> Signal:
         bb_upper=row["bb_upper"],
         bb_lower=row["bb_lower"],
         hold_estimate_days=row["hold_estimate_days"],
-        earnings_risk=bool(row["earnings_risk"]),
-        news_risk=bool(row["news_risk"]),
+        earnings_risk=normalize_risk_text(row["earnings_risk"]),
+        news_risk=normalize_risk_text(row["news_risk"]),
         raw_indicators_json=row["raw_indicators_json"],
         considered_at=(
             datetime.fromisoformat(row["considered_at"])

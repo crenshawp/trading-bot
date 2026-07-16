@@ -34,6 +34,7 @@ from typing import Any
 
 from trading_bot import config, db, outcomes, signal_pairs
 from trading_bot.allocation import Candidate, route_pool
+from trading_bot.models import is_hard_risk
 
 
 def _watchlist_status_map() -> dict[str, str]:
@@ -72,7 +73,9 @@ def _to_candidate(
         atr=row["atr"],
         ticker_active=watchlist.get(ticker, "active") == "active",
         pair_enabled=db.get_signal_pair_status(ticker, signal_type) == "enabled",
-        earnings_blackout=bool(row["earnings_risk"]),
+        # Only the existing hard-equivalent HIGH grade blocks. MEDIUM/LOW/
+        # UNKNOWN are persisted advisory context and remain non-blocking.
+        earnings_blackout=is_hard_risk(row["earnings_risk"]),
         expectancy=expectancy,
         rsi=rsi,
         adx=row["trade_ind_adx"],

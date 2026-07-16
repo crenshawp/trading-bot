@@ -3,6 +3,48 @@
 from dataclasses import dataclass
 from datetime import datetime
 
+RISK_GRADE_HIGH = "HIGH"
+RISK_GRADE_MEDIUM = "MEDIUM"
+RISK_GRADE_LOW = "LOW"
+RISK_GRADE_UNKNOWN = "UNKNOWN"
+VALID_RISK_GRADES: tuple[str, ...] = (
+    RISK_GRADE_HIGH,
+    RISK_GRADE_MEDIUM,
+    RISK_GRADE_LOW,
+    RISK_GRADE_UNKNOWN,
+)
+
+
+def risk_grade(value: object) -> str:
+    """Return the normalized leading grade for a stored risk value.
+
+    Phase 24 stores the full computed text (for example ``"MEDIUM — ..."``).
+    Legacy rows are integer booleans: ``0`` remains non-blocking UNKNOWN and
+    ``1`` retains its historical hard-risk meaning as HIGH. Unknown/malformed
+    values fail open to UNKNOWN.
+    """
+    if isinstance(value, str):
+        upper = value.strip().upper()
+        for grade in VALID_RISK_GRADES:
+            if upper == grade or upper.startswith(f"{grade} "):
+                return grade
+        return RISK_GRADE_UNKNOWN
+    return RISK_GRADE_HIGH if value is True or value == 1 else RISK_GRADE_UNKNOWN
+
+
+def normalize_risk_text(value: object) -> str:
+    """Return full persisted risk text with a validated leading grade."""
+    if isinstance(value, str) and risk_grade(value) != RISK_GRADE_UNKNOWN:
+        return value.strip()
+    if isinstance(value, str) and value.strip().upper() == RISK_GRADE_UNKNOWN:
+        return RISK_GRADE_UNKNOWN
+    return risk_grade(value)
+
+
+def is_hard_risk(value: object) -> bool:
+    """True only for the existing hard-blackout-equivalent HIGH grade."""
+    return risk_grade(value) == RISK_GRADE_HIGH
+
 
 @dataclass(frozen=True)
 class Signal:
@@ -22,8 +64,8 @@ class Signal:
     bb_upper: float | None = None
     bb_lower: float | None = None
     hold_estimate_days: int | None = None
-    earnings_risk: bool = False
-    news_risk: bool = False
+    earnings_risk: str = RISK_GRADE_UNKNOWN
+    news_risk: str = RISK_GRADE_UNKNOWN
     raw_indicators_json: str | None = None
     # Phase 17: set (via db.mark_signals_considered) when the live candidate
     # source pulls this signal into an execute-bound plan — at PULL time, not
