@@ -59,11 +59,28 @@ def _seed_fired_signals() -> None:
         signal_type="ema21_pullback", direction="call", entry_price=480.0,
         atr=8.0, rsi=55.0,      # what log_signal persists since Phase 22
         hold_estimate_days=2,   # what log_signal persists since Phase 21
+        earnings_risk="MEDIUM — Earnings in 10 days",
+        news_risk="MEDIUM — 1 medium-risk article",
     ))
     db.insert_trade(Trade(
         signal_id=swing, opened_at=_NOW, outcome="open", track_mode="active",
         ind_rsi=52.0, ind_adx=27.0, ind_obv=1_200_000.0, ind_vol_regime="low",
         ind_concentration="diversified", sentiment_score=0.4,
+    ))
+
+    # Defense-in-depth demonstration only: the live detector returns a warning
+    # before persisting HIGH, but even a stored HIGH row remains allocation-
+    # blocked. This proves the downstream gate boundary without changing it.
+    high_risk = db.insert_signal(Signal(
+        timestamp=_NOW, ticker="LLY", asset_class="stock",
+        signal_type="ema21_pullback", direction="call", entry_price=950.0,
+        atr=15.0, rsi=52.0, hold_estimate_days=2,
+        earnings_risk="HIGH — synthetic defense-in-depth row",
+        news_risk="LOW",
+    ))
+    db.insert_trade(Trade(
+        signal_id=high_risk, opened_at=_NOW, outcome="open",
+        track_mode="active",
     ))
 
     crypto_swing = db.insert_signal(Signal(
@@ -103,6 +120,14 @@ def main() -> None:
         )
 
     print("\n=== Live candidate source: real fired signals, not samples ===")
+    print("=== Phase 24 grades: HIGH blocks; MEDIUM persists/advises    ===")
+    for row in db.get_recent_signal_risk_grades():
+        if row["ticker"] not in {"LLY", "META"}:
+            continue
+        print(
+            f"  {row['ticker']:<8} earnings={row['earnings_risk']} "
+            f"| news={row['news_risk']}"
+        )
     candidates = candidate_source.live_candidates(now=_NOW, mark_considered=True)
     for c in candidates:
         window = (
@@ -110,7 +135,9 @@ def main() -> None:
             if c.hold_deadline else "-"
         )
         print(f"  {c.ticker:<8} {c.signal_type:<18} {c.asset_class:<7} "
-              f"entry={c.entry:<9,.0f} hold_deadline={window}")
+              f"entry={c.entry:<9,.0f} hold_deadline={window} "
+              f"earnings_blackout={c.earnings_blackout}")
+    print("  news_risk on Candidate: absent (persisted/reporting only)")
 
     print("\n=== build_plan: new signal (real ATR) plans; old NULL-atr row ===")
     print("=== is skipped unsizeable; data-only crypto swing still drops  ===")

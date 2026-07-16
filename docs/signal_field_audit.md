@@ -95,3 +95,8 @@ The persisted value retains the full computed text (for example,
 leading grade. This keeps the explanation visible while making the boundary
 explicit. HIGH suppression and Phase 5's hold-window blackout logic are not
 changed by persistence.
+
+**Post-implementation disposition.** `earnings_risk` and `news_risk` are now
+resolved Phase 24 findings, not outstanding FLAG-FOR-LATER items. The only
+remaining flagged field from the Phase 22 audit is `raw_indicators_json`,
+whose payload schema still requires a separate design decision.
