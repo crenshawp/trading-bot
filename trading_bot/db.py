@@ -2244,6 +2244,36 @@ def get_recent_trade_risk(limit: int = 20) -> list[dict[str, Any]]:
     ]
 
 
+def get_recent_signal_risk_grades(limit: int = 20) -> list[dict[str, str]]:
+    """Newest fired signals with their persisted earnings/news risk grades.
+
+    This view deliberately reads ``signals`` directly rather than requiring a
+    joined trade or advisory-risk row: the Phase 24 values describe the fired
+    signal itself and should remain visible even when another context pipeline
+    failed soft. Legacy integer 0/1 values are normalized only in the returned
+    representation; the stored row is never rewritten.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT timestamp, ticker, signal_type, earnings_risk, news_risk "
+            "FROM signals ORDER BY timestamp DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "timestamp": str(row["timestamp"]),
+            "ticker": str(row["ticker"]),
+            "signal_type": str(row["signal_type"]),
+            "earnings_risk": normalize_risk_text(row["earnings_risk"]),
+            "news_risk": normalize_risk_text(row["news_risk"]),
+        }
+        for row in rows
+    ]
+
+
 def get_traded_signal_pairs() -> list[tuple[str, str]]:
     """Distinct (ticker, signal_type) pairs that have at least one trade.
 

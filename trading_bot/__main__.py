@@ -1201,6 +1201,21 @@ def cmd_risk_status(limit: int = 20) -> None:
     print("\n  * size capped at the per-position limit")
 
 
+def cmd_signal_risk_grades(limit: int = 20) -> None:
+    """Show persisted fire-time earnings/news grades without recomputation."""
+    rows = db.get_recent_signal_risk_grades(limit=limit)
+    print("SIGNAL RISK GRADES  (persisted at signal fire; no live lookup)")
+    print("-" * 78)
+    if not rows:
+        print("  (no fired signals yet)")
+        return
+    for row in rows:
+        fired = row["timestamp"][:19].replace("T", " ")
+        print(f"  {fired}  {row['ticker']}  {row['signal_type']}")
+        print(f"    earnings: {row['earnings_risk']}")
+        print(f"    news:     {row['news_risk']}")
+
+
 def cmd_risk_exposure() -> None:
     """Current open-trade exposure vs the configured advisory limits.
 
@@ -2276,6 +2291,11 @@ def main() -> None:
         "--limit", type=int, default=20,
         help="How many recent risk-assessed signals to show (default 20)",
     )
+    risk_grades_p = risk_sub.add_parser("grades")
+    risk_grades_p.add_argument(
+        "--limit", type=int, default=20,
+        help="How many recent fired signals to show (default 20)",
+    )
     risk_sub.add_parser("exposure")
     # Phase 15 — risk-of-ruin operator controls.
     risk_reauth_p = risk_sub.add_parser("reauthorize")
@@ -2499,6 +2519,8 @@ def main() -> None:
             cmd_risk_ror_status()
             print()
             cmd_risk_status(limit=args.limit)
+        elif args.risk_cmd == "grades":
+            cmd_signal_risk_grades(limit=args.limit)
         elif args.risk_cmd == "exposure":
             cmd_risk_exposure()
         elif args.risk_cmd == "reauthorize":

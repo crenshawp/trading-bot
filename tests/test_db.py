@@ -289,6 +289,29 @@ def test_get_recent_trade_risk_only_returns_assessed_rows(tmp_db: Path) -> None:
     assert r["outcome"] == "win"
 
 
+def test_get_recent_signal_risk_grades_reads_signals_newest_first(
+    tmp_db: Path,
+) -> None:
+    db.insert_signal(_make_signal(
+        ticker="GOOGL", timestamp=datetime(2026, 6, 1, 10, 0),
+        earnings_risk="MEDIUM — Earnings in 10 days", news_risk="LOW",
+    ))
+    db.insert_signal(_make_signal(
+        ticker="META", timestamp=datetime(2026, 6, 1, 11, 0),
+        earnings_risk="LOW", news_risk="MEDIUM — 1 medium-risk article",
+    ))
+
+    rows = db.get_recent_signal_risk_grades(limit=1)
+
+    assert rows == [{
+        "timestamp": "2026-06-01T11:00:00",
+        "ticker": "META",
+        "signal_type": "ema21_pullback",
+        "earnings_risk": "LOW",
+        "news_risk": "MEDIUM — 1 medium-risk article",
+    }]
+
+
 # ---- self-optimization runs (Phase 9) ----
 
 

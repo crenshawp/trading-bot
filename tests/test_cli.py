@@ -714,6 +714,42 @@ def test_cli_risk_status_empty(
     assert "no risk-assessed signals yet" in capsys.readouterr().out
 
 
+def test_cli_risk_grades_surfaces_full_persisted_values(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rows = [{
+        "timestamp": "2026-06-01T10:00:00",
+        "ticker": "GOOGL",
+        "signal_type": "ema21_pullback",
+        "earnings_risk": "MEDIUM — Earnings in 10 days",
+        "news_risk": "LOW",
+    }]
+    monkeypatch.setattr(
+        "trading_bot.db.get_recent_signal_risk_grades", lambda **_kw: rows,
+    )
+
+    _run(["risk", "grades", "--limit", "1"])
+    out = capsys.readouterr().out
+    assert "SIGNAL RISK GRADES" in out
+    assert "GOOGL" in out
+    assert "MEDIUM — Earnings in 10 days" in out
+    assert "news:     LOW" in out
+
+
+def test_cli_risk_grades_empty(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "trading_bot.db.get_recent_signal_risk_grades", lambda **_kw: [],
+    )
+    _run(["risk", "grades"])
+    assert "no fired signals yet" in capsys.readouterr().out
+
+
 def test_cli_risk_exposure(
     tmp_db: Path,
     monkeypatch: pytest.MonkeyPatch,
