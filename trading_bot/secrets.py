@@ -10,9 +10,11 @@ fail loudly instead of silently returning ``None``.
 """
 
 import os
+import sys
 from pathlib import Path
 
 import keyring
+from keyring.errors import KeyringError
 
 from trading_bot.config import ROOT_DIR, RUNTIME
 
@@ -63,8 +65,14 @@ def get_secret(name: str) -> str | None:
     _validate(name)
     if RUNTIME == "railway":
         return os.environ.get(name)
-    # local: keyring first, then .env fallback
-    value: str | None = keyring.get_password(_SERVICE_NAME, name)
+    # local: keyring first, then .env fallback. A missing/broken keyring backend
+    # must fail soft (fall through to .env / return None) rather than raise — a
+    # secret-store hiccup should degrade, never crash the scan loop.
+    value: str | None = None
+    try:
+        value = keyring.get_password(_SERVICE_NAME, name)
+    except KeyringError as exc:
+        print(f"secrets: keyring unavailable for get({name}): {exc}", file=sys.stderr)
     if value is not None:
         return value
     return _read_env_file().get(name)
@@ -93,7 +101,12 @@ def list_secrets() -> list[str]:
     env_keys = set(_read_env_file().keys())
     found: list[str] = []
     for name in KNOWN_SECRETS:
-        if keyring.get_password(_SERVICE_NAME, name) is not None or name in env_keys:
+        in_keyring = False
+        try:
+            in_keyring = keyring.get_password(_SERVICE_NAME, name) is not None
+        except KeyringError as exc:
+            print(f"secrets: keyring unavailable for list({name}): {exc}", file=sys.stderr)
+        if in_keyring or name in env_keys:
             found.append(name)
     return sorted(found)
 
