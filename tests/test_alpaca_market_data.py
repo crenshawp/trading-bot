@@ -79,6 +79,28 @@ def test_daily_bar_yesterday_is_closed() -> None:
     assert amd.bar_is_closed(yesterday, "1Day", _NOW) is True
 
 
+def test_daily_bar_spring_dst_day_closes_after_23_elapsed_hours() -> None:
+    # 2026-03-08 starts at midnight EST (05:00Z); the next New York midnight
+    # is in EDT (04:00Z), only 23 elapsed hours later.
+    bar = _bar(datetime(2026, 3, 8, 5, 0, tzinfo=UTC))
+    just_before = datetime(2026, 3, 9, 3, 59, 59, tzinfo=UTC)
+    at_next_midnight = datetime(2026, 3, 9, 4, 0, tzinfo=UTC)
+
+    assert amd.bar_is_closed(bar, "1Day", just_before) is False
+    assert amd.bar_is_closed(bar, "1Day", at_next_midnight) is True
+
+
+def test_daily_bar_fall_dst_day_closes_after_25_elapsed_hours() -> None:
+    # 2026-11-01 starts at midnight EDT (04:00Z); the next New York midnight
+    # is in EST (05:00Z), 25 elapsed hours later. Fixed +24h would close early.
+    bar = _bar(datetime(2026, 11, 1, 4, 0, tzinfo=UTC))
+    after_24_hours = datetime(2026, 11, 2, 4, 30, tzinfo=UTC)
+    at_next_midnight = datetime(2026, 11, 2, 5, 0, tzinfo=UTC)
+
+    assert amd.bar_is_closed(bar, "1Day", after_24_hours) is False
+    assert amd.bar_is_closed(bar, "1Day", at_next_midnight) is True
+
+
 def test_hour_bar_boundaries() -> None:
     forming = _bar(datetime(2026, 7, 15, 17, 30, tzinfo=UTC))
     exactly_done = _bar(datetime(2026, 7, 15, 17, 0, tzinfo=UTC))
@@ -212,6 +234,52 @@ def test_stock_bars_parse_and_sort(monkeypatch: pytest.MonkeyPatch) -> None:
     bars = result.bars["AAPL"]
     assert [b.close for b in bars] == [1.2, 1.5]        # sorted oldest-first
     assert bars[0].start.tzinfo is not None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [[], {}, {"bars": []}, {"bars": {"AAPL": {}}}],
+)
+def test_malformed_http_200_bar_payload_fails_soft(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    payload: object,
+) -> None:
+    _with_creds(monkeypatch)
+    _no_sleep(monkeypatch)
+    _patch_get(monkeypatch, [_FakeResp(payload)])
+
+    result = amd.AlpacaMarketDataClient().get_stock_bars(
+        ["AAPL"], start=_NOW - timedelta(days=5),
+    )
+
+    assert result.ok is False
+    assert result.bars == {}
+    assert "malformed" in result.reason
+    assert result.reason in capsys.readouterr().err
+
+
+def test_malformed_bar_row_preserves_valid_partial_result(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _with_creds(monkeypatch)
+    _no_sleep(monkeypatch)
+    payload = {"bars": {"AAPL": [
+        {"t": "2026-07-14T04:00:00Z", "o": 1, "h": 2, "l": 0.5,
+         "c": 1.5, "v": 10},
+        {"t": "bad"},
+    ]}}
+    _patch_get(monkeypatch, [_FakeResp(payload)])
+
+    result = amd.AlpacaMarketDataClient().get_stock_bars(
+        ["AAPL"], start=_NOW - timedelta(days=5),
+    )
+
+    assert result.ok is True
+    assert [bar.close for bar in result.bars["AAPL"]] == [1.5]
+    assert "malformed bar for AAPL" in result.reason
+    assert result.reason in capsys.readouterr().err
 
 
 def test_crypto_bars_translate_and_key_by_internal_symbol(
@@ -358,6 +426,70 @@ def test_pagination_follows_next_page_token(
     assert len(captured) == 2
     assert captured[1]["params"]["page_token"] == "tok"
     assert [b.close for b in result.bars["AAPL"]] == [1.0, 2.0]
+
+
+def test_later_bar_page_failure_preserves_and_logs_partial_result(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _with_creds(monkeypatch)
+    _no_sleep(monkeypatch)
+    page1 = {
+        "bars": {"AAPL": [
+            {"t": "2026-07-13T04:00:00Z", "o": 1, "h": 2, "l": 0.5,
+             "c": 1.0, "v": 1},
+        ]},
+        "next_page_token": "tok",
+    }
+    page2 = {"message": "page unavailable"}
+    _patch_get(monkeypatch, [_FakeResp(page1), _FakeResp(page2, status=503)])
+
+    result = amd.AlpacaMarketDataClient().get_stock_bars(
+        ["AAPL"], start=_NOW - timedelta(days=5),
+    )
+
+    assert result.ok is True
+    assert [bar.close for bar in result.bars["AAPL"]] == [1.0]
+    assert result.reason == "page unavailable"
+    assert "batch failed (page unavailable)" in capsys.readouterr().err
+
+
+def test_quote_non_2xx_reason_is_logged(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _with_creds(monkeypatch)
+    _no_sleep(monkeypatch)
+    _patch_get(monkeypatch, [_FakeResp({"message": "forbidden"}, status=403)])
+
+    result = amd.AlpacaMarketDataClient().get_stock_latest_quotes(["AAPL"])
+
+    assert result.ok is False
+    assert result.reason == "forbidden"
+    assert "quote batch failed (forbidden)" in capsys.readouterr().err
+
+
+def test_quote_batch_failure_preserves_and_logs_partial_result(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _with_creds(monkeypatch)
+    _no_sleep(monkeypatch)
+    good = {"quotes": {"AAPL": {
+        "t": "2026-07-15T17:59:59Z", "bp": 211.10, "bs": 12,
+        "ap": 211.14, "as": 9,
+    }}}
+    failed = {"message": "quote page unavailable"}
+    _patch_get(monkeypatch, [_FakeResp(good), _FakeResp(failed, status=503)])
+
+    result = amd.AlpacaMarketDataClient(
+        batch_size=1,
+    ).get_stock_latest_quotes(["AAPL", "MSFT"])
+
+    assert result.ok is True
+    assert list(result.quotes) == ["AAPL"]
+    assert result.reason == "quote page unavailable"
+    assert "quote batch failed (quote page unavailable)" in capsys.readouterr().err
 
 
 def test_rate_limit_fails_soft(monkeypatch: pytest.MonkeyPatch) -> None:
