@@ -199,11 +199,13 @@ def compare_ticker(
     alpaca_closed = _alpaca_closes_by_date([
         bar for bar in alpaca_bars if bar_is_closed(bar, "1Day", now)
     ])
-    yf_window_dates = set(sorted(yf_closed)[-window_size:])
-    alpaca_window_dates = set(sorted(alpaca_closed)[-window_size:])
-    shared_dates = sorted(yf_window_dates & alpaca_window_dates)
-    missing_alpaca = sorted(yf_window_dates - alpaca_window_dates)
-    missing_yfinance = sorted(alpaca_window_dates - yf_window_dates)
+    all_closed_dates = set(yf_closed) | set(alpaca_closed)
+    horizon_dates = set(sorted(all_closed_dates)[-window_size:])
+    yf_horizon_dates = horizon_dates & set(yf_closed)
+    alpaca_horizon_dates = horizon_dates & set(alpaca_closed)
+    shared_dates = sorted(yf_horizon_dates & alpaca_horizon_dates)
+    missing_alpaca = sorted(horizon_dates - alpaca_horizon_dates)
+    missing_yfinance = sorted(horizon_dates - yf_horizon_dates)
     alignment_notes: list[str] = []
     if missing_alpaca:
         dates = ", ".join(d.isoformat() for d in missing_alpaca)

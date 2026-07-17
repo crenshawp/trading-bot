@@ -134,8 +134,8 @@ def test_asymmetric_closed_windows_report_missing_dates_on_both_sides(
     tmp_db: Path,
 ) -> None:
     yf_df = _yf_df({
+        "2026-07-09": 99.0,
         "2026-07-10": 100.0,
-        "2026-07-11": 101.0,
         "2026-07-12": 102.0,
         "2026-07-13": 103.0,
         "2026-07-14": 104.0,
@@ -151,10 +151,41 @@ def test_asymmetric_closed_windows_report_missing_dates_on_both_sides(
     result = mc.compare_ticker("AAPL", yf_df, bars, now=_NOW, window_bars=5)
 
     assert result.status == mc.STATUS_DIVERGENT
-    assert result.bars_compared == 4
+    assert result.bars_compared == 3
     assert result.max_close_diff_pct == 0.0
     assert "Alpaca missing dates: 2026-07-14" in result.note
-    assert "yfinance missing dates: 2026-07-09" in result.note
+    assert "yfinance missing dates: 2026-07-11" in result.note
+
+
+def test_padded_history_does_not_misattribute_displaced_older_date(
+    tmp_db: Path,
+) -> None:
+    yf_df = _yf_df({
+        "2026-07-08": 98.0,
+        "2026-07-09": 99.0,
+        "2026-07-10": 100.0,
+        "2026-07-11": 101.0,
+        "2026-07-12": 102.0,
+        "2026-07-13": 103.0,
+        "2026-07-14": 104.0,
+    })
+    bars = [
+        _alpaca_bar("2026-07-08", 98.0),
+        _alpaca_bar("2026-07-09", 99.0),
+        _alpaca_bar("2026-07-10", 100.0),
+        _alpaca_bar("2026-07-11", 101.0),
+        _alpaca_bar("2026-07-13", 103.0),
+        _alpaca_bar("2026-07-14", 104.0),
+    ]
+
+    result = mc.compare_ticker("AAPL", yf_df, bars, now=_NOW, window_bars=5)
+
+    assert result.status == mc.STATUS_DIVERGENT
+    assert result.bars_compared == 4
+    assert result.max_close_diff_pct == 0.0
+    assert "Alpaca missing dates: 2026-07-12" in result.note
+    assert "yfinance missing dates" not in result.note
+    assert "2026-07-09" not in result.note
 
 
 def test_missing_alpaca_data_reported(tmp_db: Path) -> None:
