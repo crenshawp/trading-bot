@@ -269,6 +269,25 @@ FUND_DEBT_EQUITY_CEILING: float = 200.0       # 2.0x debt/equity (yfinance %)
 CANDIDATE_RECENCY_HOURS: int = 24
 
 # ──────────────────────────────────────────────────────────────────────────
+# Alpaca market data (Phase 25) — FREE TIER ONLY, parallel to yfinance
+# ──────────────────────────────────────────────────────────────────────────
+# The comparison client runs BESIDE yfinance (which stays authoritative for
+# every consumer); nothing here may require or nudge toward the paid plan.
+# Minimum spacing between data-API requests: 0.35s ≈ 170 requests/minute,
+# safely under the free tier's 200 rpm cap even if batching degenerates to
+# one symbol per request.
+MARKETDATA_MIN_REQUEST_INTERVAL_S: float = 0.35
+# Symbols per multi-symbol bars request (URL-length safe; ~106-ticker universe
+# fits in 3 stock requests).
+MARKETDATA_BATCH_SIZE: int = 50
+# Close-price agreement tolerance for the yfinance-vs-Alpaca comparison, in
+# percent. IEX (exchange-local) and Yahoo (consolidated-tape) daily closes
+# legitimately differ by a few basis points; divergence beyond this is flagged.
+MD_COMPARE_TOLERANCE_PCT: float = 0.5
+# Default number of daily bars compared per ticker.
+MD_COMPARE_WINDOW_BARS: int = 5
+
+# ──────────────────────────────────────────────────────────────────────────
 # Risk of ruin (Phase 15) — CIRCUIT BREAKERS + EMERGENCY SHUTDOWN
 # ──────────────────────────────────────────────────────────────────────────
 # The mandatory safety layer required before any live-switch decision. Two
