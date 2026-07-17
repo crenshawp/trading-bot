@@ -189,8 +189,19 @@ def compare_ticker(
     alpaca_closed = _alpaca_closes_by_date([
         bar for bar in alpaca_bars if bar_is_closed(bar, "1Day", now)
     ])
-    shared_dates = sorted(set(yf_closed) & set(alpaca_closed))
-    shared_dates = shared_dates[-max(1, window_bars):]
+    window_size = max(1, window_bars)
+    yf_window_dates = set(sorted(yf_closed)[-window_size:])
+    alpaca_window_dates = set(sorted(alpaca_closed)[-window_size:])
+    shared_dates = sorted(yf_window_dates & alpaca_window_dates)
+    missing_alpaca = sorted(yf_window_dates - alpaca_window_dates)
+    missing_yfinance = sorted(alpaca_window_dates - yf_window_dates)
+    alignment_notes: list[str] = []
+    if missing_alpaca:
+        dates = ", ".join(d.isoformat() for d in missing_alpaca)
+        alignment_notes.append(f"Alpaca missing dates: {dates}")
+    if missing_yfinance:
+        dates = ", ".join(d.isoformat() for d in missing_yfinance)
+        alignment_notes.append(f"yfinance missing dates: {dates}")
     diffs_pct: list[float] = []
     for d in shared_dates:
         yf_close = yf_closed[d]
@@ -199,22 +210,23 @@ def compare_ticker(
         diffs_pct.append(abs(alpaca_closed[d] - yf_close) / yf_close * 100.0)
 
     if not shared_dates:
+        alignment_notes.append("no overlapping closed bar dates")
         return TickerComparison(
             ticker, STATUS_DIVERGENT, bars_compared=0,
             latest_closed_agrees=latest_agrees,
             latest_closed_yf=yf_latest.isoformat() if yf_latest else None,
             latest_closed_alpaca=alpaca_latest.isoformat() if alpaca_latest else None,
-            note="no overlapping closed bar dates",
+            note="; ".join(alignment_notes),
         )
 
     max_diff = max(diffs_pct) if diffs_pct else 0.0
     mean_diff = sum(diffs_pct) / len(diffs_pct) if diffs_pct else 0.0
-    diverged = max_diff > tolerance_pct or latest_agrees is False
-    note = ""
+    diverged = bool(alignment_notes) or max_diff > tolerance_pct or latest_agrees is False
+    notes = list(alignment_notes)
     if max_diff > tolerance_pct:
-        note = f"close diff {max_diff:.3f}% exceeds {tolerance_pct}% tolerance"
-    elif latest_agrees is False:
-        note = "sources disagree on the most recent closed bar"
+        notes.append(f"close diff {max_diff:.3f}% exceeds {tolerance_pct}% tolerance")
+    if latest_agrees is False:
+        notes.append("sources disagree on the most recent closed bar")
 
     return TickerComparison(
         ticker,
@@ -225,7 +237,7 @@ def compare_ticker(
         latest_closed_agrees=latest_agrees,
         latest_closed_yf=yf_latest.isoformat() if yf_latest else None,
         latest_closed_alpaca=alpaca_latest.isoformat() if alpaca_latest else None,
-        note=note,
+        note="; ".join(notes),
     )
 
 
