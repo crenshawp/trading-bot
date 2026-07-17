@@ -171,6 +171,24 @@ def test_stock_request_always_pins_iex_feed(
     assert captured[0]["params"]["feed"] == "iex"   # explicit, never defaulted
 
 
+@pytest.mark.parametrize("feed", ["sip", "opra", "delayed_sip"])
+def test_stock_latest_quote_paid_or_unknown_feed_refused_before_io(
+    monkeypatch: pytest.MonkeyPatch,
+    feed: str,
+) -> None:
+    _with_creds(monkeypatch)
+    attempts: list[dict[str, Any]] = []
+    _patch_get(monkeypatch, [], capture=attempts)
+
+    result = amd.AlpacaMarketDataClient().get_stock_latest_quotes(
+        ["AAPL"], feed=feed,
+    )
+
+    assert result.ok is False
+    assert "paid data plan" in result.reason or "unknown feed" in result.reason
+    assert attempts == []
+
+
 # ───────────────────────── fetch plumbing ────────────────────────────────────
 
 
@@ -213,6 +231,89 @@ def test_crypto_bars_translate_and_key_by_internal_symbol(
     assert captured[0]["params"]["symbols"] == "BTC/USD"   # wire form
     assert result.ok is True
     assert list(result.bars.keys()) == ["BTC-USD"]         # caller's form
+
+
+def test_stock_latest_quotes_parse_and_pin_iex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_creds(monkeypatch)
+    _no_sleep(monkeypatch)
+    captured: list[dict[str, Any]] = []
+    payload = {"quotes": {"AAPL": {
+        "t": "2026-07-15T17:59:59Z",
+        "bp": 211.10,
+        "bs": 12,
+        "ap": 211.14,
+        "as": 9,
+    }}}
+    _patch_get(monkeypatch, [_FakeResp(payload)], capture=captured)
+
+    result = amd.AlpacaMarketDataClient().get_stock_latest_quotes(["AAPL"])
+
+    assert result.ok is True
+    assert captured[0]["url"].endswith("/v2/stocks/quotes/latest")
+    assert captured[0]["params"] == {"feed": "iex", "symbols": "AAPL"}
+    quote = result.quotes["AAPL"]
+    assert quote.symbol == "AAPL"
+    assert quote.bid_price == 211.10
+    assert quote.ask_price == 211.14
+    assert quote.timestamp.tzinfo is not None
+
+
+def test_crypto_latest_quotes_translate_and_key_by_internal_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_creds(monkeypatch)
+    _no_sleep(monkeypatch)
+    captured: list[dict[str, Any]] = []
+    payload = {"quotes": {"BTC/USD": {
+        "t": "2026-07-15T17:59:59Z",
+        "bp": 64_000,
+        "bs": 0.1,
+        "ap": 64_010,
+        "as": 0.2,
+    }}}
+    _patch_get(monkeypatch, [_FakeResp(payload)], capture=captured)
+
+    result = amd.AlpacaMarketDataClient().get_crypto_latest_quotes(["BTC-USD"])
+
+    assert result.ok is True
+    assert captured[0]["url"].endswith("/v1beta3/crypto/us/latest/quotes")
+    assert captured[0]["params"]["symbols"] == "BTC/USD"
+    assert result.quotes["BTC-USD"].symbol == "BTC-USD"
+
+
+def test_latest_quotes_malformed_payload_fails_soft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_creds(monkeypatch)
+    _no_sleep(monkeypatch)
+    payload = {"quotes": {"AAPL": {
+        "t": "2026-07-15T17:59:59Z", "bp": 211.10, "bs": 12,
+    }}}
+    _patch_get(monkeypatch, [_FakeResp(payload)])
+
+    result = amd.AlpacaMarketDataClient().get_stock_latest_quotes(["AAPL"])
+
+    assert result.ok is False
+    assert result.quotes == {}
+    assert "no valid quotes" in result.reason
+
+
+def test_latest_quotes_transport_failure_fails_soft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_creds(monkeypatch)
+    _no_sleep(monkeypatch)
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise OSError("offline")
+
+    monkeypatch.setattr("trading_bot.alpaca_market_data.requests.get", fail)
+    result = amd.AlpacaMarketDataClient().get_stock_latest_quotes(["AAPL"])
+
+    assert result.ok is False
+    assert "offline" in result.reason
 
 
 def test_batching_splits_large_symbol_lists(
@@ -298,3 +399,8 @@ def test_throttle_spaces_consecutive_requests(
     client.get_stock_bars(["A", "B"], start=_NOW - timedelta(days=5))
     assert sleeps                                   # the second request waited
     assert sleeps[0] == pytest.approx(0.34, abs=0.01)
+
+
+def test_default_throttle_is_safely_below_200_requests_per_minute() -> None:
+    requests_per_minute = 60.0 / amd.config.MARKETDATA_MIN_REQUEST_INTERVAL_S
+    assert requests_per_minute < 200.0

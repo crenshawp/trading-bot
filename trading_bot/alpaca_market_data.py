@@ -1,6 +1,6 @@
 """Alpaca market data client — Phase 25. FREE TIER ONLY, parallel to yfinance.
 
-A read-only bars client for Alpaca's data API used by the yfinance-vs-Alpaca
+A read-only bars/quotes client for Alpaca's data API used by the yfinance-vs-Alpaca
 COMPARISON tooling. It replaces nothing: every existing yfinance call site
 (scanner detection, resolver settlement, indicators, discovery, earnings,
 long-term confirmation, predictions, regime/VIX) is untouched and remains
@@ -86,6 +86,31 @@ class BarsResult:
     bars: dict[str, list[MarketBar]] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class MarketQuote:
+    """One latest bid/ask quote in provider-neutral form.
+
+    ``symbol`` uses the caller's symbol form (for example ``BTC-USD``), and
+    ``timestamp`` is always timezone-aware UTC.
+    """
+
+    symbol: str
+    timestamp: datetime
+    bid_price: float
+    bid_size: float
+    ask_price: float
+    ask_size: float
+
+
+@dataclass(frozen=True)
+class QuotesResult:
+    """A fail-soft latest-quotes outcome keyed by the caller's symbols."""
+
+    ok: bool = False
+    reason: str = ""
+    quotes: dict[str, MarketQuote] = field(default_factory=dict)
+
+
 # ── bar closure (the re-derived check — NOT a port of iloc[-2]) ──────────────
 
 
@@ -141,8 +166,27 @@ def _parse_bar(symbol: str, raw: dict[str, Any]) -> MarketBar | None:
         return None
 
 
+def _parse_quote(symbol: str, raw: dict[str, Any]) -> MarketQuote | None:
+    """One Alpaca quote dict to :class:`MarketQuote`; None when malformed."""
+    try:
+        timestamp = datetime.fromisoformat(str(raw["t"]))
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=UTC)
+        return MarketQuote(
+            symbol=symbol,
+            timestamp=timestamp.astimezone(UTC),
+            bid_price=float(raw["bp"]),
+            bid_size=float(raw["bs"]),
+            ask_price=float(raw["ap"]),
+            ask_size=float(raw["as"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        print(f"  marketdata: malformed quote for {symbol} ({exc})", file=sys.stderr)
+        return None
+
+
 class AlpacaMarketDataClient:
-    """Free-tier bars client. Batched, throttled, guarded, fail-soft."""
+    """Free-tier bars/quotes client. Batched, throttled, guarded, fail-soft."""
 
     def __init__(
         self,
@@ -286,6 +330,64 @@ class AlpacaMarketDataClient:
             ok=True, reason="; ".join(errors[:3]), bars=all_bars,
         )
 
+    def _fetch_latest_quotes(
+        self,
+        path: str,
+        symbols: list[str],
+        base_params: dict[str, Any],
+        *,
+        translate: bool,
+    ) -> QuotesResult:
+        """Fetch latest quotes in batches and translate wire symbols back.
+
+        Each endpoint returns one top-level ``quotes`` mapping and does not
+        paginate. Successful batches remain usable if another batch fails.
+        """
+        all_quotes: dict[str, MarketQuote] = {}
+        errors: list[str] = []
+        for i in range(0, len(symbols), self._batch_size):
+            batch = symbols[i:i + self._batch_size]
+            wire_map = {
+                (to_alpaca_symbol(s) if translate else s): s for s in batch
+            }
+            params = dict(base_params)
+            params["symbols"] = ",".join(wire_map.keys())
+            ok, status, body, error = self._get(path, params)
+            if not ok:
+                errors.append(error)
+                continue
+            if status == 429:
+                errors.append("rate limited (HTTP 429) - free tier is 200 rpm")
+                continue
+            if status is None or not (200 <= status < 300):
+                message = str(body.get("message", "")) if isinstance(body, dict) else ""
+                errors.append(message or f"HTTP {status}")
+                continue
+            raw_quotes = body.get("quotes") if isinstance(body, dict) else None
+            if not isinstance(raw_quotes, dict):
+                errors.append("malformed quote response")
+                continue
+            parsed_in_batch = 0
+            for wire_symbol, raw in raw_quotes.items():
+                caller_symbol = wire_map.get(str(wire_symbol), str(wire_symbol))
+                if not isinstance(raw, dict):
+                    print(
+                        f"  marketdata: malformed quote for {caller_symbol}",
+                        file=sys.stderr,
+                    )
+                    continue
+                quote = _parse_quote(caller_symbol, raw)
+                if quote is not None:
+                    all_quotes[caller_symbol] = quote
+                    parsed_in_batch += 1
+            if raw_quotes and parsed_in_batch == 0:
+                errors.append("no valid quotes in response")
+        if not all_quotes and errors:
+            return QuotesResult(ok=False, reason="; ".join(errors[:3]))
+        return QuotesResult(
+            ok=True, reason="; ".join(errors[:3]), quotes=all_quotes,
+        )
+
     # ── public fetches ───────────────────────────────────────────────────────
 
     def get_stock_bars(
@@ -342,4 +444,34 @@ class AlpacaMarketDataClient:
             params["end"] = end.astimezone(UTC).isoformat()
         return self._fetch_batched(
             "/v1beta3/crypto/us/bars", symbols, params, translate=True,
+        )
+
+    def get_stock_latest_quotes(
+        self,
+        symbols: list[str],
+        *,
+        feed: str = FEED_IEX,
+    ) -> QuotesResult:
+        """Latest stock quotes explicitly pinned to the free IEX feed.
+
+        Paid or unknown feeds are refused before credentials or network I/O.
+        """
+        refusal = self._feed_refusal(feed)
+        if refusal is not None:
+            print(f"  marketdata: {refusal}", file=sys.stderr)
+            return QuotesResult(ok=False, reason=refusal)
+        return self._fetch_latest_quotes(
+            "/v2/stocks/quotes/latest",
+            symbols,
+            {"feed": FEED_IEX},
+            translate=False,
+        )
+
+    def get_crypto_latest_quotes(self, symbols: list[str]) -> QuotesResult:
+        """Latest free crypto quotes, translating ``BTC-USD`` to ``BTC/USD``."""
+        return self._fetch_latest_quotes(
+            "/v1beta3/crypto/us/latest/quotes",
+            symbols,
+            {},
+            translate=True,
         )

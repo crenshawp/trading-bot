@@ -92,9 +92,12 @@ def test_todays_forming_bars_do_not_count_as_latest_closed(tmp_db: Path) -> None
     })
     bars = [
         _alpaca_bar("2026-07-14", 101.00),
-        _alpaca_bar("2026-07-15", 998.0),        # today's partial Alpaca bar
+        _alpaca_bar("2026-07-15", 1.0),          # wildly different, still ignored
     ]
     result = mc.compare_ticker("AAPL", yf_df, bars, now=_NOW)
+    assert result.status == mc.STATUS_MATCH
+    assert result.bars_compared == 1
+    assert result.max_close_diff_pct == 0.0
     assert result.latest_closed_yf == "2026-07-14"
     assert result.latest_closed_alpaca == "2026-07-14"
     assert result.latest_closed_agrees is True
@@ -189,6 +192,32 @@ def test_compare_universe_one_bad_ticker_never_sinks_the_report(
     by_ticker = {r.ticker: r.status for r in report.results}
     assert by_ticker["AAPL"] == mc.STATUS_MATCH      # processed despite BAD
     assert by_ticker["BAD"].startswith("missing")
+
+
+def test_compare_universe_window_caps_to_most_recent_closed_matches(
+    tmp_db: Path,
+) -> None:
+    client = _FakeClient(stock_bars={"AAPL": [
+        _alpaca_bar("2026-07-12", 200.00),       # old, divergent, outside window
+        _alpaca_bar("2026-07-13", 101.02),
+        _alpaca_bar("2026-07-14", 102.02),
+    ]})
+    frame = _yf_df({
+        "2026-07-12": 100.00,
+        "2026-07-13": 101.00,
+        "2026-07-14": 102.00,
+    })
+
+    report = mc.compare_universe(
+        ["AAPL"], window_bars=2, now=_NOW,
+        client=client,  # type: ignore[arg-type]
+        yf_fetch=lambda _t, _w: frame,
+    )
+
+    result = report.results[0]
+    assert result.status == mc.STATUS_MATCH
+    assert result.bars_compared == 2
+    assert result.max_close_diff_pct == pytest.approx(0.0198, abs=0.001)
 
 
 # ───────────────────────── CLI ───────────────────────────────────────────────

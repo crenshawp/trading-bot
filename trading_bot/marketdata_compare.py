@@ -26,6 +26,7 @@ from trading_bot import config, db
 from trading_bot.alpaca_market_data import (
     AlpacaMarketDataClient,
     MarketBar,
+    bar_is_closed,
     latest_closed_bar,
 )
 from trading_bot.discovery_universe import SHADOW_UNIVERSE
@@ -150,6 +151,7 @@ def compare_ticker(
     *,
     now: datetime,
     tolerance_pct: float = config.MD_COMPARE_TOLERANCE_PCT,
+    window_bars: int = config.MD_COMPARE_WINDOW_BARS,
 ) -> TickerComparison:
     """Compare one ticker's daily bars from both sources. Pure — no I/O."""
     yf_closes = _yf_closes_by_date(yf_df) if yf_df is not None else {}
@@ -180,14 +182,21 @@ def compare_ticker(
         if yf_latest is not None and alpaca_latest is not None else None
     )
 
-    # Close-price agreement across the overlapping dates, tolerance-based.
-    shared_dates = sorted(set(yf_closes) & set(alpaca_closes))
+    # Close-price agreement uses CLOSED rows only. In particular, today's
+    # partial rows must not affect either tolerance metrics or bar counts.
+    today_et = now.astimezone(_ET).date()
+    yf_closed = {d: close for d, close in yf_closes.items() if d < today_et}
+    alpaca_closed = _alpaca_closes_by_date([
+        bar for bar in alpaca_bars if bar_is_closed(bar, "1Day", now)
+    ])
+    shared_dates = sorted(set(yf_closed) & set(alpaca_closed))
+    shared_dates = shared_dates[-max(1, window_bars):]
     diffs_pct: list[float] = []
     for d in shared_dates:
-        yf_close = yf_closes[d]
+        yf_close = yf_closed[d]
         if yf_close == 0.0:
             continue
-        diffs_pct.append(abs(alpaca_closes[d] - yf_close) / yf_close * 100.0)
+        diffs_pct.append(abs(alpaca_closed[d] - yf_close) / yf_close * 100.0)
 
     if not shared_dates:
         return TickerComparison(
@@ -195,7 +204,7 @@ def compare_ticker(
             latest_closed_agrees=latest_agrees,
             latest_closed_yf=yf_latest.isoformat() if yf_latest else None,
             latest_closed_alpaca=alpaca_latest.isoformat() if alpaca_latest else None,
-            note="no overlapping bar dates",
+            note="no overlapping closed bar dates",
         )
 
     max_diff = max(diffs_pct) if diffs_pct else 0.0
@@ -269,6 +278,7 @@ def compare_universe(
             results.append(compare_ticker(
                 ticker, yf_df, alpaca_bars.get(ticker, []),
                 now=moment, tolerance_pct=tolerance_pct,
+                window_bars=window_bars,
             ))
         except Exception as exc:  # noqa: BLE001 - one ticker must never sink the report
             print(f"  compare: error on {ticker} ({exc})", file=sys.stderr)
