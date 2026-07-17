@@ -4,6 +4,7 @@ import os
 from unittest.mock import patch
 
 import pytest
+from keyring.errors import NoKeyringError
 
 import trading_bot.secrets as secrets_module
 
@@ -80,3 +81,33 @@ def test_get_required_railway_message(railway_env: None) -> None:
         pytest.raises(KeyError, match="Railway dashboard"),
     ):
         secrets_module.get_required("NEWSAPI_KEY")
+
+
+# --- Keyring backend failure: must fail soft, never propagate ---
+
+
+def test_get_secret_fails_soft_when_keyring_backend_missing(local_env: None) -> None:
+    """A missing/broken keyring backend degrades to None, it does not raise."""
+    with (
+        patch("keyring.get_password", side_effect=NoKeyringError("no backend")),
+        patch.object(secrets_module, "_read_env_file", return_value={}),
+    ):
+        assert secrets_module.get_secret("NEWSAPI_KEY") is None
+
+
+def test_get_secret_falls_back_to_env_when_keyring_raises(local_env: None) -> None:
+    """When keyring raises, the .env fallback is still consulted."""
+    with (
+        patch("keyring.get_password", side_effect=NoKeyringError("no backend")),
+        patch.object(secrets_module, "_read_env_file", return_value={"NEWSAPI_KEY": "from_env"}),
+    ):
+        assert secrets_module.get_secret("NEWSAPI_KEY") == "from_env"
+
+
+def test_list_secrets_fails_soft_when_keyring_raises(local_env: None) -> None:
+    """list_secrets degrades to the .env view rather than crashing."""
+    with (
+        patch("keyring.get_password", side_effect=NoKeyringError("no backend")),
+        patch.object(secrets_module, "_read_env_file", return_value={"PUSHOVER_USER_KEY": "x"}),
+    ):
+        assert secrets_module.list_secrets() == ["PUSHOVER_USER_KEY"]
