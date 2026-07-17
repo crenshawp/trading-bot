@@ -1800,6 +1800,19 @@ def cmd_longterm_positions() -> None:
 # ---- market data comparison CLI (Phase 25) ----
 
 
+def _positive_marketdata_window(value: str) -> int:
+    """Argparse converter for a strictly positive daily-bar count."""
+    try:
+        window = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "--window must be a positive integer",
+        ) from None
+    if window <= 0:
+        raise argparse.ArgumentTypeError("--window must be a positive integer")
+    return window
+
+
 def cmd_marketdata_compare(
     *, tickers: str | None = None, window: int | None = None,
 ) -> None:
@@ -2429,7 +2442,7 @@ def main() -> None:
              "+ crypto)",
     )
     md_compare_p.add_argument(
-        "--window", type=int, default=None,
+        "--window", type=_positive_marketdata_window, default=None,
         help=f"Daily bars to compare (default {config.MD_COMPARE_WINDOW_BARS})",
     )
 

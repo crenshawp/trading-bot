@@ -274,6 +274,30 @@ def test_compare_universe_window_caps_to_most_recent_closed_matches(
     assert result.max_close_diff_pct == pytest.approx(0.0198, abs=0.001)
 
 
+@pytest.mark.parametrize("window_bars", [0, -1])
+def test_compare_ticker_rejects_nonpositive_windows(
+    tmp_db: Path,
+    window_bars: int,
+) -> None:
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        mc.compare_ticker(
+            "AAPL",
+            _yf_df({"2026-07-14": 101.0}),
+            [_alpaca_bar("2026-07-14", 101.0)],
+            now=_NOW,
+            window_bars=window_bars,
+        )
+
+
+@pytest.mark.parametrize("window_bars", [0, -1])
+def test_compare_universe_rejects_nonpositive_windows(
+    tmp_db: Path,
+    window_bars: int,
+) -> None:
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        mc.compare_universe([], now=_NOW, window_bars=window_bars)
+
+
 # ───────────────────────── CLI ───────────────────────────────────────────────
 
 
@@ -312,6 +336,28 @@ def test_cli_marketdata_compare_prints_report(
     assert "diagnostic only" in out
     assert captured_args["tickers"] == ["AAPL", "MSFT"]
     assert captured_args["window_bars"] == 5
+
+
+@pytest.mark.parametrize("raw_window", ["0", "-2", "not-an-integer"])
+def test_cli_marketdata_compare_rejects_nonpositive_or_invalid_window(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    raw_window: str,
+) -> None:
+    from trading_bot import __main__ as m
+
+    monkeypatch.setattr(
+        m.sys,
+        "argv",
+        ["trading_bot", "marketdata", "compare", "--window", raw_window],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        m.main()
+
+    assert exc_info.value.code == 2
+    assert "--window must be a positive integer" in capsys.readouterr().err
 
 
 def test_default_universe_dedupes_and_includes_crypto(tmp_db: Path) -> None:

@@ -43,6 +43,15 @@ STATUS_MISSING_YFINANCE = "missing_yfinance"
 YfFetch = Callable[[str, int], "pd.DataFrame | None"]
 
 
+def validate_window_bars(window_bars: int) -> int:
+    """Return a valid comparison window or raise before any provider I/O."""
+    if isinstance(window_bars, bool) or not isinstance(window_bars, int):
+        raise ValueError("window_bars must be a positive integer")
+    if window_bars <= 0:
+        raise ValueError("window_bars must be a positive integer")
+    return window_bars
+
+
 @dataclass(frozen=True)
 class TickerComparison:
     """One ticker's agreement/discrepancy summary."""
@@ -154,6 +163,7 @@ def compare_ticker(
     window_bars: int = config.MD_COMPARE_WINDOW_BARS,
 ) -> TickerComparison:
     """Compare one ticker's daily bars from both sources. Pure — no I/O."""
+    window_size = validate_window_bars(window_bars)
     yf_closes = _yf_closes_by_date(yf_df) if yf_df is not None else {}
     alpaca_closes = _alpaca_closes_by_date(alpaca_bars)
 
@@ -189,7 +199,6 @@ def compare_ticker(
     alpaca_closed = _alpaca_closes_by_date([
         bar for bar in alpaca_bars if bar_is_closed(bar, "1Day", now)
     ])
-    window_size = max(1, window_bars)
     yf_window_dates = set(sorted(yf_closed)[-window_size:])
     alpaca_window_dates = set(sorted(alpaca_closed)[-window_size:])
     shared_dates = sorted(yf_window_dates & alpaca_window_dates)
@@ -257,6 +266,7 @@ def compare_universe(
     is fetched per ticker, fail-soft. ``window_bars`` daily bars are compared;
     the fetch window is padded for weekends/holidays.
     """
+    window_bars = validate_window_bars(window_bars)
     moment = now if now is not None else datetime.now(UTC)
     md = client if client is not None else AlpacaMarketDataClient()
     window_days = window_bars * 2 + 5              # pad for non-trading days
