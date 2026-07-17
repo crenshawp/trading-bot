@@ -16,6 +16,7 @@ from trading_bot import (
     discovery,
     discovery_universe,
     long_term,
+    marketdata_compare,
     outcomes,
     performance,
     plan_execution,
@@ -1796,6 +1797,56 @@ def cmd_longterm_positions() -> None:
         )
 
 
+# ---- market data comparison CLI (Phase 25) ----
+
+
+def cmd_marketdata_compare(
+    *, tickers: str | None = None, window: int | None = None,
+) -> None:
+    """Run the yfinance-vs-Alpaca bar comparison and print the diagnostic
+    report. DIAGNOSTIC ONLY — no consumer's behavior changes; yfinance stays
+    authoritative everywhere until a separate, deliberate cutover phase."""
+    universe = (
+        [t.strip() for t in tickers.split(",") if t.strip()]
+        if tickers else marketdata_compare.default_universe()
+    )
+    window_bars = window if window is not None else config.MD_COMPARE_WINDOW_BARS
+
+    print("MARKET DATA COMPARISON  (yfinance vs Alpaca IEX free tier)")
+    print("-" * 104)
+    print(
+        f"  Tickers: {len(universe)}   window: {window_bars} daily bars   "
+        f"tolerance: {config.MD_COMPARE_TOLERANCE_PCT}%"
+    )
+    report = marketdata_compare.compare_universe(universe, window_bars=window_bars)
+
+    print()
+    print(
+        f"  {'Ticker':<10} {'Status':<18} {'Bars':>4} {'MaxDiff%':>9} "
+        f"{'MeanDiff%':>10} {'LatestAgree':<11} Note"
+    )
+    for r in report.results:
+        max_txt = "-" if r.max_close_diff_pct is None else f"{r.max_close_diff_pct:.3f}"
+        mean_txt = (
+            "-" if r.mean_close_diff_pct is None else f"{r.mean_close_diff_pct:.3f}"
+        )
+        agree_txt = "-" if r.latest_closed_agrees is None else str(r.latest_closed_agrees)
+        print(
+            f"  {r.ticker:<10} {r.status:<18} {r.bars_compared:>4} {max_txt:>9} "
+            f"{mean_txt:>10} {agree_txt:<11} {r.note}"
+        )
+
+    print("-" * 104)
+    print(
+        f"  Summary: {report.matched} matched, {report.divergent} divergent, "
+        f"{report.missing} missing (of {len(report.results)})"
+    )
+    print(
+        "  NOTE: diagnostic only - yfinance remains authoritative for every "
+        "consumer. No cutover happens here."
+    )
+
+
 # ---- risk-of-ruin CLI (Phase 15) ----
 
 
@@ -2368,6 +2419,20 @@ def main() -> None:
     longterm_sub.add_parser("candidates")
     longterm_sub.add_parser("positions")
 
+    # marketdata (Phase 25) — yfinance-vs-Alpaca comparison, diagnostic only
+    md_parser = sub.add_parser("marketdata")
+    md_sub = md_parser.add_subparsers(dest="marketdata_cmd", required=True)
+    md_compare_p = md_sub.add_parser("compare")
+    md_compare_p.add_argument(
+        "--tickers", type=str, default=None,
+        help="Comma-separated subset (default: watchlist + shadow universe "
+             "+ crypto)",
+    )
+    md_compare_p.add_argument(
+        "--window", type=int, default=None,
+        help=f"Daily bars to compare (default {config.MD_COMPARE_WINDOW_BARS})",
+    )
+
     # predictions (Phase 2.2b)
     pred_parser = sub.add_parser("predictions")
     pred_sub = pred_parser.add_subparsers(dest="predictions_cmd", required=True)
@@ -2562,6 +2627,9 @@ def main() -> None:
             cmd_longterm_candidates()
         elif args.longterm_cmd == "positions":
             cmd_longterm_positions()
+    elif args.command == "marketdata":
+        if args.marketdata_cmd == "compare":
+            cmd_marketdata_compare(tickers=args.tickers, window=args.window)
     elif args.command == "predictions":
         if args.predictions_cmd == "enable":
             cmd_predictions_enable()

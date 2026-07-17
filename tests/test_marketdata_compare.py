@@ -191,6 +191,46 @@ def test_compare_universe_one_bad_ticker_never_sinks_the_report(
     assert by_ticker["BAD"].startswith("missing")
 
 
+# ───────────────────────── CLI ───────────────────────────────────────────────
+
+
+def test_cli_marketdata_compare_prints_report(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import __main__ as m
+
+    fake_report = mc.ComparisonReport(results=[
+        mc.TickerComparison(
+            "AAPL", mc.STATUS_MATCH, bars_compared=5,
+            max_close_diff_pct=0.02, mean_close_diff_pct=0.01,
+            latest_closed_agrees=True, latest_closed_yf="2026-07-14",
+            latest_closed_alpaca="2026-07-14",
+        ),
+        mc.TickerComparison(
+            "MSFT", mc.STATUS_DIVERGENT, bars_compared=5,
+            max_close_diff_pct=1.25, mean_close_diff_pct=0.60,
+            latest_closed_agrees=True,
+            note="close diff 1.250% exceeds 0.5% tolerance",
+        ),
+    ])
+    captured_args: dict[str, object] = {}
+
+    def fake_compare(tickers: list[str], **kw: object) -> mc.ComparisonReport:
+        captured_args["tickers"] = tickers
+        captured_args.update(kw)
+        return fake_report
+
+    monkeypatch.setattr(m.marketdata_compare, "compare_universe", fake_compare)
+    m.cmd_marketdata_compare(tickers="AAPL,MSFT", window=5)
+    out = capsys.readouterr().out
+    assert "MARKET DATA COMPARISON" in out
+    assert "1 matched, 1 divergent, 0 missing" in out
+    assert "diagnostic only" in out
+    assert captured_args["tickers"] == ["AAPL", "MSFT"]
+    assert captured_args["window_bars"] == 5
+
+
 def test_default_universe_dedupes_and_includes_crypto(tmp_db: Path) -> None:
     universe = mc.default_universe()
     assert len(universe) == len(set(universe))       # deduped
