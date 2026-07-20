@@ -1623,7 +1623,7 @@ def _pass(flag: bool) -> str:
     return "ok " if flag else "-- "
 
 
-def cmd_options_chain(ticker: str) -> None:
+def cmd_options_chain(ticker: str, min_dte: int = 0) -> None:
     """Show the current option chain with per-contract delta / liquidity / DTE
     floor pass-fail marks (the same gates the selector applies)."""
     chain = broker.AlpacaOptionsClient().get_option_chain(ticker)
@@ -1642,6 +1642,8 @@ def cmd_options_chain(ticker: str) -> None:
             dte: int | None = (date.fromisoformat(c.expiry) - today).days
         except ValueError:
             dte = None
+        if min_dte > 0 and (dte is None or dte < min_dte):
+            continue
         delta_ok = (
             c.delta is not None
             and config.TARGET_DELTA_LOW <= abs(c.delta) <= config.TARGET_DELTA_HIGH
@@ -2424,6 +2426,12 @@ def main() -> None:
     options_sub = options_parser.add_subparsers(dest="options_cmd", required=True)
     opt_chain_p = options_sub.add_parser("chain")
     opt_chain_p.add_argument("ticker", help="Underlying ticker, e.g. AAPL")
+    opt_chain_p.add_argument(
+        "--min-dte",
+        type=int,
+        default=0,
+        help="Exclude contracts with fewer days to expiry than this (e.g. 1 to skip 0DTE).",
+    )
     options_sub.add_parser("positions")
 
     # long-term (Phase 14) — buy-and-hold, stocks + crypto
@@ -2632,7 +2640,7 @@ def main() -> None:
             cmd_allocate_execute(confirm=args.confirm, sample=args.sample)
     elif args.command == "options":
         if args.options_cmd == "chain":
-            cmd_options_chain(args.ticker)
+            cmd_options_chain(args.ticker, min_dte=args.min_dte)
         elif args.options_cmd == "positions":
             cmd_options_positions()
     elif args.command == "longterm":
