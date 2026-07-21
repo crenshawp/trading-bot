@@ -10,12 +10,13 @@ forward testing — testing it now would be brittle and out of scope
 
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import keyring
+import pandas as pd
 import pytest
 
 from trading_bot import db, scanner
@@ -29,6 +30,118 @@ def _set_all_secrets() -> None:
     keyring.set_password(_SERVICE, "PUSHOVER_USER_KEY", "pu_test")
     keyring.set_password(_SERVICE, "PUSHOVER_APP_TOKEN", "pa_test")
     keyring.set_password(_SERVICE, "NEWSAPI_KEY", "news_test")
+
+
+def _crypto_detector_frame() -> pd.DataFrame:
+    """Two closed no-signal bars followed by a signal-shaped forming bar."""
+    rows = [
+        {
+            "Close": 100.0, "RSI": 50.0, "ATR": 2.0, "ATR_MA20": 2.0,
+            "Volume": 100.0, "Vol_MA20": 100.0,
+            "BB_upper": 120.0, "BB_lower": 90.0,
+            "Recent_High": 120.0, "Recent_Low": 90.0, "ROC_Accel": 0.0,
+        },
+        {
+            "Close": 100.0, "RSI": 20.0, "ATR": 2.0, "ATR_MA20": 2.0,
+            "Volume": 100.0, "Vol_MA20": 100.0,
+            "BB_upper": 120.0, "BB_lower": 90.0,
+            "Recent_High": 120.0, "Recent_Low": 90.0, "ROC_Accel": 0.0,
+        },
+        {
+            "Close": 91.0, "RSI": 30.0, "ATR": 2.0, "ATR_MA20": 2.0,
+            "Volume": 200.0, "Vol_MA20": 100.0,
+            "BB_upper": 120.0, "BB_lower": 90.0,
+            "Recent_High": 120.0, "Recent_Low": 90.0, "ROC_Accel": 0.0,
+        },
+    ]
+    return pd.DataFrame(
+        rows,
+        index=pd.date_range("2026-07-21 10:00", periods=3, freq="h", tz="UTC"),
+    )
+
+
+def test_crypto_detector_excludes_signal_shaped_forming_bar() -> None:
+    frame = _crypto_detector_frame()
+    now = datetime(2026, 7, 21, 12, 30, tzinfo=UTC)
+
+    signals = scanner.detect_crypto_signals("BTC-USD", frame, now=now)
+
+    assert signals == []
+
+
+def test_crypto_detector_keeps_latest_row_when_forming_row_is_absent() -> None:
+    frame = _crypto_detector_frame().iloc[1:]
+    now = datetime(2026, 7, 21, 13, 30, tzinfo=UTC)
+
+    signals = scanner.detect_crypto_signals("BTC-USD", frame, now=now)
+
+    assert [signal["setup"] for signal in signals] == ["Oversold Reversal"]
+    assert signals[0]["price"] == pytest.approx(91.0)
+
+
+def test_crypto_detector_includes_bar_at_exact_close_boundary() -> None:
+    frame = _crypto_detector_frame()
+    now = datetime(2026, 7, 21, 13, 0, tzinfo=UTC)
+
+    signals = scanner.detect_crypto_signals("BTC-USD", frame, now=now)
+
+    assert [signal["setup"] for signal in signals] == ["Oversold Reversal"]
+    assert signals[0]["price"] == pytest.approx(91.0)
+
+
+def test_crypto_closure_converts_aware_index_to_utc() -> None:
+    frame = pd.DataFrame(
+        {"Close": [100.0, 101.0]},
+        index=pd.date_range(
+            "2026-07-21 08:00", periods=2, freq="h", tz="America/New_York",
+        ),
+    )
+    now = datetime(2026, 7, 21, 13, 30, tzinfo=UTC)
+
+    closed = scanner._closed_hourly_crypto_bars(frame, now)
+
+    assert closed.index.tolist() == [frame.index[0]]
+
+
+def test_crypto_closure_treats_naive_index_as_utc() -> None:
+    frame = pd.DataFrame(
+        {"Close": [100.0, 101.0]},
+        index=pd.date_range("2026-07-21 12:00", periods=2, freq="h"),
+    )
+    now = datetime(2026, 7, 21, 13, 30, tzinfo=UTC)
+
+    closed = scanner._closed_hourly_crypto_bars(frame, now)
+
+    assert closed.index.tolist() == [frame.index[0]]
+
+
+def test_crypto_detector_fails_soft_when_closed_history_is_insufficient(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    frame = _crypto_detector_frame().iloc[:2]
+    now = datetime(2026, 7, 21, 11, 30, tzinfo=UTC)
+
+    assert scanner.detect_crypto_signals("BTC-USD", frame, now=now) == []
+    assert (
+        "crypto insufficient closed candles for BTC-USD: "
+        "1 available, 2 required"
+    ) in capsys.readouterr().err
+
+
+def test_scan_crypto_production_path_excludes_forming_bar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(scanner, "CRYPTO_WATCHLIST", ["BTC-USD"])
+    monkeypatch.setattr(
+        scanner, "get_crypto_data", lambda _ticker: _crypto_detector_frame(),
+    )
+    monkeypatch.setattr(scanner, "add_crypto_indicators", lambda frame: frame)
+    monkeypatch.setattr(scanner, "send_notification", sent.append)
+
+    scanner.scan_crypto(now=datetime(2026, 7, 21, 12, 30, tzinfo=UTC))
+
+    assert sent == []
 
 
 # ───────────────────────── log_signal ─────────────────────────

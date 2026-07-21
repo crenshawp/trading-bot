@@ -1576,7 +1576,51 @@ def detect_stock_signals(ticker, df):
 # Proven 56-61% win rate on BTC, BNB, ETH on hourly candles
 # ══════════════════════════════════════════════════════════════════════════════
 
-def detect_crypto_signals(ticker, df):
+def _closed_hourly_crypto_bars(
+    df: pd.DataFrame, now: datetime,
+) -> pd.DataFrame:
+    """Return only hourly crypto bars whose full interval has elapsed.
+
+    yfinance indexes intraday rows by bar-open timestamp, so a row is closed
+    only when ``open + 1 hour <= now``. Timezone-aware indexes are normalized
+    to UTC before comparison. A naive crypto index is conservatively treated
+    as UTC too; it is never reinterpreted in the host machine's local timezone.
+    """
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("crypto scan now must be timezone-aware")
+
+    index = pd.DatetimeIndex(pd.to_datetime(df.index))
+    opens_utc = (
+        index.tz_localize("UTC")
+        if index.tz is None
+        else index.tz_convert("UTC")
+    )
+    comparison_now = pd.Timestamp(now).tz_convert("UTC")
+
+    bar_ends = opens_utc + pd.Timedelta(hours=1)
+    return df.loc[bar_ends <= comparison_now]
+
+
+def detect_crypto_signals(
+    ticker, df, *, now: datetime | None = None,
+):
+    comparison_now = now if now is not None else datetime.now(UTC)
+    try:
+        df = _closed_hourly_crypto_bars(df, comparison_now)
+    except (TypeError, ValueError) as exc:
+        print(
+            f"  crypto candle timestamp error for {ticker}: {exc}",
+            file=sys.stderr,
+        )
+        return []
+    if df.shape[0] < 2:
+        print(
+            f"  crypto insufficient closed candles for {ticker}: "
+            f"{df.shape[0]} available, 2 required",
+            file=sys.stderr,
+        )
+        return []
+
     signals = []
 
     latest = df.iloc[-1]
@@ -1997,7 +2041,7 @@ def _run_shadow_scan() -> None:
         print(f"  shadow scan error: {exc}", file=sys.stderr)
 
 
-def scan_crypto():
+def scan_crypto(*, now: datetime | None = None):
     """Runs every hour, 24/7 — hourly candles, short term trades"""
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scanning crypto...")
     for ticker in CRYPTO_WATCHLIST:
@@ -2007,7 +2051,7 @@ def scan_crypto():
                 print(f"  {ticker}: No data")
                 continue
             df      = add_crypto_indicators(df)
-            signals = detect_crypto_signals(ticker, df)
+            signals = detect_crypto_signals(ticker, df, now=now)
             for s in signals:
                 send_notification(s)
             if not signals:
