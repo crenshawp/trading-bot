@@ -20,6 +20,7 @@ fail soft (``reason='ALPACA credentials unset'``) and nothing is sent.
 from __future__ import annotations
 
 import dataclasses
+import math
 import re
 import sys
 from collections.abc import Mapping
@@ -30,6 +31,9 @@ import requests
 
 from trading_bot import secrets
 from trading_bot.broker.base import (
+    ORDER_LOOKUP_FOUND,
+    ORDER_LOOKUP_NOT_FOUND,
+    ORDER_LOOKUP_UNAVAILABLE,
     ORDER_TYPE_LIMIT,
     STATUS_CANCELED,
     STATUS_ERROR,
@@ -44,6 +48,7 @@ from trading_bot.broker.base import (
     VALID_TIF,
     AccountInfo,
     Broker,
+    OrderLookupResult,
     OrderResult,
     OrdersResult,
     Position,
@@ -431,6 +436,77 @@ class AlpacaBroker(Broker):
         if parsed.order_id is None:
             parsed = dataclasses.replace(parsed, order_id=order_id)
         return parsed
+
+    def get_order_by_client_order_id(
+        self, client_order_id: str,
+    ) -> OrderLookupResult:
+        """Look up one order using Alpaca's provider correlation identity.
+
+        Only an HTTP 404 becomes ``not_found``. Every other unusable response,
+        including a 2xx payload without the requested identity, remains
+        ``unavailable`` so restart recovery cannot abandon an ambiguous order.
+        Synthetic ``legacy-*`` IDs are local compatibility keys and are refused
+        before the HTTP chokepoint.
+        """
+        if not client_order_id or client_order_id.startswith("legacy-"):
+            return OrderLookupResult(
+                outcome=ORDER_LOOKUP_UNAVAILABLE,
+                reason="client order ID is not eligible for provider lookup",
+            )
+        resp = self._request(
+            "GET",
+            "/v2/orders:by_client_order_id",
+            params={"client_order_id": client_order_id},
+        )
+        if resp.ok and resp.status_code == 404:
+            return OrderLookupResult(
+                outcome=ORDER_LOOKUP_NOT_FOUND,
+                reason=self._error_reason(resp),
+            )
+        if not self._succeeded(resp):
+            return OrderLookupResult(
+                outcome=ORDER_LOOKUP_UNAVAILABLE,
+                reason=self._log_unavailable("order by client ID", resp),
+            )
+        if not isinstance(resp.body, dict):
+            print(
+                "  broker: order by client ID unavailable "
+                "(malformed response body)",
+                file=sys.stderr,
+            )
+            return OrderLookupResult(
+                outcome=ORDER_LOOKUP_UNAVAILABLE,
+                reason="malformed order lookup response",
+            )
+        parsed = _parse_order(resp.body)
+        raw_filled_qty = _to_float(resp.body.get("filled_qty"))
+        raw_filled_avg = _to_float(resp.body.get("filled_avg_price"))
+        if (
+            parsed.order_id is None
+            or not parsed.order_id.strip()
+            or parsed.client_order_id != client_order_id
+            or parsed.raw_status is None
+            or not parsed.raw_status.strip()
+            or raw_filled_qty is None
+            or not math.isfinite(raw_filled_qty)
+            or raw_filled_qty < 0
+            or (raw_filled_qty > 0 and (
+                raw_filled_avg is None
+                or not math.isfinite(raw_filled_avg)
+                or raw_filled_avg <= 0
+            ))
+            or (raw_filled_qty == 0 and raw_filled_avg is not None)
+        ):
+            print(
+                "  broker: order by client ID unavailable "
+                "(malformed order identity/status)",
+                file=sys.stderr,
+            )
+            return OrderLookupResult(
+                outcome=ORDER_LOOKUP_UNAVAILABLE,
+                reason="malformed order lookup response",
+            )
+        return OrderLookupResult(outcome=ORDER_LOOKUP_FOUND, order=parsed)
 
     def cancel_order(self, order_id: str) -> OrderResult:
         # Alpaca returns 204 No Content on a successful cancel.

@@ -353,17 +353,18 @@ def record_shares_position(
     ))
 
 
-def _capture_execution_intent(
+def _submit_execution_with_intent(
+    broker: Broker,
     decision: ExecutionDecision,
-    order: OrderResult,
     *,
-    accepted_at: datetime,
+    submitted_at: datetime,
     signal_id: int | None,
     tp: float | None,
     sl: float | None,
     deadline: datetime | None,
-) -> int:
-    """Capture the already-selected option/share intent without re-selection."""
+    time_in_force: str,
+) -> OrderResult:
+    """Prepare the already-selected intent, submit once, and bind its reply."""
     contract = decision.contract
     if contract is not None:
         ticker = contract.underlying
@@ -401,8 +402,8 @@ def _capture_execution_intent(
             "materialization intent was not durably captured"
         )
 
-    return order_lifecycle.capture_accepted_order(
-        order,
+    return order_lifecycle.submit_prepared_order(
+        broker,
         ticker=ticker,
         broker_symbol=decision.symbol,
         asset_class=asset_class,
@@ -411,9 +412,11 @@ def _capture_execution_intent(
         side=decision.side,
         requested_qty=decision.qty,
         requested_limit_price=_limit_price_for(decision),
-        accepted_at=accepted_at,
+        submitted_at=submitted_at,
         signal_id=signal_id,
         intent_payload=intent_payload,
+        order_type=ORDER_TYPE_LIMIT,
+        time_in_force=time_in_force,
     )
 
 
@@ -434,18 +437,19 @@ def execute_decision(
     data (Phase 19 — previously untracked). Returns ``(order_result,
     position_row_id | None)`` — the id belongs to whichever table matches the
     vehicle. A rejected/errored order records nothing anywhere."""
-    order = submit_execution_order(broker, decision, time_in_force=time_in_force)
+    order = _submit_execution_with_intent(
+        broker,
+        decision,
+        submitted_at=opened_at,
+        signal_id=signal_id,
+        tp=tp,
+        sl=sl,
+        deadline=deadline,
+        time_in_force=time_in_force,
+    )
+    risk_of_ruin.record_broker_result(order.ok)
     position_id: int | None = None
     if order.ok:
-        _capture_execution_intent(
-            decision,
-            order,
-            accepted_at=opened_at,
-            signal_id=signal_id,
-            tp=tp,
-            sl=sl,
-            deadline=deadline,
-        )
         if decision.contract is not None:
             position_id = record_option_position(
                 decision, order, opened_at=opened_at, signal_id=signal_id,

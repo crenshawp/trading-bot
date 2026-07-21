@@ -207,6 +207,27 @@ def test_fake_get_order_not_found_and_failsoft() -> None:
     assert b.cancel_order("nope").ok is False
 
 
+def test_fake_client_order_lookup_distinguishes_found_not_found_and_unavailable() -> None:
+    b = FakeBroker()
+    submitted = b.submit_order(
+        "MSFT",
+        5,
+        broker.SIDE_BUY,
+        limit_price=400.0,
+        client_order_id="tradingbot-client-1",
+    )
+    found = b.get_order_by_client_order_id("tradingbot-client-1")
+    missing = b.get_order_by_client_order_id("tradingbot-missing")
+    unavailable = FakeBroker(fail=True).get_order_by_client_order_id(
+        "tradingbot-client-1"
+    )
+
+    assert found.outcome == broker.ORDER_LOOKUP_FOUND
+    assert found.order == submitted
+    assert missing.outcome == broker.ORDER_LOOKUP_NOT_FOUND
+    assert unavailable.outcome == broker.ORDER_LOOKUP_UNAVAILABLE
+
+
 def test_fake_list_orders_filters() -> None:
     b = FakeBroker()
     b.submit_order("MSFT", 5, broker.SIDE_BUY, limit_price=400.0)
@@ -540,6 +561,89 @@ def test_alpaca_get_order_transport_error(
     res = alpaca.AlpacaBroker().get_order("o1")
     assert res.status == broker.STATUS_ERROR
     assert res.order_id == "o1"
+
+
+def test_alpaca_get_order_by_client_id_success_uses_exact_endpoint_and_param(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_creds(monkeypatch)
+    capture: list[dict[str, object]] = []
+    _patch_request(monkeypatch, _FakeResp(200, {
+        "id": "o-client-1",
+        "client_order_id": "tradingbot-client-1",
+        "status": "accepted",
+        "filled_qty": "0",
+    }), capture=capture)
+
+    result = alpaca.AlpacaBroker().get_order_by_client_order_id(
+        "tradingbot-client-1"
+    )
+
+    assert result.outcome == broker.ORDER_LOOKUP_FOUND
+    assert result.order is not None
+    assert result.order.order_id == "o-client-1"
+    assert capture[0]["method"] == "GET"
+    assert str(capture[0]["url"]).endswith("/v2/orders:by_client_order_id")
+    assert capture[0]["params"] == {"client_order_id": "tradingbot-client-1"}
+
+
+def test_alpaca_client_id_404_is_explicit_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_creds(monkeypatch)
+    _patch_request(monkeypatch, _FakeResp(404, {"message": "order not found"}))
+
+    result = alpaca.AlpacaBroker().get_order_by_client_order_id(
+        "tradingbot-missing"
+    )
+
+    assert result.outcome == broker.ORDER_LOOKUP_NOT_FOUND
+    assert result.order is None
+    assert result.reason == "order not found"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"client_order_id": "tradingbot-client-1", "status": "new", "filled_qty": "0"},
+        {"id": "o1", "client_order_id": "wrong", "status": "new", "filled_qty": "0"},
+        {
+            "id": "o1",
+            "client_order_id": "tradingbot-client-1",
+            "status": "new",
+            "filled_qty": "garbage",
+        },
+    ],
+)
+def test_alpaca_malformed_client_id_lookup_is_unavailable_not_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: object,
+) -> None:
+    _with_creds(monkeypatch)
+    _patch_request(monkeypatch, _FakeResp(200, payload))
+
+    result = alpaca.AlpacaBroker().get_order_by_client_order_id(
+        "tradingbot-client-1"
+    )
+
+    assert result.outcome == broker.ORDER_LOOKUP_UNAVAILABLE
+    assert result.order is None
+
+
+def test_alpaca_legacy_client_id_lookup_is_refused_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_creds(monkeypatch)
+    capture: list[dict[str, object]] = []
+    _patch_request(monkeypatch, _FakeResp(500, None), capture=capture)
+
+    result = alpaca.AlpacaBroker().get_order_by_client_order_id(
+        "legacy-broker-o1"
+    )
+
+    assert result.outcome == broker.ORDER_LOOKUP_UNAVAILABLE
+    assert capture == []
 
 
 def test_alpaca_cancel_success(monkeypatch: pytest.MonkeyPatch) -> None:

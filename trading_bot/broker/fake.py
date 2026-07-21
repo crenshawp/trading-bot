@@ -13,6 +13,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from trading_bot.broker.base import (
+    ORDER_LOOKUP_FOUND,
+    ORDER_LOOKUP_NOT_FOUND,
+    ORDER_LOOKUP_UNAVAILABLE,
     STATUS_CANCELED,
     STATUS_ERROR,
     STATUS_FILLED,
@@ -23,6 +26,7 @@ from trading_bot.broker.base import (
     VALID_TIF,
     AccountInfo,
     Broker,
+    OrderLookupResult,
     OrderResult,
     OrdersResult,
     Position,
@@ -156,6 +160,30 @@ class FakeBroker(Broker):
                 reason="order not found",
             )
         return order
+
+    def get_order_by_client_order_id(
+        self, client_order_id: str,
+    ) -> OrderLookupResult:
+        if client_order_id.startswith("legacy-"):
+            return OrderLookupResult(
+                outcome=ORDER_LOOKUP_UNAVAILABLE,
+                reason="synthetic legacy client order IDs are not provider identities",
+            )
+        if self.fail:
+            return OrderLookupResult(
+                outcome=ORDER_LOOKUP_UNAVAILABLE,
+                reason="fake broker: simulated outage",
+            )
+        for order in self._orders.values():
+            if order.client_order_id == client_order_id:
+                return OrderLookupResult(
+                    outcome=ORDER_LOOKUP_FOUND,
+                    order=order,
+                )
+        return OrderLookupResult(
+            outcome=ORDER_LOOKUP_NOT_FOUND,
+            reason="order not found",
+        )
 
     def cancel_order(self, order_id: str) -> OrderResult:
         if self.fail:

@@ -56,6 +56,19 @@ TERMINAL_STATUSES: frozenset[str] = frozenset({
     STATUS_CANCELED, STATUS_REJECTED,
 })
 
+# Client-order-ID lookup has a deliberately separate three-way result. A
+# provider-confirmed 404 is durable evidence that no order exists; transport
+# failure and malformed success payloads are retryable uncertainty and must
+# never be mistaken for that not-found fact.
+ORDER_LOOKUP_FOUND = "found"
+ORDER_LOOKUP_NOT_FOUND = "not_found"
+ORDER_LOOKUP_UNAVAILABLE = "unavailable"
+VALID_ORDER_LOOKUP_OUTCOMES: frozenset[str] = frozenset({
+    ORDER_LOOKUP_FOUND,
+    ORDER_LOOKUP_NOT_FOUND,
+    ORDER_LOOKUP_UNAVAILABLE,
+})
+
 
 @dataclass(frozen=True)
 class AccountInfo:
@@ -128,6 +141,20 @@ class OrderResult:
 
 
 @dataclass(frozen=True)
+class OrderLookupResult:
+    """Neutral result of a provider lookup by client order identity.
+
+    ``not_found`` is only a definitive provider response. Outages, missing
+    credentials, refused synthetic legacy IDs, and malformed payloads are all
+    ``unavailable`` so callers retain prepared intent and retry lookup only.
+    """
+
+    outcome: str = ORDER_LOOKUP_UNAVAILABLE
+    reason: str = ""
+    order: OrderResult | None = None
+
+
+@dataclass(frozen=True)
 class OrdersResult:
     """Result of an orders list read. Same fail-soft ``ok`` semantics as
     :class:`PositionsResult`."""
@@ -175,6 +202,12 @@ class Broker(ABC):
     @abstractmethod
     def get_order(self, order_id: str) -> OrderResult:
         """Fetch one order's current state. Fail-soft → ``ok=False``."""
+
+    @abstractmethod
+    def get_order_by_client_order_id(
+        self, client_order_id: str,
+    ) -> OrderLookupResult:
+        """Fetch one order by client ID with explicit not-found semantics."""
 
     @abstractmethod
     def cancel_order(self, order_id: str) -> OrderResult:
