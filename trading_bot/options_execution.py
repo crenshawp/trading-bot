@@ -22,7 +22,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from trading_bot import config, db, risk_of_ruin
+from trading_bot import config, db, order_lifecycle, risk_of_ruin
 from trading_bot.broker.base import ORDER_TYPE_LIMIT, TIF_DAY, Broker, OrderResult
 from trading_bot.broker.options import (
     OPTION_TYPE_CALL,
@@ -353,6 +353,70 @@ def record_shares_position(
     ))
 
 
+def _capture_execution_intent(
+    decision: ExecutionDecision,
+    order: OrderResult,
+    *,
+    accepted_at: datetime,
+    signal_id: int | None,
+    tp: float | None,
+    sl: float | None,
+    deadline: datetime | None,
+) -> int:
+    """Capture the already-selected option/share intent without re-selection."""
+    contract = decision.contract
+    if contract is not None:
+        ticker = contract.underlying
+        asset_class = "stock"
+        target_position_kind = "option"
+        intent_payload: dict[str, object] = {
+            "intent_kind": "option",
+            "option_type": contract.option_type,
+            "strike": contract.strike,
+            "expiry": contract.expiry,
+            "multiplier": config.OPTION_MULTIPLIER,
+            "delta_entry": contract.delta,
+            "theta": contract.theta,
+            "vega": contract.vega,
+            "gamma": contract.gamma,
+            "tp": tp,
+            "sl": sl,
+            "deadline": deadline.isoformat() if deadline is not None else None,
+        }
+    elif decision.vehicle == VEHICLE_SHARES:
+        ticker = decision.symbol
+        asset_class = "crypto" if decision.symbol.endswith("-USD") else "stock"
+        target_position_kind = "long_term"
+        intent_payload = {
+            "intent_kind": "shares_fallback",
+            "source": "swing_fallback",
+            "direction": "short" if decision.side == "sell" else "long",
+            "tp": tp,
+            "sl": sl,
+            "deadline": deadline.isoformat() if deadline is not None else None,
+        }
+    else:
+        raise order_lifecycle.OrderIntentCaptureError(
+            f"accepted order has unsupported execution vehicle {decision.vehicle!r}; "
+            "materialization intent was not durably captured"
+        )
+
+    return order_lifecycle.capture_accepted_order(
+        order,
+        ticker=ticker,
+        broker_symbol=decision.symbol,
+        asset_class=asset_class,
+        vehicle=decision.vehicle,
+        target_position_kind=target_position_kind,
+        side=decision.side,
+        requested_qty=decision.qty,
+        requested_limit_price=_limit_price_for(decision),
+        accepted_at=accepted_at,
+        signal_id=signal_id,
+        intent_payload=intent_payload,
+    )
+
+
 def execute_decision(
     broker: Broker,
     decision: ExecutionDecision,
@@ -372,15 +436,25 @@ def execute_decision(
     vehicle. A rejected/errored order records nothing anywhere."""
     order = submit_execution_order(broker, decision, time_in_force=time_in_force)
     position_id: int | None = None
-    if order.ok and decision.contract is not None:
-        position_id = record_option_position(
-            decision, order, opened_at=opened_at, signal_id=signal_id,
-            tp=tp, sl=sl, deadline=deadline,
+    if order.ok:
+        _capture_execution_intent(
+            decision,
+            order,
+            accepted_at=opened_at,
+            signal_id=signal_id,
+            tp=tp,
+            sl=sl,
+            deadline=deadline,
         )
-    elif order.ok and decision.vehicle == VEHICLE_SHARES:
-        position_id = record_shares_position(
-            decision, opened_at=opened_at, tp=tp, sl=sl, deadline=deadline,
-        )
+        if decision.contract is not None:
+            position_id = record_option_position(
+                decision, order, opened_at=opened_at, signal_id=signal_id,
+                tp=tp, sl=sl, deadline=deadline,
+            )
+        elif decision.vehicle == VEHICLE_SHARES:
+            position_id = record_shares_position(
+                decision, opened_at=opened_at, tp=tp, sl=sl, deadline=deadline,
+            )
     return order, position_id
 
 

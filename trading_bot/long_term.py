@@ -49,6 +49,7 @@ from trading_bot import (
     earnings,
     indicators,
     options_execution,
+    order_lifecycle,
     risk_of_ruin,
 )
 from trading_bot.broker.base import ORDER_TYPE_LIMIT, TIF_DAY, Broker, OrderResult
@@ -406,6 +407,23 @@ def submit_long_term_entry(
     risk_of_ruin.record_broker_result(order.ok)   # Phase 15 detector
     position_id: int | None = None
     if order.ok:
+        order_lifecycle.capture_accepted_order(
+            order,
+            ticker=ticker,
+            broker_symbol=ticker,
+            asset_class=asset_class,
+            vehicle="shares",
+            target_position_kind="long_term",
+            side="buy",
+            requested_qty=qty,
+            requested_limit_price=entry_price,
+            accepted_at=now,
+            intent_payload={
+                "intent_kind": "long_term",
+                "source": "long_term",
+                "direction": "long",
+            },
+        )
         position_id = db.insert_long_term_position(LongTermPosition(
             ticker=ticker, asset_class=asset_class, entry_price=entry_price,
             entry_date=now, qty=qty, status="open",
