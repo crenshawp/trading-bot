@@ -326,6 +326,26 @@ def test_alpaca_get_account_transport_error_is_failsoft(
     assert "error" in capsys.readouterr().err
 
 
+def test_alpaca_get_account_malformed_2xx_is_not_authoritative(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _with_creds(monkeypatch)
+    _patch_request(monkeypatch, _FakeResp(200, {
+        "account_number": "PA123", "buying_power": "not-a-number",
+        "cash": "10000", "equity": "60000", "currency": "USD",
+        "status": "ACTIVE",
+    }))
+
+    account = alpaca.AlpacaBroker().get_account()
+
+    assert account.ok is False
+    assert account.reason == (
+        "malformed account response: missing or invalid 'buying_power'"
+    )
+    assert account.equity is None
+    assert account.reason in capsys.readouterr().err
+
+
 def test_alpaca_get_positions_parses(monkeypatch: pytest.MonkeyPatch) -> None:
     _with_creds(monkeypatch)
     _patch_request(monkeypatch, _FakeResp(200, [
@@ -360,6 +380,25 @@ def test_alpaca_get_positions_server_error_is_failsoft(
 
 
 # ───────────────────────── broker CLI (account / positions) ─────────────────
+
+
+def test_alpaca_get_positions_rejects_any_malformed_row(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _with_creds(monkeypatch)
+    _patch_request(monkeypatch, _FakeResp(200, [
+        {"symbol": "AAPL", "qty": "10", "side": "long"},
+        {"symbol": "TSLA", "qty": "garbage", "side": "long"},
+    ]))
+
+    result = alpaca.AlpacaBroker().get_positions()
+
+    assert result.ok is False
+    assert result.positions == []
+    assert result.reason == (
+        "malformed positions response: item 1 has missing or invalid 'qty'"
+    )
+    assert result.reason in capsys.readouterr().err
 
 
 def test_cli_broker_account_ok(
@@ -452,7 +491,7 @@ def test_alpaca_submit_logs_intent_and_result(
 ) -> None:
     _with_creds(monkeypatch)
     _patch_request(monkeypatch, _FakeResp(200, {
-        "id": "o1", "status": "new", "symbol": "AAPL",
+        "id": "o1", "status": "new", "symbol": "AAPL", "filled_qty": "0",
     }))
     alpaca.AlpacaBroker().submit_order("AAPL", 1, broker.SIDE_BUY, limit_price=10.0)
     err = capsys.readouterr().err
@@ -499,6 +538,27 @@ def test_alpaca_submit_rejected_in_2xx_body(
     assert res.reason == "rejected"
 
 
+def test_alpaca_submit_malformed_2xx_is_error_not_accepted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _with_creds(monkeypatch)
+    _patch_request(monkeypatch, _FakeResp(200, {
+        "id": "o1", "status": "accepted", "symbol": "AAPL",
+    }))
+
+    result = alpaca.AlpacaBroker().submit_order(
+        "AAPL", 1, broker.SIDE_BUY, limit_price=10.0,
+    )
+
+    assert result.ok is False
+    assert result.status == broker.STATUS_ERROR
+    assert result.order_id is None
+    assert result.reason == (
+        "malformed order submission response: missing or invalid 'filled_qty'"
+    )
+    assert result.reason in capsys.readouterr().err
+
+
 def test_alpaca_submit_server_error_is_error_not_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -536,9 +596,30 @@ def test_alpaca_get_order_fills_in_missing_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _with_creds(monkeypatch)
-    _patch_request(monkeypatch, _FakeResp(200, {"status": "new", "symbol": "AAPL"}))
+    _patch_request(monkeypatch, _FakeResp(200, {
+        "status": "new", "symbol": "AAPL", "filled_qty": "0",
+    }))
     res = alpaca.AlpacaBroker().get_order("o9")
     assert res.order_id == "o9"
+
+
+def test_alpaca_get_order_malformed_2xx_preserves_lifecycle_state(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _with_creds(monkeypatch)
+    _patch_request(monkeypatch, _FakeResp(200, {
+        "id": "o1", "status": "filled", "filled_qty": "10",
+    }))
+
+    result = alpaca.AlpacaBroker().get_order("o1")
+
+    assert result.ok is False
+    assert result.status == broker.STATUS_ERROR
+    assert result.order_id == "o1"
+    assert result.reason == (
+        "malformed order response: positive fill is missing 'filled_avg_price'"
+    )
+    assert result.reason in capsys.readouterr().err
 
 
 def test_alpaca_get_order_not_found_is_error(
@@ -629,6 +710,7 @@ def test_alpaca_malformed_client_id_lookup_is_unavailable_not_not_found(
 
     assert result.outcome == broker.ORDER_LOOKUP_UNAVAILABLE
     assert result.order is None
+    assert result.reason.startswith("malformed order by client ID response:")
 
 
 def test_alpaca_legacy_client_id_lookup_is_refused_before_network(
@@ -669,14 +751,47 @@ def test_alpaca_cancel_failure(
 def test_alpaca_list_orders_success(monkeypatch: pytest.MonkeyPatch) -> None:
     _with_creds(monkeypatch)
     _patch_request(monkeypatch, _FakeResp(200, [
-        {"id": "o1", "status": "new", "symbol": "AAPL"},
-        {"id": "o2", "status": "partially_filled", "symbol": "TSLA"},
+        {"id": "o1", "status": "new", "symbol": "AAPL", "filled_qty": "0"},
+        {
+            "id": "o2", "status": "partially_filled", "symbol": "TSLA",
+            "filled_qty": "1", "filled_avg_price": "240.0",
+        },
     ]))
     res = alpaca.AlpacaBroker().list_orders("open")
     assert res.ok is True
     assert [o.status for o in res.orders] == [
         broker.STATUS_NEW, broker.STATUS_PARTIALLY_FILLED,
     ]
+
+
+def test_alpaca_list_orders_empty_is_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    _with_creds(monkeypatch)
+    _patch_request(monkeypatch, _FakeResp(200, []))
+
+    result = alpaca.AlpacaBroker().list_orders()
+
+    assert result.ok is True
+    assert result.orders == []
+    assert result.reason == ""
+
+
+def test_alpaca_list_orders_rejects_any_malformed_row(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _with_creds(monkeypatch)
+    _patch_request(monkeypatch, _FakeResp(200, [
+        {"id": "o1", "status": "new", "filled_qty": "0"},
+        {"id": "o2", "status": "new"},
+    ]))
+
+    result = alpaca.AlpacaBroker().list_orders()
+
+    assert result.ok is False
+    assert result.orders == []
+    assert result.reason == (
+        "malformed orders response: item 1: missing or invalid 'filled_qty'"
+    )
+    assert result.reason in capsys.readouterr().err
 
 
 def test_alpaca_list_orders_failure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -688,6 +803,66 @@ def test_alpaca_list_orders_failure(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ───────────────────────── reconciliation (pure comparison) ─────────────────
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected_reason"),
+    [
+        ("account", "malformed account response: non-JSON response body"),
+        ("positions", "malformed positions response: non-JSON response body"),
+        (
+            "submit",
+            "malformed order submission response: non-JSON response body",
+        ),
+        ("get-order", "malformed order response: non-JSON response body"),
+        (
+            "client-order",
+            "malformed order by client ID response: non-JSON response body",
+        ),
+        ("orders", "malformed orders response: non-JSON response body"),
+    ],
+)
+def test_alpaca_non_json_2xx_fails_soft_for_every_json_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    endpoint: str,
+    expected_reason: str,
+) -> None:
+    _with_creds(monkeypatch)
+    _patch_request(monkeypatch, _FakeResp(200, {}, raise_json=True))
+    client = alpaca.AlpacaBroker()
+
+    if endpoint == "account":
+        account = client.get_account()
+        assert account.ok is False
+        reason = account.reason
+    elif endpoint == "positions":
+        positions = client.get_positions()
+        assert positions.ok is False
+        reason = positions.reason
+    elif endpoint == "submit":
+        order = client.submit_order(
+            "AAPL", 1, broker.SIDE_BUY, limit_price=10.0,
+        )
+        assert order.ok is False
+        assert order.status == broker.STATUS_ERROR
+        reason = order.reason
+    elif endpoint == "get-order":
+        order = client.get_order("o1")
+        assert order.ok is False
+        assert order.status == broker.STATUS_ERROR
+        reason = order.reason
+    elif endpoint == "client-order":
+        lookup = client.get_order_by_client_order_id("tradingbot-client-1")
+        assert lookup.outcome == broker.ORDER_LOOKUP_UNAVAILABLE
+        reason = lookup.reason
+    else:
+        orders = client.list_orders()
+        assert orders.ok is False
+        reason = orders.reason
+
+    assert reason == expected_reason
+    assert expected_reason in capsys.readouterr().err
 
 
 def test_compare_positions_detects_each_divergence_kind() -> None:
@@ -760,6 +935,23 @@ def test_reconcile_broker_unavailable_flags_nothing(tmp_db: Path) -> None:
     # An outage must NOT flag the tracked position as 'internal_only'.
     assert [d.kind for d in report.divergences] == ["broker_unavailable"]
     assert all(d.kind != "internal_only" for d in report.divergences)
+
+
+def test_reconcile_malformed_positions_2xx_flags_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_db: Path,
+) -> None:
+    _with_creds(monkeypatch)
+    _patch_request(monkeypatch, _FakeResp(200, {}))
+    _seed_broker_tracked("AAPL")
+
+    report = broker.reconcile(alpaca.AlpacaBroker())
+
+    assert report.ok is False
+    assert [d.kind for d in report.divergences] == ["broker_unavailable"]
+    assert all(d.kind != "internal_only" for d in report.divergences)
+    assert report.note == (
+        "malformed positions response: top-level body must be a list"
+    )
 
 
 def test_reconcile_surfaces_open_order_count(tmp_db: Path) -> None:
@@ -885,7 +1077,10 @@ def test_alpaca_submit_rounds_limit_price_on_the_wire(
     captured: list[dict[str, object]] = []
     _patch_request(
         monkeypatch,
-        _FakeResp(200, {"id": "abc", "status": "accepted", "symbol": "LLY"}),
+        _FakeResp(200, {
+            "id": "abc", "status": "accepted", "symbol": "LLY",
+            "filled_qty": "0",
+        }),
         capture=captured,
     )
     result = alpaca.AlpacaBroker().submit_order(

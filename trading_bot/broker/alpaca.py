@@ -134,7 +134,7 @@ def _to_float(value: Any) -> float | None:
         return None
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return None
 
 
@@ -148,8 +148,142 @@ def _to_int(value: Any) -> int | None:
         return None
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return None
+
+
+def _finite_float(value: Any) -> float | None:
+    """Return a finite float, rejecting booleans and malformed numbers."""
+    if isinstance(value, bool):
+        return None
+    parsed = _to_float(value)
+    if parsed is None or not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _required_text(body: Mapping[str, Any], field: str) -> str | None:
+    value = body.get(field)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value
+
+
+def _account_body_error(body: Any) -> str:
+    """Return why a successful account body is unusable, or ``""``."""
+    if body is None:
+        return "empty body or JSON null"
+    if not isinstance(body, Mapping):
+        return "top-level body must be an object"
+    for field in ("account_number", "currency", "status"):
+        if _required_text(body, field) is None:
+            return f"missing or invalid {field!r}"
+    for field in ("buying_power", "cash", "equity"):
+        if _finite_float(body.get(field)) is None:
+            return f"missing or invalid {field!r}"
+    options_level = body.get("options_trading_level")
+    if options_level is not None and (
+        isinstance(options_level, bool) or _to_int(options_level) is None
+    ):
+        return "invalid 'options_trading_level'"
+    return ""
+
+
+def _position_body_error(body: Any) -> str:
+    """Return why a successful positions body is unusable, or ``""``."""
+    if body is None:
+        return "empty body or JSON null"
+    if not isinstance(body, list):
+        return "top-level body must be a list"
+    for index, row in enumerate(body):
+        if not isinstance(row, Mapping):
+            return f"item {index} must be an object"
+        if _required_text(row, "symbol") is None:
+            return f"item {index} has missing or invalid 'symbol'"
+        if _finite_float(row.get("qty")) is None:
+            return f"item {index} has missing or invalid 'qty'"
+        side = _required_text(row, "side")
+        if side not in ("long", "short"):
+            return f"item {index} has missing or invalid 'side'"
+        for field in ("avg_entry_price", "market_value", "unrealized_pl"):
+            if row.get(field) is not None and _finite_float(row.get(field)) is None:
+                return f"item {index} has invalid {field!r}"
+    return ""
+
+
+def _order_body_error(
+    body: Any,
+    *,
+    require_order_id: bool,
+    expected_order_id: str | None = None,
+    expected_client_order_id: str | None = None,
+) -> str:
+    """Return why a successful order body is unusable, or ``""``.
+
+    Status plus cumulative fill state are lifecycle-critical. Defaulting a
+    missing fill to zero would make a malformed refresh authoritative.
+    """
+    if body is None:
+        return "empty body or JSON null"
+    if not isinstance(body, Mapping):
+        return "top-level body must be an object"
+
+    order_id = body.get("id")
+    if order_id is not None and (
+        not isinstance(order_id, str) or not order_id.strip()
+    ):
+        return "invalid 'id'"
+    if require_order_id and order_id is None:
+        return "missing 'id'"
+    if expected_order_id is not None and order_id not in (None, expected_order_id):
+        return "response 'id' does not match requested order"
+
+    client_order_id = body.get("client_order_id")
+    if client_order_id is not None and (
+        not isinstance(client_order_id, str) or not client_order_id.strip()
+    ):
+        return "invalid 'client_order_id'"
+    if (
+        expected_client_order_id is not None
+        and client_order_id != expected_client_order_id
+    ):
+        return "response 'client_order_id' does not match requested order"
+
+    raw_status = _required_text(body, "status")
+    if raw_status is None:
+        return "missing or invalid 'status'"
+    filled_qty = _finite_float(body.get("filled_qty"))
+    if filled_qty is None or filled_qty < 0:
+        return "missing or invalid 'filled_qty'"
+
+    raw_filled_avg = body.get("filled_avg_price")
+    filled_avg = (
+        None if raw_filled_avg is None else _finite_float(raw_filled_avg)
+    )
+    if raw_filled_avg is not None and (filled_avg is None or filled_avg <= 0):
+        return "invalid 'filled_avg_price'"
+    if filled_qty > 0 and filled_avg is None:
+        return "positive fill is missing 'filled_avg_price'"
+    if filled_qty == 0 and raw_filled_avg is not None:
+        return "zero fill must not have 'filled_avg_price'"
+    if map_status(raw_status) in (STATUS_PARTIALLY_FILLED, STATUS_FILLED) and (
+        filled_qty == 0
+    ):
+        return f"status {raw_status!r} has no fill"
+    return ""
+
+
+def _orders_body_error(body: Any) -> str:
+    """Return why a successful orders-list body is unusable, or ``""``."""
+    if body is None:
+        return "empty body or JSON null"
+    if not isinstance(body, list):
+        return "top-level body must be a list"
+    for index, row in enumerate(body):
+        detail = _order_body_error(row, require_order_id=True)
+        if detail:
+            return f"item {index}: {detail}"
+    return ""
 
 
 def _parse_position(d: Mapping[str, Any]) -> Position:
@@ -218,7 +352,9 @@ def _validate_order(
 class _Response:
     """Outcome of a single HTTP attempt. ``ok`` means a response was received
     (any status code); a transport failure or missing creds gives ``ok=False``
-    with ``error`` populated. ``status_code`` is None when no response arrived.
+    with ``error`` populated. For HTTP 2xx, ``error`` also records a non-JSON
+    response body so endpoint validators can surface that precise failure.
+    ``status_code`` is None when no response arrived.
     """
 
     ok: bool
@@ -283,11 +419,16 @@ class AlpacaBroker(Broker):
         except Exception as exc:  # noqa: BLE001 - broker I/O must never raise into the loop
             print(f"  broker: {method} {path} error ({exc})", file=sys.stderr)
             return _Response(ok=False, status_code=None, body=None, error=str(exc))
+        body_error = ""
         try:
             body = resp.json() if resp.content else None
-        except Exception:  # noqa: BLE001 - a non-JSON body is not fatal
+        except Exception:  # noqa: BLE001 - malformed broker data must fail soft
             body = None
-        return _Response(ok=True, status_code=resp.status_code, body=body, error="")
+            if 200 <= resp.status_code < 300:
+                body_error = "non-JSON response body"
+        return _Response(
+            ok=True, status_code=resp.status_code, body=body, error=body_error,
+        )
 
     @staticmethod
     def _succeeded(resp: _Response) -> bool:
@@ -315,13 +456,26 @@ class AlpacaBroker(Broker):
             print(f"  broker: {what} unavailable ({reason})", file=sys.stderr)
         return reason
 
+    @staticmethod
+    def _log_malformed(what: str, detail: str) -> str:
+        """Log and return an endpoint-specific malformed-2xx reason."""
+        reason = f"malformed {what} response: {detail}"
+        print(f"  broker: {what} unavailable ({reason})", file=sys.stderr)
+        return reason
+
     # ── read path (Section 3) ────────────────────────────────────────────────
 
     def get_account(self) -> AccountInfo:
         resp = self._request("GET", "/v2/account")
         if not self._succeeded(resp):
             return AccountInfo(ok=False, reason=self._log_unavailable("account", resp))
-        body: Mapping[str, Any] = resp.body if isinstance(resp.body, dict) else {}
+        detail = resp.error or _account_body_error(resp.body)
+        if detail:
+            return AccountInfo(
+                ok=False, reason=self._log_malformed("account", detail),
+            )
+        body = resp.body
+        assert isinstance(body, Mapping)
         return AccountInfo(
             ok=True,
             account_number=_str_or_none(body.get("account_number")),
@@ -339,8 +493,14 @@ class AlpacaBroker(Broker):
             return PositionsResult(
                 ok=False, reason=self._log_unavailable("positions", resp),
             )
-        rows = resp.body if isinstance(resp.body, list) else []
-        positions = [_parse_position(r) for r in rows if isinstance(r, dict)]
+        detail = resp.error or _position_body_error(resp.body)
+        if detail:
+            return PositionsResult(
+                ok=False, reason=self._log_malformed("positions", detail),
+            )
+        rows = resp.body
+        assert isinstance(rows, list)
+        positions = [_parse_position(r) for r in rows if isinstance(r, Mapping)]
         return PositionsResult(ok=True, positions=positions)
 
     # ── write path (Section 4) ───────────────────────────────────────────────
@@ -407,15 +567,29 @@ class AlpacaBroker(Broker):
                 reason=resp.error or "unavailable",
             )
         if self._succeeded(resp):
-            body = resp.body if isinstance(resp.body, dict) else {}
-            parsed = _parse_order(body)
-            if parsed.status == STATUS_REJECTED:
+            body = resp.body
+            if isinstance(body, Mapping) and (
+                map_status(_str_or_none(body.get("status"))) == STATUS_REJECTED
+            ):
+                parsed = _parse_order(body)
                 # A rejected order can arrive inside a 2xx body; surface its own
                 # message rather than the (misleading) "HTTP 200".
-                message = str(body.get("message", "")) if body else ""
+                message = str(body.get("message", ""))
                 return dataclasses.replace(
                     parsed, ok=False, reason=message or "rejected",
                 )
+            detail = resp.error or _order_body_error(
+                body, require_order_id=True,
+            )
+            if detail:
+                return OrderResult(
+                    ok=False,
+                    status=STATUS_ERROR,
+                    symbol=symbol,
+                    reason=f"malformed order submission response: {detail}",
+                )
+            assert isinstance(body, Mapping)
+            parsed = _parse_order(body)
             return parsed
         reason = self._error_reason(resp)
         code = resp.status_code or 0
@@ -431,7 +605,18 @@ class AlpacaBroker(Broker):
             return OrderResult(
                 ok=False, status=STATUS_ERROR, order_id=order_id, reason=reason,
             )
-        body = resp.body if isinstance(resp.body, dict) else {}
+        detail = resp.error or _order_body_error(
+            resp.body,
+            require_order_id=False,
+            expected_order_id=order_id,
+        )
+        if detail:
+            reason = self._log_malformed("order", detail)
+            return OrderResult(
+                ok=False, status=STATUS_ERROR, order_id=order_id, reason=reason,
+            )
+        body = resp.body
+        assert isinstance(body, Mapping)
         parsed = _parse_order(body)
         if parsed.order_id is None:
             parsed = dataclasses.replace(parsed, order_id=order_id)
@@ -468,44 +653,18 @@ class AlpacaBroker(Broker):
                 outcome=ORDER_LOOKUP_UNAVAILABLE,
                 reason=self._log_unavailable("order by client ID", resp),
             )
-        if not isinstance(resp.body, dict):
-            print(
-                "  broker: order by client ID unavailable "
-                "(malformed response body)",
-                file=sys.stderr,
-            )
+        detail = resp.error or _order_body_error(
+            resp.body,
+            require_order_id=True,
+            expected_client_order_id=client_order_id,
+        )
+        if detail:
             return OrderLookupResult(
                 outcome=ORDER_LOOKUP_UNAVAILABLE,
-                reason="malformed order lookup response",
+                reason=self._log_malformed("order by client ID", detail),
             )
+        assert isinstance(resp.body, Mapping)
         parsed = _parse_order(resp.body)
-        raw_filled_qty = _to_float(resp.body.get("filled_qty"))
-        raw_filled_avg = _to_float(resp.body.get("filled_avg_price"))
-        if (
-            parsed.order_id is None
-            or not parsed.order_id.strip()
-            or parsed.client_order_id != client_order_id
-            or parsed.raw_status is None
-            or not parsed.raw_status.strip()
-            or raw_filled_qty is None
-            or not math.isfinite(raw_filled_qty)
-            or raw_filled_qty < 0
-            or (raw_filled_qty > 0 and (
-                raw_filled_avg is None
-                or not math.isfinite(raw_filled_avg)
-                or raw_filled_avg <= 0
-            ))
-            or (raw_filled_qty == 0 and raw_filled_avg is not None)
-        ):
-            print(
-                "  broker: order by client ID unavailable "
-                "(malformed order identity/status)",
-                file=sys.stderr,
-            )
-            return OrderLookupResult(
-                outcome=ORDER_LOOKUP_UNAVAILABLE,
-                reason="malformed order lookup response",
-            )
         return OrderLookupResult(outcome=ORDER_LOOKUP_FOUND, order=parsed)
 
     def cancel_order(self, order_id: str) -> OrderResult:
@@ -525,6 +684,12 @@ class AlpacaBroker(Broker):
         resp = self._request("GET", "/v2/orders", params={"status": status})
         if not self._succeeded(resp):
             return OrdersResult(ok=False, reason=self._log_unavailable("orders", resp))
-        rows = resp.body if isinstance(resp.body, list) else []
-        orders = [_parse_order(r) for r in rows if isinstance(r, dict)]
+        detail = resp.error or _orders_body_error(resp.body)
+        if detail:
+            return OrdersResult(
+                ok=False, reason=self._log_malformed("orders", detail),
+            )
+        rows = resp.body
+        assert isinstance(rows, list)
+        orders = [_parse_order(r) for r in rows if isinstance(r, Mapping)]
         return OrdersResult(ok=True, orders=orders)
