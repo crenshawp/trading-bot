@@ -89,6 +89,14 @@ class _FakeGetResp:
         return self._payload
 
 
+class _NonJsonGetResp(_FakeGetResp):
+    def __init__(self, status_code: int = 200) -> None:
+        super().__init__(status_code, object())
+
+    def json(self) -> object:
+        raise ValueError("not JSON")
+
+
 def _with_opt_creds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "trading_bot.broker.options.secrets.get_secret", lambda _n: "key",
@@ -192,6 +200,111 @@ def test_get_option_chain_no_contracts_is_not_ok(
     assert chain.contracts == []
 
 
+@pytest.mark.parametrize(
+    ("response", "detail"),
+    [
+        (_NonJsonGetResp(), "non-JSON response body"),
+        (_FakeGetResp(200, []), "top-level body must be an object"),
+        (
+            _FakeGetResp(200, {"option_contracts": {}}),
+            "missing 'option_contracts' list",
+        ),
+    ],
+    ids=("non-json", "non-object", "wrong-collection-shape"),
+)
+def test_get_option_chain_rejects_malformed_contracts_2xx(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    response: _FakeGetResp,
+    detail: str,
+) -> None:
+    _with_opt_creds(monkeypatch)
+    monkeypatch.setattr(
+        "trading_bot.broker.options.requests.get",
+        lambda *a, **k: response,
+    )
+
+    chain = options.AlpacaOptionsClient().get_option_chain("AAPL")
+
+    assert chain.ok is False
+    assert chain.contracts == []
+    assert "malformed contracts response" in chain.reason
+    assert detail in chain.reason
+    assert chain.reason in capsys.readouterr().err
+
+
+def test_get_option_chain_preserves_valid_empty_contracts_response(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _with_opt_creds(monkeypatch)
+    monkeypatch.setattr(
+        "trading_bot.broker.options.requests.get",
+        lambda *a, **k: _FakeGetResp(200, {"option_contracts": []}),
+    )
+
+    chain = options.AlpacaOptionsClient().get_option_chain("AAPL")
+
+    assert chain.ok is False
+    assert chain.reason == "no contracts listed for AAPL"
+    assert "malformed" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("response", "detail"),
+    [
+        (_NonJsonGetResp(), "non-JSON response body"),
+        (_FakeGetResp(200, []), "top-level body must be an object"),
+        (
+            _FakeGetResp(200, {"snapshots": []}),
+            "missing 'snapshots' object",
+        ),
+    ],
+    ids=("non-json", "non-object", "wrong-collection-shape"),
+)
+def test_get_option_chain_rejects_malformed_snapshots_2xx(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    response: _FakeGetResp,
+    detail: str,
+) -> None:
+    _with_opt_creds(monkeypatch)
+
+    def route(url: str, **kwargs: object) -> _FakeGetResp:
+        if "/v2/options/contracts" in url:
+            return _FakeGetResp(200, _CONTRACTS_BODY)
+        return response
+
+    monkeypatch.setattr("trading_bot.broker.options.requests.get", route)
+
+    chain = options.AlpacaOptionsClient().get_option_chain("AAPL")
+
+    assert chain.ok is False
+    assert chain.contracts == []
+    assert "malformed snapshots response" in chain.reason
+    assert detail in chain.reason
+    assert chain.reason in capsys.readouterr().err
+
+
+def test_get_option_chain_preserves_valid_empty_snapshots_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_opt_creds(monkeypatch)
+
+    def route(url: str, **kwargs: object) -> _FakeGetResp:
+        if "/v2/options/contracts" in url:
+            return _FakeGetResp(200, _CONTRACTS_BODY)
+        return _FakeGetResp(200, {"snapshots": {}})
+
+    monkeypatch.setattr("trading_bot.broker.options.requests.get", route)
+
+    chain = options.AlpacaOptionsClient().get_option_chain("AAPL")
+
+    assert chain.ok is True
+    assert len(chain.contracts) == 1
+    assert chain.contracts[0].delta is None
+
+
 def test_get_option_chain_snapshot_failure_keeps_contracts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -272,6 +385,22 @@ def test_cli_options_chain_unavailable(
     )
     m.cmd_options_chain("AAPL")
     assert "unavailable" in capsys.readouterr().out
+
+
+def test_cli_options_chain_propagates_malformed_upstream_reason(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import __main__ as m
+    reason = "malformed snapshots response: non-JSON response body"
+    monkeypatch.setattr(
+        m.broker,
+        "AlpacaOptionsClient",
+        lambda: _FakeChainClient(OptionChainResult(ok=False, reason=reason)),
+    )
+
+    m.cmd_options_chain("AAPL")
+
+    assert f"unavailable: {reason}" in capsys.readouterr().out
 
 
 def test_cli_options_positions_empty(

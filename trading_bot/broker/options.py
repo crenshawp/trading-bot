@@ -140,6 +140,51 @@ def _parse_contract(d: Mapping[str, Any]) -> OptionContract:
     )
 
 
+# A malformed 2xx body is an upstream failure, not a valid empty collection.
+# These endpoint-specific reasons ride on OptionChainResult.reason and are also
+# logged to stderr so a shares fallback cannot hide the provider failure.
+_MALFORMED_CONTRACTS = "malformed contracts response"
+_MALFORMED_SNAPSHOTS = "malformed snapshots response"
+
+
+def _parse_contracts_body(body: Any) -> tuple[list[OptionContract], str]:
+    """Parse a 2xx contracts body into ``(contracts, malformed_reason)``.
+
+    An empty ``option_contracts`` list is valid. Missing or wrongly typed
+    top-level data is not.
+    """
+    if body is None:
+        return [], f"{_MALFORMED_CONTRACTS}: empty body or JSON null"
+    if not isinstance(body, Mapping):
+        return [], f"{_MALFORMED_CONTRACTS}: top-level body must be an object"
+    rows = body.get("option_contracts")
+    if not isinstance(rows, list):
+        return [], f"{_MALFORMED_CONTRACTS}: missing 'option_contracts' list"
+    return [_parse_contract(r) for r in rows if isinstance(r, Mapping)], ""
+
+
+def _parse_snapshots_body(
+    body: Any,
+) -> tuple[dict[str, Mapping[str, Any]], str]:
+    """Parse a 2xx snapshots body into ``(snapshots, malformed_reason)``.
+
+    An empty ``snapshots`` object is valid. Missing or wrongly typed top-level
+    data is not.
+    """
+    if body is None:
+        return {}, f"{_MALFORMED_SNAPSHOTS}: empty body or JSON null"
+    if not isinstance(body, Mapping):
+        return {}, f"{_MALFORMED_SNAPSHOTS}: top-level body must be an object"
+    raw_snapshots = body.get("snapshots")
+    if not isinstance(raw_snapshots, Mapping):
+        return {}, f"{_MALFORMED_SNAPSHOTS}: missing 'snapshots' object"
+    return {
+        str(symbol): snapshot
+        for symbol, snapshot in raw_snapshots.items()
+        if isinstance(snapshot, Mapping)
+    }, ""
+
+
 def _apply_snapshot(
     contract: OptionContract, snap: Mapping[str, Any] | None,
 ) -> OptionContract:
@@ -227,8 +272,16 @@ class AlpacaOptionsClient:
             return False, None, None, str(exc)
         try:
             body = resp.json() if resp.content else None
-        except Exception:  # noqa: BLE001 - a non-JSON body is not fatal
-            body = None
+        except Exception:  # noqa: BLE001 - malformed upstream data must fail soft
+            # Preserve non-JSON as a distinct error only for a successful HTTP
+            # response. A non-2xx free-tier/policy response keeps its existing
+            # HTTP status semantics.
+            body_error = (
+                "non-JSON response body"
+                if 200 <= resp.status_code < 300
+                else ""
+            )
+            return True, resp.status_code, None, body_error
         return True, resp.status_code, body, ""
 
     @staticmethod
@@ -245,6 +298,25 @@ class AlpacaOptionsClient:
         limit: int = 100,
     ) -> list[OptionContract]:
         """List option contracts (metadata) for ``underlying``. Fail-soft → []."""
+        contracts, _reason = self._list_option_contracts_result(
+            underlying,
+            expiration_gte=expiration_gte,
+            expiration_lte=expiration_lte,
+            option_type=option_type,
+            limit=limit,
+        )
+        return contracts
+
+    def _list_option_contracts_result(
+        self,
+        underlying: str,
+        *,
+        expiration_gte: str | None = None,
+        expiration_lte: str | None = None,
+        option_type: str | None = None,
+        limit: int = 100,
+    ) -> tuple[list[OptionContract], str]:
+        """List contracts while retaining an upstream-failure reason."""
         params: dict[str, Any] = {"underlying_symbols": underlying, "limit": limit}
         if expiration_gte is not None:
             params["expiration_date_gte"] = expiration_gte
@@ -256,17 +328,39 @@ class AlpacaOptionsClient:
             self._trading_base, "/v2/options/contracts", params=params,
         )
         if not ok or not self._ok2xx(status):
+            reason = (
+                f"contracts unavailable for {underlying} "
+                f"({error or f'HTTP {status}'})"
+            )
             print(
-                f"  options: contracts unavailable for {underlying} "
-                f"({error or f'HTTP {status}'})",
+                f"  options: {reason}",
                 file=sys.stderr,
             )
-            return []
-        rows = body.get("option_contracts", []) if isinstance(body, dict) else []
-        return [_parse_contract(r) for r in rows if isinstance(r, dict)]
+            return [], reason
+        contracts, malformed_reason = _parse_contracts_body(body)
+        if error:
+            malformed_reason = f"{_MALFORMED_CONTRACTS}: {error}"
+        if malformed_reason:
+            reason = f"{malformed_reason} for {underlying} (HTTP {status})"
+            print(f"  options: {reason}", file=sys.stderr)
+            return [], reason
+        return contracts, ""
 
     def _fetch_snapshots(self, underlying: str) -> dict[str, Mapping[str, Any]]:
         """Fetch greeks + quotes keyed by OCC symbol. Fail-soft → {}."""
+        snapshots, _reason = self._fetch_snapshots_result(underlying)
+        return snapshots
+
+    def _fetch_snapshots_result(
+        self, underlying: str,
+    ) -> tuple[dict[str, Mapping[str, Any]], str]:
+        """Fetch snapshots while retaining malformed-2xx failure reasons.
+
+        Ordinary HTTP/transport failures keep the established free-tier
+        behavior: return an empty mapping so listed contracts remain available
+        without greeks. Only malformed successful responses carry a reason that
+        invalidates the chain.
+        """
         ok, status, body, error = self._get(
             self._data_base, f"/v1beta1/options/snapshots/{underlying}",
             params={"limit": 1000},
@@ -277,25 +371,36 @@ class AlpacaOptionsClient:
                 f"({error or f'HTTP {status}'})",
                 file=sys.stderr,
             )
-            return {}
-        snaps = body.get("snapshots", {}) if isinstance(body, dict) else {}
-        return {str(k): v for k, v in snaps.items() if isinstance(v, dict)}
+            return {}, ""
+        snapshots, malformed_reason = _parse_snapshots_body(body)
+        if error:
+            malformed_reason = f"{_MALFORMED_SNAPSHOTS}: {error}"
+        if malformed_reason:
+            reason = f"{malformed_reason} for {underlying} (HTTP {status})"
+            print(f"  options: {reason}", file=sys.stderr)
+            return {}, reason
+        return snapshots, ""
 
     def get_option_chain(self, underlying: str) -> OptionChainResult:
         """The full chain with greeks populated. Fail-soft → ``ok=False``.
 
         Contract metadata (strike/expiry/type/open_interest) is merged with the
         data-API snapshot (delta/theta/vega/gamma + bid/ask/mid). If contracts
-        cannot be listed the result is ``ok=False``; if only the snapshots fail,
-        contracts are returned with ``None`` greeks (they then fail the delta /
-        liquidity gates and are excluded from selection).
+        cannot be listed the result is ``ok=False``. Snapshot transport, HTTP,
+        or access-policy failures retain the established degraded behavior:
+        contracts are returned with ``None`` greeks. A malformed successful
+        snapshot response is instead an explicit ``ok=False`` upstream failure.
         """
-        contracts = self.list_option_contracts(underlying)
+        contracts, contracts_reason = self._list_option_contracts_result(underlying)
+        if contracts_reason:
+            return OptionChainResult(ok=False, reason=contracts_reason)
         if not contracts:
             return OptionChainResult(
                 ok=False,
-                reason="no contracts (options unavailable or none listed)",
+                reason=f"no contracts listed for {underlying}",
             )
-        snapshots = self._fetch_snapshots(underlying)
+        snapshots, snapshots_reason = self._fetch_snapshots_result(underlying)
+        if snapshots_reason:
+            return OptionChainResult(ok=False, reason=snapshots_reason)
         merged = [_apply_snapshot(c, snapshots.get(c.symbol)) for c in contracts]
         return OptionChainResult(ok=True, contracts=merged)
