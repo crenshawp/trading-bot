@@ -15,7 +15,7 @@ import sys
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from trading_bot import db
@@ -35,8 +35,12 @@ from trading_bot.broker.base import (
     OrderResult,
 )
 from trading_bot.models import (
+    PENDING_ORDER_INTENT_VERSION,
     TERMINAL_PENDING_ORDER_STATUSES,
+    VALID_PENDING_ORDER_INTENT_KINDS,
     VALID_PENDING_ORDER_STATUSES,
+    LongTermPosition,
+    OptionPosition,
     PendingOrder,
     is_recoverable_pending_order_client_id,
 )
@@ -984,3 +988,381 @@ def capture_accepted_order(
         terminal_at=terminal_at,
     )
     return _insert_idempotently(pending)
+
+
+# ── fill materialization (dormant until 02e cutover) ─────────────────────────
+#
+# Turns a durable pending-order row's cumulative broker fill into the correct
+# option / long-term / shares-fallback position, idempotently.  Nothing here
+# polls or submits: it reads the fill state that :func:`refresh_pending_order`
+# already persisted and materializes it.  It stays unscheduled until 02e.
+
+MATERIALIZE_CREATED = "created"
+MATERIALIZE_UPDATED = "updated"
+MATERIALIZE_UNCHANGED = "unchanged"
+MATERIALIZE_SKIPPED = "skipped"
+MATERIALIZE_FAILED = "failed"
+
+
+class FillMaterializationError(RuntimeError):
+    """A usable broker fill could not be truthfully materialized."""
+
+
+@dataclass(frozen=True)
+class FillMaterializationResult:
+    """Durable outcome of one pending-order fill materialization attempt."""
+
+    pending_order_id: int | None
+    client_order_id: str | None
+    broker_order_id: str | None
+    action: str
+    position_kind: str | None
+    position_id: int | None
+    filled_qty: float
+    reason: str = ""
+
+
+def _materialize_result(
+    pending: PendingOrder,
+    *,
+    action: str,
+    position_kind: str | None = None,
+    position_id: int | None = None,
+    reason: str = "",
+) -> FillMaterializationResult:
+    return FillMaterializationResult(
+        pending_order_id=pending.id,
+        client_order_id=pending.client_order_id,
+        broker_order_id=pending.broker_order_id,
+        action=action,
+        position_kind=position_kind if position_kind is not None else pending.position_kind,
+        position_id=position_id if position_id is not None else pending.position_id,
+        filled_qty=pending.filled_qty,
+        reason=reason,
+    )
+
+
+def _log_materialize_issue(pending: PendingOrder, reason: str) -> None:
+    identity = pending.broker_order_id or pending.client_order_id or "unidentified"
+    print(
+        f"  order lifecycle: materialize issue for {identity} ({reason})",
+        file=sys.stderr,
+    )
+
+
+def _decode_intent_payload(pending: PendingOrder) -> dict[str, Any]:
+    """Decode and shallow-validate the immutable version-1 intent payload."""
+    if pending.intent_payload_version != PENDING_ORDER_INTENT_VERSION:
+        raise FillMaterializationError(
+            "unsupported intent payload version "
+            f"{pending.intent_payload_version}; expected {PENDING_ORDER_INTENT_VERSION}"
+        )
+    try:
+        payload = json.loads(pending.intent_payload_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise FillMaterializationError("intent payload is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise FillMaterializationError("intent payload must be a JSON object")
+    intent_kind = payload.get("intent_kind")
+    if intent_kind not in VALID_PENDING_ORDER_INTENT_KINDS:
+        raise FillMaterializationError(
+            f"unsupported intent_kind {intent_kind!r}"
+        )
+    return payload
+
+
+def _payload_number(payload: Mapping[str, Any], key: str) -> float | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise FillMaterializationError(
+            f"intent field {key!r} must be numeric or null"
+        )
+    number = float(value)
+    if not math.isfinite(number):
+        raise FillMaterializationError(
+            f"intent field {key!r} must be finite or null"
+        )
+    return number
+
+
+def _payload_deadline(payload: Mapping[str, Any]) -> datetime | None:
+    raw = payload.get("deadline")
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise FillMaterializationError("intent deadline must be an ISO datetime or null")
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise FillMaterializationError("intent deadline is not an ISO datetime") from exc
+
+
+def _build_option_position(
+    pending: PendingOrder,
+    payload: Mapping[str, Any],
+    *,
+    filled_qty: float,
+    filled_avg_price: float,
+    opened_at: datetime,
+) -> OptionPosition:
+    """Build the option position from immutable intent + actual broker fill."""
+    if payload.get("intent_kind") != "option":
+        raise FillMaterializationError("option target requires an option intent")
+    if pending.target_position_kind != "option" or pending.vehicle not in (
+        "option_full", "option_undersized",
+    ):
+        raise FillMaterializationError("option intent requires an option target/vehicle")
+    option_type = payload.get("option_type")
+    if option_type not in ("call", "put"):
+        raise FillMaterializationError("option intent option_type must be 'call' or 'put'")
+    strike = _payload_number(payload, "strike")
+    if strike is None or strike <= 0:
+        raise FillMaterializationError("option intent strike must be positive")
+    expiry = payload.get("expiry")
+    if not isinstance(expiry, str) or not expiry.strip():
+        raise FillMaterializationError("option intent expiry must be a date string")
+    try:
+        date.fromisoformat(expiry)
+    except ValueError as exc:
+        raise FillMaterializationError("option intent expiry must be an ISO date") from exc
+    multiplier = payload.get("multiplier")
+    if isinstance(multiplier, bool) or not isinstance(multiplier, int) or multiplier <= 0:
+        raise FillMaterializationError("option intent multiplier must be a positive integer")
+    return OptionPosition(
+        symbol=pending.broker_symbol,
+        underlying=pending.ticker,
+        option_type=option_type,
+        strike=strike,
+        expiry=expiry,
+        contracts=filled_qty,
+        opened_at=opened_at,
+        multiplier=multiplier,
+        signal_id=pending.signal_id,
+        order_id=pending.broker_order_id,
+        premium_entry=filled_avg_price,
+        delta_entry=_payload_number(payload, "delta_entry"),
+        theta=_payload_number(payload, "theta"),
+        vega=_payload_number(payload, "vega"),
+        gamma=_payload_number(payload, "gamma"),
+        tp=_payload_number(payload, "tp"),
+        sl=_payload_number(payload, "sl"),
+        deadline=_payload_deadline(payload),
+        outcome="open",
+        vehicle=pending.vehicle,
+    )
+
+
+def _build_long_term_position(
+    pending: PendingOrder,
+    payload: Mapping[str, Any],
+    *,
+    intent_kind: str,
+    filled_qty: float,
+    filled_avg_price: float,
+    opened_at: datetime,
+) -> LongTermPosition:
+    """Build the long-term / shares-fallback position from intent + fill."""
+    if intent_kind not in ("long_term", "shares_fallback"):
+        raise FillMaterializationError(
+            "long_term target requires a long_term or shares_fallback intent"
+        )
+    if pending.target_position_kind != "long_term" or pending.vehicle != "shares":
+        raise FillMaterializationError(
+            "share intent requires a long_term target and shares vehicle"
+        )
+    expected_source = "long_term" if intent_kind == "long_term" else "swing_fallback"
+    source = payload.get("source")
+    if source != expected_source:
+        raise FillMaterializationError(
+            f"{intent_kind} intent source must be {expected_source!r}"
+        )
+    direction = payload.get("direction")
+    if direction not in ("long", "short"):
+        raise FillMaterializationError("share intent direction must be 'long' or 'short'")
+    expected_direction = "long" if pending.side == "buy" else "short"
+    if direction != expected_direction:
+        raise FillMaterializationError("share intent direction must match the submitted side")
+    if intent_kind == "long_term" and (direction != "long" or pending.side != "buy"):
+        raise FillMaterializationError("long_term intent must be a long buy order")
+    is_fallback = intent_kind == "shares_fallback"
+    return LongTermPosition(
+        ticker=pending.ticker,
+        asset_class=pending.asset_class,
+        entry_price=filled_avg_price,
+        entry_date=opened_at,
+        qty=filled_qty,
+        status="open",
+        source=source,
+        direction=direction,
+        tp=_payload_number(payload, "tp") if is_fallback else None,
+        sl=_payload_number(payload, "sl") if is_fallback else None,
+        deadline=_payload_deadline(payload) if is_fallback else None,
+    )
+
+
+def _create_position(
+    pending: PendingOrder,
+    payload: Mapping[str, Any],
+    intent_kind: str,
+    *,
+    filled_avg_price: float,
+    observed_at: datetime,
+) -> FillMaterializationResult:
+    """Insert and atomically link the first materialized position."""
+    assert pending.id is not None
+    if pending.target_position_kind == "option":
+        option_pos = _build_option_position(
+            pending,
+            payload,
+            filled_qty=pending.filled_qty,
+            filled_avg_price=filled_avg_price,
+            opened_at=observed_at,
+        )
+        position_id = db.materialize_new_option_position(pending.id, option_pos)
+        return _materialize_result(
+            pending,
+            action=MATERIALIZE_CREATED,
+            position_kind="option",
+            position_id=position_id,
+        )
+    long_term_pos = _build_long_term_position(
+        pending,
+        payload,
+        intent_kind=intent_kind,
+        filled_qty=pending.filled_qty,
+        filled_avg_price=filled_avg_price,
+        opened_at=observed_at,
+    )
+    position_id = db.materialize_new_long_term_position(pending.id, long_term_pos)
+    return _materialize_result(
+        pending,
+        action=MATERIALIZE_CREATED,
+        position_kind="long_term",
+        position_id=position_id,
+    )
+
+
+def _update_position(
+    pending: PendingOrder,
+    *,
+    filled_avg_price: float,
+) -> FillMaterializationResult:
+    """Advance an already-linked position to a larger cumulative fill, or no-op."""
+    assert pending.id is not None
+    assert pending.position_id is not None
+    kind = pending.position_kind
+    if kind != pending.target_position_kind:
+        raise FillMaterializationError(
+            "linked position kind does not match the pending-order target"
+        )
+    try:
+        if kind == "option":
+            changed = db.update_option_position_fill(
+                pending.id,
+                pending.position_id,
+                contracts=pending.filled_qty,
+                premium_entry=filled_avg_price,
+            )
+        else:
+            changed = db.update_long_term_position_fill(
+                pending.id,
+                pending.position_id,
+                qty=pending.filled_qty,
+                entry_price=filled_avg_price,
+            )
+    except ValueError as exc:
+        raise FillMaterializationError(str(exc)) from exc
+    if not changed:
+        return _materialize_result(
+            pending,
+            action=MATERIALIZE_UNCHANGED,
+            position_kind=kind,
+            position_id=pending.position_id,
+            reason="position already reflects the cumulative fill",
+        )
+    return _materialize_result(
+        pending,
+        action=MATERIALIZE_UPDATED,
+        position_kind=kind,
+        position_id=pending.position_id,
+    )
+
+
+def _materialize_current(
+    pending: PendingOrder,
+    *,
+    observed_at: datetime,
+) -> FillMaterializationResult:
+    if pending.filled_qty == 0:
+        return _materialize_result(
+            pending,
+            action=MATERIALIZE_SKIPPED,
+            reason="no usable fill to materialize",
+        )
+    if not math.isfinite(pending.filled_qty) or pending.filled_qty < 0:
+        raise FillMaterializationError("cumulative fill quantity is invalid")
+    filled_avg_price = pending.filled_avg_price
+    if (
+        filled_avg_price is None
+        or not math.isfinite(filled_avg_price)
+        or filled_avg_price <= 0
+    ):
+        raise FillMaterializationError("usable fill is missing a positive average price")
+    payload = _decode_intent_payload(pending)
+    intent_kind = str(payload["intent_kind"])
+    if pending.position_id is None:
+        return _create_position(
+            pending,
+            payload,
+            intent_kind,
+            filled_avg_price=filled_avg_price,
+            observed_at=observed_at,
+        )
+    return _update_position(pending, filled_avg_price=filled_avg_price)
+
+
+def materialize_pending_order_fill(
+    pending: PendingOrder,
+    *,
+    observed_at: datetime | None = None,
+) -> FillMaterializationResult:
+    """Materialize one durable row's cumulative fill into its position.
+
+    Reloads the row first so replays and restarts act on durable truth, never a
+    stale in-memory copy. Zero fill creates nothing; the first positive fill
+    inserts and links the correct position; a later higher cumulative fill
+    updates that same row; an exact snapshot is a no-op. Inconsistent intent or
+    a regressed cumulative fill fails without mutating anything.
+    """
+    current = _current_pending_order(pending)
+    if current is None:
+        return _materialize_result(
+            pending,
+            action=MATERIALIZE_SKIPPED,
+            reason="pending order is no longer present in the durable ledger",
+        )
+    moment = observed_at or datetime.now(UTC)
+    try:
+        return _materialize_current(current, observed_at=moment)
+    except FillMaterializationError as exc:
+        reason = str(exc)
+        _log_materialize_issue(current, reason)
+        return _materialize_result(current, action=MATERIALIZE_FAILED, reason=reason)
+    except (sqlite3.Error, TypeError, ValueError) as exc:
+        reason = f"durable materialization failed: {exc}"
+        _log_materialize_issue(current, reason)
+        return _materialize_result(current, action=MATERIALIZE_FAILED, reason=reason)
+
+
+def materialize_pending_order_fills(
+    *,
+    observed_at: datetime | None = None,
+) -> list[FillMaterializationResult]:
+    """Materialize every fill-bearing ledger row once; deliberately unscheduled."""
+    moment = observed_at or datetime.now(UTC)
+    return [
+        materialize_pending_order_fill(pending, observed_at=moment)
+        for pending in db.get_pending_orders_with_fills()
+    ]

@@ -3041,8 +3041,12 @@ def get_shadow_evaluations(limit: int = 100) -> list[dict[str, Any]]:
 # ---- option positions (Phase 13) ----
 
 
-def insert_option_position(pos: OptionPosition) -> int:
-    """Insert a single-leg option position and return its id."""
+def _insert_option_position_row(conn: sqlite3.Connection, pos: OptionPosition) -> int:
+    """Insert one option position on an OPEN connection; the caller commits.
+
+    Split out so the eager writer and the atomic fill materializer share one
+    column list and never drift apart.
+    """
     if pos.option_type not in ("call", "put"):
         raise ValueError(f"Invalid option_type '{pos.option_type}'")
     if pos.outcome is not None and pos.outcome not in VALID_OUTCOMES:
@@ -3083,13 +3087,19 @@ def insert_option_position(pos: OptionPosition) -> int:
         pos.pnl_dollars,
         pos.vehicle,
     )
+    cur = conn.execute(sql, params)
+    new_id = cur.lastrowid
+    if new_id is None:
+        raise RuntimeError("INSERT did not return a row id")
+    return new_id
+
+
+def insert_option_position(pos: OptionPosition) -> int:
+    """Insert a single-leg option position and return its id."""
     conn = get_connection()
     try:
-        cur = conn.execute(sql, params)
+        new_id = _insert_option_position_row(conn, pos)
         conn.commit()
-        new_id = cur.lastrowid
-        if new_id is None:
-            raise RuntimeError("INSERT did not return a row id")
         return new_id
     finally:
         conn.close()
@@ -3184,11 +3194,96 @@ def update_option_position(position_id: int, **fields: Any) -> None:
         conn.close()
 
 
+def get_option_position(position_id: int) -> OptionPosition | None:
+    """Return one option position by row id, or None."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM option_positions WHERE id = ?", (position_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return _row_to_option_position(row) if row is not None else None
+
+
+def update_option_position_fill(
+    pending_order_id: int,
+    position_id: int,
+    *,
+    contracts: float,
+    premium_entry: float,
+) -> bool:
+    """Advance a materialized option position to a larger cumulative fill.
+
+    Separate from :func:`update_option_position` (the exit-watcher whitelist):
+    only the fill materializer calls this, when a later cumulative broker
+    snapshot raises contract count / weighted-average premium on an already
+    linked position. Entry premium mirrors the broker average, never a quote.
+
+    The compare-and-update runs under one write transaction so an older worker
+    cannot overwrite a newer materialized quantity. Returns ``True`` only when
+    the position advanced; an exact replay returns ``False``.
+    """
+    if contracts <= 0:
+        raise ValueError("option position contracts must be positive")
+    if premium_entry <= 0:
+        raise ValueError("option position premium_entry must be positive")
+    conn = get_connection()
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _guard_linked_pending_order_fill(
+            conn,
+            pending_order_id,
+            "option",
+            position_id,
+            filled_qty=contracts,
+            filled_avg_price=premium_entry,
+        )
+        row = conn.execute(
+            "SELECT contracts, premium_entry FROM option_positions WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("linked option position row is missing")
+        current_contracts = float(row["contracts"])
+        current_premium = row["premium_entry"]
+        if contracts < current_contracts:
+            raise ValueError(
+                "cumulative fill regressed below the materialized holding "
+                f"({contracts} < {current_contracts})"
+            )
+        if contracts == current_contracts:
+            if current_premium is None or float(current_premium) != premium_entry:
+                raise ValueError(
+                    "cumulative quantity unchanged but average fill price diverged"
+                )
+            conn.commit()
+            return False
+        conn.execute(
+            "UPDATE option_positions SET contracts = ?, premium_entry = ? WHERE id = ?",
+            (contracts, premium_entry, position_id),
+        )
+        conn.commit()
+        return True
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 # ---- long-term positions (Phase 14) ----
 
 
-def insert_long_term_position(pos: LongTermPosition) -> int:
-    """Insert a position into the long-term lifecycle book and return its id."""
+def _insert_long_term_position_row(
+    conn: sqlite3.Connection, pos: LongTermPosition,
+) -> int:
+    """Insert one long-term position on an OPEN connection; the caller commits.
+
+    Split out so the eager writer and the atomic fill materializer share one
+    column list and never drift apart.
+    """
     if pos.status not in ("open", "closed"):
         raise ValueError(f"Invalid status '{pos.status}'")
     if pos.source not in VALID_POSITION_SOURCES:
@@ -3224,13 +3319,19 @@ def insert_long_term_position(pos: LongTermPosition) -> int:
         pos.sl,
         pos.deadline.isoformat() if pos.deadline is not None else None,
     )
+    cur = conn.execute(sql, params)
+    new_id = cur.lastrowid
+    if new_id is None:
+        raise RuntimeError("INSERT did not return a row id")
+    return new_id
+
+
+def insert_long_term_position(pos: LongTermPosition) -> int:
+    """Insert a position into the long-term lifecycle book and return its id."""
     conn = get_connection()
     try:
-        cur = conn.execute(sql, params)
+        new_id = _insert_long_term_position_row(conn, pos)
         conn.commit()
-        new_id = cur.lastrowid
-        if new_id is None:
-            raise RuntimeError("INSERT did not return a row id")
         return new_id
     finally:
         conn.close()
@@ -3313,6 +3414,85 @@ def update_long_term_position(position_id: int, **fields: Any) -> None:
     try:
         conn.execute(sql, params)
         conn.commit()
+    finally:
+        conn.close()
+
+
+def get_long_term_position(position_id: int) -> LongTermPosition | None:
+    """Return one long-term position by row id, or None."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM long_term_positions WHERE id = ?", (position_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return _row_to_long_term_position(row) if row is not None else None
+
+
+def update_long_term_position_fill(
+    pending_order_id: int,
+    position_id: int,
+    *,
+    qty: float,
+    entry_price: float,
+) -> bool:
+    """Advance a materialized long-term position to a larger cumulative fill.
+
+    Separate from :func:`update_long_term_position` (the exit-watcher
+    whitelist): only the fill materializer calls this, when a later cumulative
+    broker snapshot raises share quantity / weighted-average entry on an already
+    linked position. Entry price mirrors the broker average, never a quote.
+
+    The compare-and-update runs under one write transaction so an older worker
+    cannot overwrite a newer materialized quantity. Returns ``True`` only when
+    the position advanced; an exact replay returns ``False``.
+    """
+    if qty <= 0:
+        raise ValueError("long-term position qty must be positive")
+    if entry_price <= 0:
+        raise ValueError("long-term position entry_price must be positive")
+    conn = get_connection()
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _guard_linked_pending_order_fill(
+            conn,
+            pending_order_id,
+            "long_term",
+            position_id,
+            filled_qty=qty,
+            filled_avg_price=entry_price,
+        )
+        row = conn.execute(
+            "SELECT qty, entry_price FROM long_term_positions WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("linked long-term position row is missing")
+        current_qty = float(row["qty"])
+        current_entry = float(row["entry_price"])
+        if qty < current_qty:
+            raise ValueError(
+                "cumulative fill regressed below the materialized holding "
+                f"({qty} < {current_qty})"
+            )
+        if qty == current_qty:
+            if current_entry != entry_price:
+                raise ValueError(
+                    "cumulative quantity unchanged but average fill price diverged"
+                )
+            conn.commit()
+            return False
+        conn.execute(
+            "UPDATE long_term_positions SET qty = ?, entry_price = ? WHERE id = ?",
+            (qty, entry_price, position_id),
+        )
+        conn.commit()
+        return True
+    except BaseException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -3961,5 +4141,165 @@ def update_pending_order(pending_order_id: int, **fields: Any) -> None:
     try:
         conn.execute(sql, [*normalized.values(), pending_order_id])
         conn.commit()
+    finally:
+        conn.close()
+
+
+def get_pending_orders_with_fills() -> list[PendingOrder]:
+    """Bound rows carrying a positive cumulative fill — materialization candidates.
+
+    Includes terminal rows: a canceled/rejected/expired order that filled part
+    of its quantity still owns a real partial position to materialize.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM pending_orders WHERE filled_qty > 0 "
+            "ORDER BY submitted_at ASC, id ASC"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_pending_order(row) for row in rows]
+
+
+def _guard_unlinked_pending_order(
+    conn: sqlite3.Connection,
+    pending_order_id: int,
+    position_kind: str,
+    *,
+    filled_qty: float,
+    filled_avg_price: float,
+) -> None:
+    """Confirm, inside the write transaction, that this row may still link.
+
+    Closes the read-check-write window: the position link is only inserted when
+    the ledger row still exists, still targets ``position_kind``, and is not
+    already linked. A concurrent or replayed materialization therefore cannot
+    insert a second position.
+    """
+    row = conn.execute(
+        "SELECT target_position_kind, position_id, filled_qty, filled_avg_price "
+        "FROM pending_orders WHERE id = ?",
+        (pending_order_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"pending order {pending_order_id} not found")
+    if row["position_id"] is not None:
+        raise ValueError("pending order already links a materialized position")
+    if row["target_position_kind"] != position_kind:
+        raise ValueError(
+            "materialized position kind does not match the pending-order target"
+        )
+    if (
+        float(row["filled_qty"]) != filled_qty
+        or row["filled_avg_price"] is None
+        or float(row["filled_avg_price"]) != filled_avg_price
+    ):
+        raise ValueError("pending-order fill changed before the position could link")
+
+
+def _guard_linked_pending_order_fill(
+    conn: sqlite3.Connection,
+    pending_order_id: int,
+    position_kind: str,
+    position_id: int,
+    *,
+    filled_qty: float,
+    filled_avg_price: float,
+) -> None:
+    """Verify a cumulative position update still matches durable ledger truth."""
+    row = conn.execute(
+        "SELECT position_kind, position_id, filled_qty, filled_avg_price "
+        "FROM pending_orders WHERE id = ?",
+        (pending_order_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"pending order {pending_order_id} not found")
+    if row["position_kind"] != position_kind or row["position_id"] != position_id:
+        raise ValueError("pending-order position link changed before the fill update")
+    if (
+        float(row["filled_qty"]) != filled_qty
+        or row["filled_avg_price"] is None
+        or float(row["filled_avg_price"]) != filled_avg_price
+    ):
+        raise ValueError("pending-order fill changed before the position could update")
+
+
+def _link_pending_order_position(
+    conn: sqlite3.Connection,
+    pending_order_id: int,
+    position_kind: str,
+    position_id: int,
+) -> None:
+    """Bind the eventual position link on an OPEN transaction; caller commits."""
+    cur = conn.execute(
+        "UPDATE pending_orders SET position_kind = ?, position_id = ? WHERE id = ?",
+        (position_kind, position_id, pending_order_id),
+    )
+    if cur.rowcount != 1:
+        raise RuntimeError("pending-order position link did not update exactly one row")
+
+
+def materialize_new_option_position(
+    pending_order_id: int, pos: OptionPosition,
+) -> int:
+    """Atomically insert an option position and link its pending-order row.
+
+    The insert and the ledger link commit together or roll back together, so a
+    failed link can never leave an orphan position and a replay can never insert
+    a second one. Returns the new position row id.
+    """
+    if pos.premium_entry is None:
+        raise ValueError("option materialization requires a broker average fill price")
+    conn = get_connection()
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _guard_unlinked_pending_order(
+            conn,
+            pending_order_id,
+            "option",
+            filled_qty=pos.contracts,
+            filled_avg_price=pos.premium_entry,
+        )
+        position_id = _insert_option_position_row(conn, pos)
+        _link_pending_order_position(conn, pending_order_id, "option", position_id)
+        conn.commit()
+        return position_id
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def materialize_new_long_term_position(
+    pending_order_id: int, pos: LongTermPosition,
+) -> int:
+    """Atomically insert a long-term position and link its pending-order row.
+
+    Same all-or-nothing guarantee as :func:`materialize_new_option_position`.
+    Returns the new position row id.
+    """
+    conn = get_connection()
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _guard_unlinked_pending_order(
+            conn,
+            pending_order_id,
+            "long_term",
+            filled_qty=pos.qty,
+            filled_avg_price=pos.entry_price,
+        )
+        position_id = _insert_long_term_position_row(conn, pos)
+        _link_pending_order_position(
+            conn, pending_order_id, "long_term", position_id
+        )
+        conn.commit()
+        return position_id
+    except BaseException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
