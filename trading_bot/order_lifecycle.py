@@ -1,8 +1,8 @@
-"""Durable capture of accepted broker-order materialization intent.
+"""Durable capture and dormant refresh of broker-order lifecycle truth.
 
-This module is deliberately limited to submit-time capture. Later lifecycle
-refresh and fill materialization remain separate capabilities; until their
-final cutover, the existing eager position writers stay active.
+Fill materialization remains a separate capability.  Until the final cutover,
+the refresh functions in this module are callable but unscheduled and the
+existing eager position writers stay active.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from trading_bot.broker.base import (
     STATUS_CANCELED,
     STATUS_ERROR,
     STATUS_FILLED,
+    STATUS_NEW,
     STATUS_PARTIALLY_FILLED,
     STATUS_REJECTED,
     STATUS_UNKNOWN,
@@ -68,6 +69,35 @@ RECOVERY_ABANDONED = "abandoned"
 RECOVERY_UNCHANGED = "unchanged"
 RECOVERY_REFUSED = "refused"
 
+RECOVERY_REASON_MALFORMED = "malformed"
+RECOVERY_REASON_NOT_FOUND = "not_found"
+RECOVERY_REASON_STATE = "state"
+RECOVERY_REASON_UNAVAILABLE = "unavailable"
+
+REFRESH_UPDATED = "updated"
+REFRESH_UNCHANGED = "unchanged"
+REFRESH_UNAVAILABLE = "unavailable"
+REFRESH_MALFORMED = "malformed"
+REFRESH_STALE = "stale"
+REFRESH_SKIPPED = "skipped"
+REFRESH_FAILED = "failed"
+
+_BOUND_BROKER_STATUSES: frozenset[str] = frozenset(
+    {
+        STATUS_NEW,
+        STATUS_PARTIALLY_FILLED,
+        STATUS_FILLED,
+        STATUS_CANCELED,
+        STATUS_REJECTED,
+        STATUS_UNKNOWN,
+    }
+)
+_NONTERMINAL_STATUS_RANK = {
+    STATUS_UNKNOWN: 0,
+    STATUS_NEW: 1,
+    STATUS_PARTIALLY_FILLED: 2,
+}
+
 
 @dataclass(frozen=True)
 class PreparedOrderRecoveryResult:
@@ -77,6 +107,31 @@ class PreparedOrderRecoveryResult:
     action: str
     reason: str = ""
     broker_order_id: str | None = None
+    reason_kind: str = ""
+
+
+@dataclass(frozen=True)
+class PendingOrderRefreshResult:
+    """Durable outcome of one prepared or bound order refresh attempt."""
+
+    pending_order_id: int | None
+    client_order_id: str | None
+    broker_order_id: str | None
+    action: str
+    previous_status: str
+    lifecycle_status: str
+    filled_qty: float
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class _LifecycleSnapshot:
+    lifecycle_status: str
+    broker_status: str | None
+    filled_qty: float
+    filled_avg_price: float | None
+    terminal_reason: str | None
+    terminal_at: datetime | None
 
 
 def _immutable_intent(order: PendingOrder) -> tuple[object, ...]:
@@ -443,6 +498,7 @@ def recover_prepared_order(
             client_order_id=client_order_id,
             action=RECOVERY_REFUSED,
             reason="synthetic legacy client order ID is not provider-recoverable",
+            reason_kind=RECOVERY_REASON_STATE,
         )
     pending = db.get_pending_order_by_client_order_id(client_order_id)
     if pending is None:
@@ -450,6 +506,7 @@ def recover_prepared_order(
             client_order_id=client_order_id,
             action=RECOVERY_UNCHANGED,
             reason="prepared order not found in local ledger",
+            reason_kind=RECOVERY_REASON_STATE,
         )
     if pending.lifecycle_status != "prepared":
         return PreparedOrderRecoveryResult(
@@ -457,6 +514,7 @@ def recover_prepared_order(
             action=RECOVERY_UNCHANGED,
             reason=f"local lifecycle is already {pending.lifecycle_status}",
             broker_order_id=pending.broker_order_id,
+            reason_kind=RECOVERY_REASON_STATE,
         )
     moment = observed_at or datetime.now(UTC)
     try:
@@ -470,6 +528,7 @@ def recover_prepared_order(
             client_order_id=client_order_id,
             action=RECOVERY_UNCHANGED,
             reason=str(exc),
+            reason_kind=RECOVERY_REASON_UNAVAILABLE,
         )
     if lookup.outcome == ORDER_LOOKUP_NOT_FOUND:
         _abandon_prepared_order(
@@ -481,12 +540,14 @@ def recover_prepared_order(
             client_order_id=client_order_id,
             action=RECOVERY_ABANDONED,
             reason=lookup.reason,
+            reason_kind=RECOVERY_REASON_NOT_FOUND,
         )
     if lookup.outcome != ORDER_LOOKUP_FOUND or lookup.order is None:
         return PreparedOrderRecoveryResult(
             client_order_id=client_order_id,
             action=RECOVERY_UNCHANGED,
             reason=lookup.reason or "client order ID lookup unavailable",
+            reason_kind=RECOVERY_REASON_UNAVAILABLE,
         )
     try:
         _bind_prepared_snapshot(pending, lookup.order, observed_at=moment)
@@ -496,6 +557,7 @@ def recover_prepared_order(
             client_order_id=client_order_id,
             action=RECOVERY_UNCHANGED,
             reason=str(exc),
+            reason_kind=RECOVERY_REASON_MALFORMED,
         )
     return PreparedOrderRecoveryResult(
         client_order_id=client_order_id,
@@ -524,6 +586,342 @@ def recover_prepared_orders(
             observed_at=observed_at,
         )
         for client_order_id in client_order_ids
+    ]
+
+
+def _refresh_result(
+    previous: PendingOrder,
+    current: PendingOrder,
+    *,
+    action: str,
+    reason: str = "",
+) -> PendingOrderRefreshResult:
+    return PendingOrderRefreshResult(
+        pending_order_id=current.id,
+        client_order_id=current.client_order_id,
+        broker_order_id=current.broker_order_id,
+        action=action,
+        previous_status=previous.lifecycle_status,
+        lifecycle_status=current.lifecycle_status,
+        filled_qty=current.filled_qty,
+        reason=reason,
+    )
+
+
+def _log_refresh_issue(order: PendingOrder, category: str, reason: str) -> None:
+    identity = order.broker_order_id or order.client_order_id or "unidentified"
+    print(
+        f"  order lifecycle: refresh {category} for {identity} ({reason})",
+        file=sys.stderr,
+    )
+
+
+def _current_pending_order(order: PendingOrder) -> PendingOrder | None:
+    """Reload one caller-supplied row before performing external work."""
+    if order.client_order_id is None:
+        return None
+    return db.get_pending_order_by_client_order_id(order.client_order_id)
+
+
+def _normalize_refresh_snapshot(
+    pending: PendingOrder,
+    order: OrderResult,
+    *,
+    observed_at: datetime,
+) -> _LifecycleSnapshot:
+    """Validate one bound-order read and normalize its cumulative truth."""
+    expected_order_id = pending.broker_order_id
+    if order.order_id is not None and not isinstance(order.order_id, str):
+        raise OrderIntentCaptureError("broker refresh returned a malformed order ID")
+    returned_order_id = order.order_id.strip() if order.order_id is not None else ""
+    if expected_order_id is None:
+        raise OrderIntentCaptureError("bound refresh row has no broker order ID")
+    if not returned_order_id:
+        raise OrderIntentCaptureError("broker refresh response has no order ID")
+    if returned_order_id != expected_order_id:
+        raise OrderIntentCaptureError(
+            f"broker refresh returned order ID {returned_order_id!r}, "
+            f"expected {expected_order_id!r}"
+        )
+    if not isinstance(order.status, str) or order.status not in _BOUND_BROKER_STATUSES:
+        raise OrderIntentCaptureError(
+            f"broker refresh returned invalid lifecycle status {order.status!r}"
+        )
+    if order.raw_status is not None and not isinstance(order.raw_status, str):
+        raise OrderIntentCaptureError("broker refresh returned a malformed raw status")
+    if not isinstance(order.reason, str):
+        raise OrderIntentCaptureError("broker refresh returned a malformed reason")
+    if isinstance(order.filled_qty, bool) or isinstance(order.filled_avg_price, bool):
+        raise OrderIntentCaptureError("broker refresh returned a malformed fill snapshot")
+    raw_status = order.raw_status.strip() if order.raw_status else None
+    if order.status == STATUS_UNKNOWN and raw_status is None:
+        raise OrderIntentCaptureError(
+            "broker refresh returned neither a recognized nor raw lifecycle status"
+        )
+    (
+        lifecycle_status,
+        broker_status,
+        filled_qty,
+        filled_avg_price,
+        terminal_reason,
+        terminal_at,
+    ) = _initial_lifecycle(
+        order,
+        requested_qty=pending.requested_qty,
+        observed_at=observed_at,
+    )
+    return _LifecycleSnapshot(
+        lifecycle_status=lifecycle_status,
+        broker_status=broker_status,
+        filled_qty=filled_qty,
+        filled_avg_price=filled_avg_price,
+        terminal_reason=terminal_reason,
+        terminal_at=terminal_at,
+    )
+
+
+def _same_number(left: float, right: float) -> bool:
+    return math.isclose(left, right, rel_tol=1e-12, abs_tol=1e-12)
+
+
+def _apply_bound_refresh(
+    pending: PendingOrder,
+    order: OrderResult,
+    *,
+    observed_at: datetime,
+) -> PendingOrderRefreshResult:
+    try:
+        snapshot = _normalize_refresh_snapshot(
+            pending,
+            order,
+            observed_at=observed_at,
+        )
+    except OrderIntentCaptureError as exc:
+        reason = str(exc)
+        _log_refresh_issue(pending, REFRESH_MALFORMED, reason)
+        return _refresh_result(
+            pending,
+            pending,
+            action=REFRESH_MALFORMED,
+            reason=reason,
+        )
+
+    quantity_is_equal = _same_number(snapshot.filled_qty, pending.filled_qty)
+    if snapshot.filled_qty < pending.filled_qty and not quantity_is_equal:
+        reason = (
+            f"filled_qty regression {snapshot.filled_qty} < {pending.filled_qty}"
+        )
+        _log_refresh_issue(pending, REFRESH_STALE, reason)
+        return _refresh_result(
+            pending,
+            pending,
+            action=REFRESH_STALE,
+            reason=reason,
+        )
+    if quantity_is_equal and pending.filled_qty > 0:
+        assert pending.filled_avg_price is not None
+        assert snapshot.filled_avg_price is not None
+        if not _same_number(snapshot.filled_avg_price, pending.filled_avg_price):
+            reason = (
+                "average fill price changed without a cumulative quantity increase"
+            )
+            _log_refresh_issue(pending, REFRESH_MALFORMED, reason)
+            return _refresh_result(
+                pending,
+                pending,
+                action=REFRESH_MALFORMED,
+                reason=reason,
+            )
+
+    if snapshot.lifecycle_status not in TERMINAL_PENDING_ORDER_STATUSES:
+        previous_rank = _NONTERMINAL_STATUS_RANK[pending.lifecycle_status]
+        incoming_rank = _NONTERMINAL_STATUS_RANK[snapshot.lifecycle_status]
+        if incoming_rank < previous_rank:
+            reason = (
+                f"lifecycle regression {pending.lifecycle_status} -> "
+                f"{snapshot.lifecycle_status}"
+            )
+            _log_refresh_issue(pending, REFRESH_STALE, reason)
+            return _refresh_result(
+                pending,
+                pending,
+                action=REFRESH_STALE,
+                reason=reason,
+            )
+
+    effective_filled_qty = pending.filled_qty if quantity_is_equal else snapshot.filled_qty
+    effective_avg_price = (
+        pending.filled_avg_price if quantity_is_equal else snapshot.filled_avg_price
+    )
+    state_changed = (
+        snapshot.lifecycle_status != pending.lifecycle_status
+        or snapshot.broker_status != pending.broker_status
+        or not quantity_is_equal
+        or effective_avg_price != pending.filled_avg_price
+        or snapshot.terminal_reason != pending.terminal_reason
+        or snapshot.terminal_at != pending.terminal_at
+    )
+    if not state_changed:
+        return _refresh_result(
+            pending,
+            pending,
+            action=REFRESH_UNCHANGED,
+            reason="repeated cumulative broker snapshot",
+        )
+
+    assert pending.id is not None
+    try:
+        db.update_pending_order(
+            pending.id,
+            lifecycle_status=snapshot.lifecycle_status,
+            broker_status=snapshot.broker_status,
+            filled_qty=effective_filled_qty,
+            filled_avg_price=effective_avg_price,
+            last_refreshed_at=observed_at,
+            terminal_reason=snapshot.terminal_reason,
+            terminal_at=snapshot.terminal_at,
+        )
+    except (sqlite3.Error, TypeError, ValueError) as exc:
+        reason = f"durable lifecycle update failed: {exc}"
+        _log_refresh_issue(pending, REFRESH_FAILED, reason)
+        return _refresh_result(
+            pending,
+            pending,
+            action=REFRESH_FAILED,
+            reason=reason,
+        )
+    current = dataclasses.replace(
+        pending,
+        lifecycle_status=snapshot.lifecycle_status,
+        broker_status=snapshot.broker_status,
+        filled_qty=effective_filled_qty,
+        filled_avg_price=effective_avg_price,
+        last_refreshed_at=observed_at,
+        terminal_reason=snapshot.terminal_reason,
+        terminal_at=snapshot.terminal_at,
+    )
+    return _refresh_result(pending, current, action=REFRESH_UPDATED)
+
+
+def _refresh_prepared_order(
+    broker: Broker,
+    pending: PendingOrder,
+    *,
+    observed_at: datetime,
+) -> PendingOrderRefreshResult:
+    client_order_id = pending.client_order_id
+    assert client_order_id is not None
+    try:
+        recovery = recover_prepared_order(
+            broker,
+            client_order_id,
+            observed_at=observed_at,
+        )
+    except (OrderIntentCaptureError, sqlite3.Error, TypeError, ValueError) as exc:
+        reason = f"prepared-order recovery failed: {exc}"
+        _log_refresh_issue(pending, REFRESH_FAILED, reason)
+        return _refresh_result(
+            pending,
+            pending,
+            action=REFRESH_FAILED,
+            reason=reason,
+        )
+    current = db.get_pending_order_by_client_order_id(client_order_id) or pending
+    if recovery.action in (RECOVERY_BOUND, RECOVERY_ABANDONED):
+        return _refresh_result(pending, current, action=REFRESH_UPDATED)
+    if recovery.reason_kind == RECOVERY_REASON_UNAVAILABLE:
+        _log_refresh_issue(pending, REFRESH_UNAVAILABLE, recovery.reason)
+        return _refresh_result(
+            pending,
+            current,
+            action=REFRESH_UNAVAILABLE,
+            reason=recovery.reason,
+        )
+    if recovery.reason_kind == RECOVERY_REASON_MALFORMED:
+        _log_refresh_issue(pending, REFRESH_MALFORMED, recovery.reason)
+        return _refresh_result(
+            pending,
+            current,
+            action=REFRESH_MALFORMED,
+            reason=recovery.reason,
+        )
+    action = REFRESH_SKIPPED if recovery.action == RECOVERY_REFUSED else REFRESH_UNCHANGED
+    return _refresh_result(
+        pending,
+        current,
+        action=action,
+        reason=recovery.reason,
+    )
+
+
+def refresh_pending_order(
+    broker: Broker,
+    pending: PendingOrder,
+    *,
+    observed_at: datetime | None = None,
+) -> PendingOrderRefreshResult:
+    """Refresh one durable row without submitting or materializing a position."""
+    current = _current_pending_order(pending)
+    if current is None:
+        return _refresh_result(
+            pending,
+            pending,
+            action=REFRESH_SKIPPED,
+            reason="pending order is no longer present in the durable ledger",
+        )
+    if current.lifecycle_status in TERMINAL_PENDING_ORDER_STATUSES:
+        return _refresh_result(
+            current,
+            current,
+            action=REFRESH_SKIPPED,
+            reason=f"local lifecycle is already {current.lifecycle_status}",
+        )
+    moment = observed_at or datetime.now(UTC)
+    if current.lifecycle_status == "prepared":
+        return _refresh_prepared_order(
+            broker,
+            current,
+            observed_at=moment,
+        )
+    broker_order_id = current.broker_order_id
+    assert broker_order_id is not None
+    try:
+        snapshot = broker.get_order(broker_order_id)
+    except Exception as exc:  # noqa: BLE001 - broker boundary must remain fail-soft
+        reason = str(exc) or "broker order read raised"
+        _log_refresh_issue(current, REFRESH_UNAVAILABLE, reason)
+        return _refresh_result(
+            current,
+            current,
+            action=REFRESH_UNAVAILABLE,
+            reason=reason,
+        )
+    if not snapshot.ok or snapshot.status == STATUS_ERROR:
+        reason = (
+            snapshot.reason.strip()
+            if isinstance(snapshot.reason, str) and snapshot.reason.strip()
+            else "broker order read unavailable"
+        )
+        _log_refresh_issue(current, REFRESH_UNAVAILABLE, reason)
+        return _refresh_result(
+            current,
+            current,
+            action=REFRESH_UNAVAILABLE,
+            reason=reason,
+        )
+    return _apply_bound_refresh(current, snapshot, observed_at=moment)
+
+
+def refresh_pending_orders(
+    broker: Broker,
+    *,
+    observed_at: datetime | None = None,
+) -> list[PendingOrderRefreshResult]:
+    """Refresh every nonterminal ledger row once; deliberately unscheduled."""
+    moment = observed_at or datetime.now(UTC)
+    return [
+        refresh_pending_order(broker, pending, observed_at=moment)
+        for pending in db.get_nonterminal_pending_orders()
     ]
 
 
