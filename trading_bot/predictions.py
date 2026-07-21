@@ -233,6 +233,30 @@ def tally_votes(votes: dict[str, int]) -> tuple[str | None, float]:
 # ────────────────────────────────────────────────────────────────────────────
 
 
+def _closed_15m_candles(
+    df: pd.DataFrame, now: datetime,
+) -> pd.DataFrame:
+    """Return only candles whose full 15-minute interval has elapsed.
+
+    yfinance indexes intraday rows by candle-open time. A row is therefore
+    closed only when ``row timestamp + 15 minutes <= now``. A timezone-aware
+    index is compared in its own timezone. A naive index is treated as
+    exchange-local wall time, so callers must supply ``now`` in that same
+    local timezone; stripping the timezone avoids silently assuming UTC.
+    """
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("prediction now must be timezone-aware")
+
+    index = pd.DatetimeIndex(pd.to_datetime(df.index))
+    if index.tz is None:
+        comparison_now = pd.Timestamp(now.replace(tzinfo=None))
+    else:
+        comparison_now = pd.Timestamp(now).tz_convert(index.tz)
+
+    bar_ends = index + pd.Timedelta(minutes=_WINDOW_MINUTES)
+    return df.loc[bar_ends <= comparison_now]
+
+
 def _fetch_15m_candles(ticker: str) -> pd.DataFrame | None:
     """Pull recent 15-min candles. Returns None on any failure or empty."""
     try:
@@ -275,8 +299,25 @@ def predict_direction(
     Regime + VIX are tagged at call time; their fetch errors fall back to
     ``'unknown'`` rather than blocking the prediction.
     """
+    created_at = now if now is not None else datetime.now(UTC)
     df = _fetch_15m_candles(ticker)
     if df is None:
+        return None
+
+    try:
+        df = _closed_15m_candles(df, created_at)
+    except (TypeError, ValueError) as exc:
+        print(
+            f"  prediction candle timestamp error for {ticker}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+    if df.shape[0] < _MIN_CANDLES:
+        print(
+            f"  prediction insufficient closed candles for {ticker}: "
+            f"{df.shape[0]} available, {_MIN_CANDLES} required",
+            file=sys.stderr,
+        )
         return None
 
     votes = _gather_votes(df)
@@ -290,7 +331,6 @@ def predict_direction(
         return None
 
     entry_price = float(df["Close"].iloc[-1])
-    created_at = now if now is not None else datetime.now(UTC)
     target_window_end = created_at + timedelta(minutes=_WINDOW_MINUTES)
 
     # Context tags. Same fail-soft contract as the swing trade scanner.

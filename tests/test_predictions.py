@@ -12,6 +12,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -114,6 +115,23 @@ def _patch_fetch(
     monkeypatch.setattr(
         "trading_bot.predictions._fetch_15m_candles", lambda _t: df,
     )
+
+
+def _with_forming_reversal(closed: pd.DataFrame) -> pd.DataFrame:
+    """Append a still-forming row that reverses the real indicator verdict."""
+    last_close = float(closed["Close"].iloc[-1])
+    forming_start = closed.index[-1] + timedelta(minutes=15)
+    forming = pd.DataFrame(
+        {
+            "Open": [last_close],
+            "High": [last_close + 1.0],
+            "Low": [0.0],
+            "Close": [1.0],
+            "Volume": [1_000_000_000],
+        },
+        index=pd.DatetimeIndex([forming_start]),
+    )
+    return pd.concat([closed, forming])
 
 
 # ────────────────────── tally_votes (pure) ──────────────────────
@@ -329,10 +347,107 @@ def test_predict_target_window_is_15_minutes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_fetch(monkeypatch, _strong_uptrend())
-    now = datetime(2026, 5, 26, 14, 30, tzinfo=UTC)
+    now = datetime(2026, 5, 27, 0, 0, tzinfo=UTC)
     pred = predictions.predict_direction("BTC-USD", now=now)
     assert pred is not None
     assert pred.target_window_end == now + timedelta(minutes=15)
+
+
+def test_predict_excludes_forming_row_from_votes_and_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed = _strong_uptrend()
+    candles = _with_forming_reversal(closed)
+    now = candles.index[-1].to_pydatetime() + timedelta(minutes=7)
+    assert predictions.tally_votes(predictions._gather_votes(candles))[0] == "LOWER"
+
+    _patch_fetch(monkeypatch, candles)
+    pred = predictions.predict_direction("BTC-USD", now=now)
+
+    assert pred is not None
+    assert pred.direction == "HIGHER"
+    assert pred.entry_price == pytest.approx(float(closed["Close"].iloc[-1]))
+    assert json.loads(pred.signals_used) == predictions._gather_votes(closed)
+
+
+def test_predict_keeps_latest_row_when_provider_omits_forming_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed = _strong_uptrend()
+    now = closed.index[-1].to_pydatetime() + timedelta(minutes=22)
+    _patch_fetch(monkeypatch, closed)
+
+    pred = predictions.predict_direction("BTC-USD", now=now)
+
+    assert pred is not None
+    assert pred.direction == "HIGHER"
+    assert pred.entry_price == pytest.approx(float(closed["Close"].iloc[-1]))
+
+
+def test_predict_includes_row_at_exact_close_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candles = _with_forming_reversal(_strong_uptrend())
+    now = candles.index[-1].to_pydatetime() + timedelta(minutes=15)
+    _patch_fetch(monkeypatch, candles)
+
+    pred = predictions.predict_direction("BTC-USD", now=now)
+
+    assert pred is not None
+    assert pred.direction == "LOWER"
+    assert pred.entry_price == pytest.approx(1.0)
+
+
+def test_predict_compares_aware_index_in_its_timezone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candles = _with_forming_reversal(_strong_uptrend())
+    candles = candles.tz_convert("America/New_York")
+    now_utc = (
+        candles.index[-1].tz_convert("UTC").to_pydatetime()
+        + timedelta(minutes=7)
+    )
+    _patch_fetch(monkeypatch, candles)
+
+    pred = predictions.predict_direction("BTC-USD", now=now_utc)
+
+    assert pred is not None
+    assert pred.direction == "HIGHER"
+    assert pred.entry_price != pytest.approx(1.0)
+
+
+def test_predict_treats_naive_index_as_exchange_local_wall_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candles = _with_forming_reversal(_strong_uptrend())
+    local_zone = ZoneInfo("America/New_York")
+    local_candles = candles.tz_convert(local_zone)
+    now_local = (
+        local_candles.index[-1].to_pydatetime() + timedelta(minutes=7)
+    )
+    local_candles.index = local_candles.index.tz_localize(None)
+    _patch_fetch(monkeypatch, local_candles)
+
+    pred = predictions.predict_direction("BTC-USD", now=now_local)
+
+    assert pred is not None
+    assert pred.direction == "HIGHER"
+    assert pred.entry_price != pytest.approx(1.0)
+
+
+def test_predict_fails_clearly_when_closed_history_is_insufficient(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    candles = _strong_uptrend(n=30)
+    now = candles.index[-1].to_pydatetime() + timedelta(minutes=7)
+    _patch_fetch(monkeypatch, candles)
+
+    assert predictions.predict_direction("BTC-USD", now=now) is None
+    assert (
+        "prediction insufficient closed candles for BTC-USD: "
+        "29 available, 30 required"
+    ) in capsys.readouterr().err
 
 
 # ────────────────────── resolution ──────────────────────
