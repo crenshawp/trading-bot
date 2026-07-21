@@ -251,6 +251,70 @@ class PlanExecution:
     id: int | None = None
 
 
+# Cross-cutting order-lifecycle audit: durable accepted-order ledger.  The
+# normalized status deliberately mirrors the broker-neutral vocabulary except
+# that transport ``error`` is not durable broker truth.  ``expired`` remains
+# distinct here even though the current Alpaca adapter maps it to ``canceled``;
+# the raw broker status is retained alongside it for the lifecycle materializer.
+PENDING_ORDER_INTENT_VERSION = 1
+VALID_PENDING_ORDER_INTENT_KINDS: frozenset[str] = frozenset(
+    {"option", "long_term", "shares_fallback"}
+)
+VALID_PENDING_ORDER_STATUSES: frozenset[str] = frozenset(
+    {"new", "partially_filled", "filled", "canceled", "rejected", "expired", "unknown"}
+)
+TERMINAL_PENDING_ORDER_STATUSES: frozenset[str] = frozenset(
+    {"filled", "canceled", "rejected", "expired"}
+)
+VALID_PENDING_ORDER_VEHICLES: frozenset[str] = frozenset(
+    {"option_full", "option_undersized", "shares"}
+)
+VALID_PENDING_ORDER_POSITION_KINDS: frozenset[str] = frozenset(
+    {"option", "long_term"}
+)
+VALID_PENDING_ORDER_SIDES: frozenset[str] = frozenset({"buy", "sell"})
+
+
+@dataclass(frozen=True)
+class PendingOrder:
+    """Accepted broker order awaiting cumulative fill materialization.
+
+    Common submission intent is normalized for restart-safe lookup.  Target-
+    specific materialization data lives in immutable ``intent_payload_json``;
+    ``intent_payload_version`` selects its decoder.  Version 1 payloads use an
+    ``intent_kind`` of ``option``, ``long_term``, or ``shares_fallback``.
+
+    Lifecycle fields always represent the latest *usable* cumulative broker
+    snapshot.  Broker read errors are not records and must leave these values
+    unchanged.  ``position_kind`` plus ``position_id`` is the typed, one-time
+    link to the eventual option_positions or long_term_positions row.
+    """
+
+    broker_order_id: str
+    ticker: str
+    broker_symbol: str
+    asset_class: str
+    vehicle: str
+    target_position_kind: str
+    side: str
+    requested_qty: float
+    requested_limit_price: float | None
+    submitted_at: datetime
+    intent_payload_json: str
+    signal_id: int | None = None
+    intent_payload_version: int = PENDING_ORDER_INTENT_VERSION
+    lifecycle_status: str = "new"
+    broker_status: str | None = None
+    filled_qty: float = 0.0
+    filled_avg_price: float | None = None
+    last_refreshed_at: datetime | None = None
+    terminal_reason: str | None = None
+    terminal_at: datetime | None = None
+    position_kind: str | None = None
+    position_id: int | None = None
+    id: int | None = None
+
+
 @dataclass(frozen=True)
 class OptionPosition:
     """An open/closed single-leg option position (Phase 13).
