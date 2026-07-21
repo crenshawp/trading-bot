@@ -1541,6 +1541,16 @@ def cmd_allocate_execute(*, confirm: bool, sample: bool = False) -> None:
     pull is the one that marks them considered — a signal enters a submitting
     plan exactly once, whatever that plan later does with it.
     """
+    # The sample fixture is for plan/demo inspection only.  Refuse this flag
+    # combination before constructing an Alpaca client so fabricated candidates
+    # can never reach broker I/O, whether invoked through argparse or directly.
+    if confirm and sample:
+        print("EXECUTION REFUSED: --sample is for planning/demo inspection only.")
+        print("  No broker connection was created and nothing was submitted.")
+        print("  Inspect the sample plan with:")
+        print("    python -m trading_bot allocate plan --sample")
+        return
+
     account, candidates, result, source_label = _build_live_plan(
         sample=sample, mark_considered=confirm,
     )

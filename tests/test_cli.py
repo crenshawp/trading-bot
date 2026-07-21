@@ -58,6 +58,28 @@ def test_cli_secrets_list(
     assert "NOT SET" in out
 
 
+def test_cli_allocate_execute_refuses_confirmed_sample_before_broker_io(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    constructions: list[bool] = []
+
+    def unexpected_broker() -> None:
+        constructions.append(True)
+        raise AssertionError("confirmed sample must not construct AlpacaBroker")
+
+    monkeypatch.setattr(
+        "trading_bot.__main__.broker.AlpacaBroker", unexpected_broker,
+    )
+    _run(["allocate", "execute", "--confirm", "--sample"])
+
+    out = capsys.readouterr().out
+    assert "EXECUTION REFUSED" in out
+    assert "planning/demo inspection only" in out
+    assert constructions == []                 # argparse path reaches the same guard
+
+
 # ───────────────────── Phase 1.3 outcomes subcommands ─────────────────────
 
 

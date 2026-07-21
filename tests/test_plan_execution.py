@@ -596,29 +596,26 @@ def test_cli_execute_refuses_without_confirm(
     assert db.get_plan_executions() == []
 
 
-def test_cli_execute_with_confirm_submits(
+def test_direct_execute_refuses_confirmed_sample_before_broker_construction(
     tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     from trading_bot import __main__ as m
 
-    class FakeChainClient:
-        def get_option_chain(self, _underlying: str) -> OptionChainResult:
-            return OptionChainResult(ok=False, reason="options not enabled")
+    constructions: list[bool] = []
 
-    broker = SpyBroker()
-    monkeypatch.setattr(m.broker, "AlpacaBroker", lambda: broker)
-    monkeypatch.setattr(m.broker, "AlpacaOptionsClient", FakeChainClient)
-    # Phase 17: the sample fixture stays available behind --sample.
+    def unexpected_broker() -> SpyBroker:
+        constructions.append(True)
+        raise AssertionError("confirmed sample must not construct AlpacaBroker")
+
+    monkeypatch.setattr(m.broker, "AlpacaBroker", unexpected_broker)
     m.cmd_allocate_execute(confirm=True, sample=True)
     out = capsys.readouterr().out
-    assert "PLAN EXECUTION" in out
-    assert "Submitted" in out
-    assert broker.submissions != []            # paper orders actually went out
-    rows = db.get_plan_executions()
-    assert rows and all(r.status == "submitted" for r in rows)
-    # The data-only crypto swing signals were filtered by the plan, never routed.
-    assert all(r.pool != config.POOL_CRYPTO for r in rows)
+    assert "EXECUTION REFUSED" in out
+    assert "planning/demo inspection only" in out
+    assert "allocate plan --sample" in out
+    assert constructions == []                 # ZERO broker construction / I/O
+    assert db.get_plan_executions() == []
 
 
 def test_cli_execute_with_confirm_refuses_when_unauthorized(
