@@ -122,6 +122,19 @@ _SNAPSHOTS_BODY = {
 }
 
 
+def _contract_row(
+    index: int, *, open_interest: str = "500",
+) -> dict[str, str]:
+    return {
+        "symbol": f"AAPL260116C{index:08d}",
+        "underlying_symbol": "AAPL",
+        "type": "call",
+        "strike_price": str(index / 1000),
+        "expiration_date": "2026-01-16",
+        "open_interest": open_interest,
+    }
+
+
 def test_options_client_construction_is_paper_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -144,6 +157,225 @@ def test_list_option_contracts_parses(monkeypatch: pytest.MonkeyPatch) -> None:
     assert c.strike == 150.0 and c.expiry == "2026-01-16"
     assert c.open_interest == 500
     assert c.delta is None            # greeks not populated by the metadata call
+
+
+def test_list_option_contracts_paginates_more_than_100_and_propagates_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_opt_creds(monkeypatch)
+    captured_params: list[dict[str, object]] = []
+    responses = iter([
+        _FakeGetResp(200, {
+            "option_contracts": [_contract_row(i) for i in range(100)],
+            "next_page_token": "contracts-page-2",
+        }),
+        _FakeGetResp(200, {
+            "option_contracts": [_contract_row(i) for i in range(100, 150)],
+            "next_page_token": None,
+        }),
+    ])
+
+    def route(
+        url: str,
+        *,
+        headers: object,
+        params: dict[str, object],
+        timeout: object,
+    ) -> _FakeGetResp:
+        assert "/v2/options/contracts" in url
+        captured_params.append(dict(params))
+        return next(responses)
+
+    monkeypatch.setattr("trading_bot.broker.options.requests.get", route)
+    contracts = options.AlpacaOptionsClient().list_option_contracts(
+        "AAPL",
+        expiration_gte="2026-01-01",
+        expiration_lte="2026-02-01",
+        option_type="call",
+    )
+
+    assert len(contracts) == 150
+    assert contracts[0].symbol == "AAPL260116C00000000"
+    assert contracts[-1].symbol == "AAPL260116C00000149"
+    assert "page_token" not in captured_params[0]
+    assert captured_params[1]["page_token"] == "contracts-page-2"
+    assert captured_params[1]["expiration_date_gte"] == "2026-01-01"
+    assert captured_params[1]["expiration_date_lte"] == "2026-02-01"
+    assert captured_params[1]["type"] == "call"
+    assert captured_params[1]["limit"] == 100
+
+
+def test_list_option_contracts_dedupes_first_seen_symbol_across_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_opt_creds(monkeypatch)
+    responses = iter([
+        _FakeGetResp(200, {
+            "option_contracts": [_contract_row(1, open_interest="100")],
+            "next_page_token": "next",
+        }),
+        _FakeGetResp(200, {
+            "option_contracts": [
+                _contract_row(1, open_interest="999"),
+                _contract_row(2),
+            ],
+        }),
+    ])
+    monkeypatch.setattr(
+        "trading_bot.broker.options.requests.get",
+        lambda *args, **kwargs: next(responses),
+    )
+
+    contracts = options.AlpacaOptionsClient().list_option_contracts("AAPL")
+
+    assert [contract.symbol for contract in contracts] == [
+        "AAPL260116C00000001",
+        "AAPL260116C00000002",
+    ]
+    assert contracts[0].open_interest == 100
+
+
+def test_list_option_contracts_accepts_empty_final_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_opt_creds(monkeypatch)
+    calls = 0
+    responses = iter([
+        _FakeGetResp(200, {
+            "option_contracts": [_contract_row(1)],
+            "next_page_token": "empty-final-page",
+        }),
+        _FakeGetResp(200, {
+            "option_contracts": [],
+            "next_page_token": None,
+        }),
+    ])
+
+    def route(*args: object, **kwargs: object) -> _FakeGetResp:
+        nonlocal calls
+        calls += 1
+        return next(responses)
+
+    monkeypatch.setattr("trading_bot.broker.options.requests.get", route)
+
+    contracts = options.AlpacaOptionsClient().list_option_contracts("AAPL")
+
+    assert calls == 2
+    assert [contract.symbol for contract in contracts] == [
+        "AAPL260116C00000001",
+    ]
+
+
+def test_get_option_chain_rejects_repeated_contract_page_token(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _with_opt_creds(monkeypatch)
+    calls = 0
+    responses = iter([
+        _FakeGetResp(200, {
+            "option_contracts": [_contract_row(1)],
+            "next_page_token": "repeated",
+        }),
+        _FakeGetResp(200, {
+            "option_contracts": [_contract_row(2)],
+            "next_page_token": "repeated",
+        }),
+    ])
+
+    def route(*args: object, **kwargs: object) -> _FakeGetResp:
+        nonlocal calls
+        calls += 1
+        return next(responses)
+
+    monkeypatch.setattr("trading_bot.broker.options.requests.get", route)
+
+    chain = options.AlpacaOptionsClient().get_option_chain("AAPL")
+
+    assert calls == 2
+    assert chain.ok is False
+    assert chain.contracts == []
+    assert "repeated page token" in chain.reason
+    assert "2 unique contracts discarded" in chain.reason
+    assert chain.reason in capsys.readouterr().err
+
+
+def test_get_option_chain_rejects_contract_page_guard_exhaustion(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _with_opt_creds(monkeypatch)
+    monkeypatch.setattr(options, "_MAX_CONTRACT_PAGES", 2)
+    calls = 0
+
+    def route(*args: object, **kwargs: object) -> _FakeGetResp:
+        nonlocal calls
+        calls += 1
+        return _FakeGetResp(200, {
+            "option_contracts": [_contract_row(calls)],
+            "next_page_token": f"page-{calls + 1}",
+        })
+
+    monkeypatch.setattr("trading_bot.broker.options.requests.get", route)
+
+    chain = options.AlpacaOptionsClient().get_option_chain("AAPL")
+
+    assert calls == 2
+    assert chain.ok is False
+    assert chain.contracts == []
+    assert "exceeded maximum of 2 pages" in chain.reason
+    assert "2 unique contracts discarded" in chain.reason
+    assert chain.reason in capsys.readouterr().err
+
+
+def test_get_option_chain_rejects_later_contract_page_http_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _with_opt_creds(monkeypatch)
+    responses = iter([
+        _FakeGetResp(200, {
+            "option_contracts": [_contract_row(1)],
+            "next_page_token": "page-2",
+        }),
+        _FakeGetResp(503, {"message": "unavailable"}),
+    ])
+    monkeypatch.setattr(
+        "trading_bot.broker.options.requests.get",
+        lambda *args, **kwargs: next(responses),
+    )
+
+    chain = options.AlpacaOptionsClient().get_option_chain("AAPL")
+
+    assert chain.ok is False
+    assert chain.contracts == []
+    assert "pagination incomplete" in chain.reason
+    assert "page 2 after 1 unique contracts" in chain.reason
+    assert "HTTP 503" in chain.reason
+    assert chain.reason in capsys.readouterr().err
+
+
+def test_get_option_chain_rejects_later_contract_page_malformed_2xx(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _with_opt_creds(monkeypatch)
+    responses = iter([
+        _FakeGetResp(200, {
+            "option_contracts": [_contract_row(1)],
+            "next_page_token": "page-2",
+        }),
+        _FakeGetResp(200, {"next_page_token": None}),
+    ])
+    monkeypatch.setattr(
+        "trading_bot.broker.options.requests.get",
+        lambda *args, **kwargs: next(responses),
+    )
+
+    chain = options.AlpacaOptionsClient().get_option_chain("AAPL")
+
+    assert chain.ok is False
+    assert chain.contracts == []
+    assert "malformed contracts response" in chain.reason
+    assert "missing 'option_contracts' list" in chain.reason
+    assert "page 2 after 1 unique contracts" in chain.reason
+    assert chain.reason in capsys.readouterr().err
 
 
 def test_list_option_contracts_failsoft(
@@ -209,8 +441,16 @@ def test_get_option_chain_no_contracts_is_not_ok(
             _FakeGetResp(200, {"option_contracts": {}}),
             "missing 'option_contracts' list",
         ),
+        (
+            _FakeGetResp(200, {
+                "option_contracts": [], "next_page_token": 123,
+            }),
+            "'next_page_token' must be a string or null",
+        ),
     ],
-    ids=("non-json", "non-object", "wrong-collection-shape"),
+    ids=(
+        "non-json", "non-object", "wrong-collection-shape", "wrong-token-shape",
+    ),
 )
 def test_get_option_chain_rejects_malformed_contracts_2xx(
     monkeypatch: pytest.MonkeyPatch,
@@ -337,6 +577,7 @@ def test_account_parses_options_trading_level(
 
         def json(self) -> object:
             return {
+                "account_number": "PA123", "currency": "USD",
                 "options_trading_level": 2, "cash": "1000", "equity": "1000",
                 "buying_power": "1000", "status": "ACTIVE",
             }

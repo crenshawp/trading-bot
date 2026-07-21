@@ -33,6 +33,7 @@ from trading_bot.broker.alpaca import ALPACA_PAPER_BASE_URL
 ALPACA_OPTIONS_DATA_BASE_URL = "https://data.alpaca.markets"
 
 _HTTP_TIMEOUT_SECONDS = 10
+_MAX_CONTRACT_PAGES = 100
 
 OPTION_TYPE_CALL = "call"
 OPTION_TYPE_PUT = "put"
@@ -147,20 +148,40 @@ _MALFORMED_CONTRACTS = "malformed contracts response"
 _MALFORMED_SNAPSHOTS = "malformed snapshots response"
 
 
-def _parse_contracts_body(body: Any) -> tuple[list[OptionContract], str]:
-    """Parse a 2xx contracts body into ``(contracts, malformed_reason)``.
+def _parse_contracts_body(
+    body: Any,
+) -> tuple[list[OptionContract], str | None, str]:
+    """Parse a 2xx contracts body into contracts, next token, and error.
 
     An empty ``option_contracts`` list is valid. Missing or wrongly typed
-    top-level data is not.
+    top-level data is not. A missing, null, or empty ``next_page_token`` marks
+    the final page; any other token must be a string.
     """
     if body is None:
-        return [], f"{_MALFORMED_CONTRACTS}: empty body or JSON null"
+        return [], None, f"{_MALFORMED_CONTRACTS}: empty body or JSON null"
     if not isinstance(body, Mapping):
-        return [], f"{_MALFORMED_CONTRACTS}: top-level body must be an object"
+        return (
+            [],
+            None,
+            f"{_MALFORMED_CONTRACTS}: top-level body must be an object",
+        )
     rows = body.get("option_contracts")
     if not isinstance(rows, list):
-        return [], f"{_MALFORMED_CONTRACTS}: missing 'option_contracts' list"
-    return [_parse_contract(r) for r in rows if isinstance(r, Mapping)], ""
+        return (
+            [],
+            None,
+            f"{_MALFORMED_CONTRACTS}: missing 'option_contracts' list",
+        )
+    raw_page_token = body.get("next_page_token")
+    if raw_page_token is not None and not isinstance(raw_page_token, str):
+        return (
+            [],
+            None,
+            f"{_MALFORMED_CONTRACTS}: 'next_page_token' must be a string or null",
+        )
+    page_token = raw_page_token or None
+    contracts = [_parse_contract(r) for r in rows if isinstance(r, Mapping)]
+    return contracts, page_token, ""
 
 
 def _parse_snapshots_body(
@@ -324,27 +345,75 @@ class AlpacaOptionsClient:
             params["expiration_date_lte"] = expiration_lte
         if option_type is not None:
             params["type"] = option_type
-        ok, status, body, error = self._get(
-            self._trading_base, "/v2/options/contracts", params=params,
+        contracts_by_symbol: dict[str, OptionContract] = {}
+        page_token: str | None = None
+        seen_page_tokens: set[str] = set()
+
+        for page_number in range(1, _MAX_CONTRACT_PAGES + 1):
+            page_params = dict(params)
+            if page_token is not None:
+                page_params["page_token"] = page_token
+            ok, status, body, error = self._get(
+                self._trading_base,
+                "/v2/options/contracts",
+                params=page_params,
+            )
+            if not ok or not self._ok2xx(status):
+                if page_number == 1:
+                    reason = (
+                        f"contracts unavailable for {underlying} "
+                        f"({error or f'HTTP {status}'})"
+                    )
+                else:
+                    reason = (
+                        f"contracts pagination incomplete for {underlying} on "
+                        f"page {page_number} after {len(contracts_by_symbol)} "
+                        f"unique contracts ({error or f'HTTP {status}'})"
+                    )
+                print(f"  options: {reason}", file=sys.stderr)
+                return [], reason
+
+            page_contracts, next_page_token, malformed_reason = (
+                _parse_contracts_body(body)
+            )
+            if error:
+                malformed_reason = f"{_MALFORMED_CONTRACTS}: {error}"
+            if malformed_reason:
+                if page_number == 1:
+                    reason = (
+                        f"{malformed_reason} for {underlying} (HTTP {status})"
+                    )
+                else:
+                    reason = (
+                        f"{malformed_reason} for {underlying} on page "
+                        f"{page_number} after {len(contracts_by_symbol)} unique "
+                        f"contracts (HTTP {status})"
+                    )
+                print(f"  options: {reason}", file=sys.stderr)
+                return [], reason
+
+            for contract in page_contracts:
+                contracts_by_symbol.setdefault(contract.symbol, contract)
+            if next_page_token is None:
+                return list(contracts_by_symbol.values()), ""
+            if next_page_token in seen_page_tokens:
+                reason = (
+                    f"contracts pagination incomplete for {underlying}: repeated "
+                    f"page token after page {page_number}; "
+                    f"{len(contracts_by_symbol)} unique contracts discarded"
+                )
+                print(f"  options: {reason}", file=sys.stderr)
+                return [], reason
+            seen_page_tokens.add(next_page_token)
+            page_token = next_page_token
+
+        reason = (
+            f"contracts pagination incomplete for {underlying}: exceeded maximum "
+            f"of {_MAX_CONTRACT_PAGES} pages; {len(contracts_by_symbol)} unique "
+            "contracts discarded"
         )
-        if not ok or not self._ok2xx(status):
-            reason = (
-                f"contracts unavailable for {underlying} "
-                f"({error or f'HTTP {status}'})"
-            )
-            print(
-                f"  options: {reason}",
-                file=sys.stderr,
-            )
-            return [], reason
-        contracts, malformed_reason = _parse_contracts_body(body)
-        if error:
-            malformed_reason = f"{_MALFORMED_CONTRACTS}: {error}"
-        if malformed_reason:
-            reason = f"{malformed_reason} for {underlying} (HTTP {status})"
-            print(f"  options: {reason}", file=sys.stderr)
-            return [], reason
-        return contracts, ""
+        print(f"  options: {reason}", file=sys.stderr)
+        return [], reason
 
     def _fetch_snapshots(self, underlying: str) -> dict[str, Mapping[str, Any]]:
         """Fetch greeks + quotes keyed by OCC symbol. Fail-soft → {}."""
