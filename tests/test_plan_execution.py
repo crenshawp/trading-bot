@@ -185,7 +185,8 @@ class SpyBroker(FakeBroker):
     """FakeBroker that counts submissions and can reject specific symbols."""
 
     def __init__(self, *, reject_symbols: frozenset[str] = frozenset()) -> None:
-        super().__init__()
+        # Position assertions in this suite model an immediate real broker fill.
+        super().__init__(auto_fill=True)
         self.submissions: list[str] = []
         self._reject_symbols = reject_symbols
 

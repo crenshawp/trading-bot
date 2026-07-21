@@ -393,12 +393,11 @@ def submit_long_term_entry(
     the submission call that was missing between "plan produced" and "order
     submitted".
 
-    The mirror of :func:`close_long_term_position`: on a broker-accepted order
-    the position row is inserted OPEN so the EXISTING protective exit watcher
-    manages it from the next cycle. A rejected/errored order records NOTHING —
-    no position is ever recorded that was not submitted. Never called
-    automatically; the operator-gated ``allocate execute --confirm`` is the
-    only caller. Returns ``(order, position_id | None)``.
+    Broker acceptance is stored in the durable pending-order ledger, but a
+    position is created only from a usable broker-reported partial/full fill.
+    Accepted-unfilled orders await scanner reconciliation. Never called
+    automatically; the operator-gated ``allocate execute --confirm`` remains
+    the only opening caller. Returns ``(order, position_id | None)``.
     """
     order = order_lifecycle.submit_prepared_order(
         broker,
@@ -420,12 +419,11 @@ def submit_long_term_entry(
         time_in_force=TIF_DAY,
     )
     risk_of_ruin.record_broker_result(order.ok)   # Phase 15 detector
-    position_id: int | None = None
-    if order.ok:
-        position_id = db.insert_long_term_position(LongTermPosition(
-            ticker=ticker, asset_class=asset_class, entry_price=entry_price,
-            entry_date=now, qty=qty, status="open",
-        ))
+    materialized = order_lifecycle.materialize_submitted_order_fill(
+        order,
+        observed_at=now,
+    )
+    position_id = materialized.position_id if materialized is not None else None
     return order, position_id
 
 

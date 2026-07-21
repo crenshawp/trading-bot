@@ -217,7 +217,7 @@ def test_submit_execution_order_structured_rejection(tmp_db: Path) -> None:
 
 def test_execute_decision_records_option_position(tmp_db: Path) -> None:
     order, pid = oe.execute_decision(
-        FakeBroker(), _decision_full(), opened_at=_OPENED, signal_id=7,
+        FakeBroker(auto_fill=True), _decision_full(), opened_at=_OPENED, signal_id=7,
         tp=110.0, sl=95.0, deadline=datetime(2026, 1, 20, tzinfo=UTC),
     )
     assert order.ok is True and pid is not None
@@ -227,7 +227,7 @@ def test_execute_decision_records_option_position(tmp_db: Path) -> None:
     assert p.symbol == _contract(0.70).symbol
     assert p.vehicle == "option_full"
     assert p.delta_entry == 0.70
-    assert p.premium_entry == 5.0            # mid of 4.9/5.1
+    assert p.premium_entry == 5.1            # broker-reported limit fill
     assert p.multiplier == 100               # the multiplier is persisted
     assert p.tp == 110.0 and p.sl == 95.0 and p.outcome == "open"
 
@@ -242,7 +242,9 @@ def test_execute_decision_shares_records_swing_fallback_not_option(
         "call", 300.0, "AAPL", 100.0, [_contract(0.70)], ref_date=_REF,
     )
     assert dec.vehicle == oe.VEHICLE_SHARES
-    order, pid = oe.execute_decision(FakeBroker(), dec, opened_at=_OPENED)
+    order, pid = oe.execute_decision(
+        FakeBroker(auto_fill=True), dec, opened_at=_OPENED
+    )
     assert order.ok is True and pid is not None
     assert db.get_open_option_positions() == []
     (pos,) = db.get_open_long_term_positions()
@@ -254,7 +256,7 @@ def test_shares_fallback_persists_original_swing_exit_data(tmp_db: Path) -> None
     deadline = datetime(2026, 1, 3, tzinfo=UTC)
     dec = oe.choose_execution("call", 300.0, "AAPL", 100.0, [], ref_date=_REF)
     order, pid = oe.execute_decision(
-        FakeBroker(), dec, opened_at=_OPENED, tp=110.0, sl=95.0,
+        FakeBroker(auto_fill=True), dec, opened_at=_OPENED, tp=110.0, sl=95.0,
         deadline=deadline,
     )
     assert order.ok is True and pid is not None
@@ -271,7 +273,7 @@ def test_short_shares_fallback_records_short_direction(tmp_db: Path) -> None:
     dec = oe.choose_execution("short", 300.0, "AAPL", 100.0, [], ref_date=_REF)
     assert dec.side == "sell"
     order, _pid = oe.execute_decision(
-        FakeBroker(), dec, opened_at=_OPENED, tp=90.0, sl=105.0,
+        FakeBroker(auto_fill=True), dec, opened_at=_OPENED, tp=90.0, sl=105.0,
     )
     assert order.ok is True
     (pos,) = db.get_open_long_term_positions()
@@ -284,11 +286,6 @@ def test_rejected_shares_fallback_records_nothing(tmp_db: Path) -> None:
         FakeBroker(reject_reason="market closed"), dec, opened_at=_OPENED,
     )
     assert order.ok is False and pid is None
-    assert db.get_open_long_term_positions() == []
-
-
-def test_record_shares_position_ignores_non_shares_decisions(tmp_db: Path) -> None:
-    assert oe.record_shares_position(_decision_full(), opened_at=_OPENED) is None
     assert db.get_open_long_term_positions() == []
 
 

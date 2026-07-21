@@ -177,7 +177,7 @@ def _option_decision() -> oe.ExecutionDecision:
         (STATUS_FILLED, "filled", 2.0, 5.0, True),
     ],
 )
-def test_option_capture_preserves_unfilled_partial_and_filled_submit_snapshots(
+def test_immediate_option_submit_materializes_only_usable_fill_snapshots(
     tmp_db: Path,
     monkeypatch: pytest.MonkeyPatch,
     status: str,
@@ -206,7 +206,8 @@ def test_option_capture_preserves_unfilled_partial_and_filled_submit_snapshots(
         deadline=_DEADLINE,
     )
 
-    assert order.ok is True and position_id is not None
+    assert order.ok is True
+    assert (position_id is not None) is (filled_qty > 0)
     (pending,) = db.get_pending_orders()
     assert pending.broker_order_id == "accepted-order-1"
     assert pending.ticker == "GOOGL"
@@ -225,7 +226,7 @@ def test_option_capture_preserves_unfilled_partial_and_filled_submit_snapshots(
     assert pending.last_refreshed_at == _ACCEPTED_AT
     assert (pending.terminal_at is not None) is expected_terminal
     assert (pending.terminal_reason is not None) is expected_terminal
-    assert pending.position_id is None
+    assert (pending.position_id is not None) is (filled_qty > 0)
     assert json.loads(pending.intent_payload_json) == {
         "intent_kind": "option",
         "option_type": "call",
@@ -241,10 +242,13 @@ def test_option_capture_preserves_unfilled_partial_and_filled_submit_snapshots(
         "deadline": _DEADLINE.isoformat(),
     }
 
-    # 02b intentionally leaves the legacy requested-value writer active.
-    (legacy_position,) = db.get_open_option_positions()
-    assert legacy_position.contracts == 2.0
-    assert legacy_position.premium_entry == 5.0
+    positions = db.get_open_option_positions()
+    if filled_qty == 0:
+        assert positions == []
+    else:
+        (position,) = positions
+        assert position.contracts == filled_qty
+        assert position.premium_entry == filled_avg
 
 
 def test_shares_fallback_capture_preserves_swing_intent(tmp_db: Path) -> None:
@@ -268,7 +272,7 @@ def test_shares_fallback_capture_preserves_swing_intent(tmp_db: Path) -> None:
         deadline=_DEADLINE,
     )
 
-    assert order.ok is True and position_id is not None
+    assert order.ok is True and position_id is None
     pending = db.get_pending_order("shares-fallback-1")
     assert pending is not None
     assert pending.ticker == pending.broker_symbol == "META"
@@ -285,9 +289,7 @@ def test_shares_fallback_capture_preserves_swing_intent(tmp_db: Path) -> None:
         "sl": 510.0,
         "deadline": _DEADLINE.isoformat(),
     }
-    (legacy_position,) = db.get_open_long_term_positions()
-    assert legacy_position.source == "swing_fallback"
-    assert legacy_position.direction == "short"
+    assert db.get_open_long_term_positions() == []
 
 
 def test_long_term_capture_preserves_buy_and_hold_intent(tmp_db: Path) -> None:
@@ -324,10 +326,10 @@ def test_long_term_capture_preserves_buy_and_hold_intent(tmp_db: Path) -> None:
         "source": "long_term",
         "direction": "long",
     }
-    (legacy_position,) = db.get_open_long_term_positions()
-    assert legacy_position.source == "long_term"
-    assert legacy_position.qty == 2.5
-    assert legacy_position.entry_price == 175.0
+    (position,) = db.get_open_long_term_positions()
+    assert position.source == "long_term"
+    assert position.qty == 0.5
+    assert position.entry_price == 174.5
 
 
 def test_duplicate_capture_is_idempotent_and_conflicting_intent_fails(
@@ -561,7 +563,7 @@ def test_prepared_row_exists_before_submit_and_exact_client_id_binds(
     assert len(submitted_client_order_id) == 43
     assert submitted_client_order_id.replace("-", "").isalnum()
     assert order.client_order_id == submitted_client_order_id
-    assert position_id is not None
+    assert position_id is None
     pending = db.get_pending_order_by_client_order_id(submitted_client_order_id)
     assert pending is not None
     assert pending.broker_order_id == "atomic-bind-1"

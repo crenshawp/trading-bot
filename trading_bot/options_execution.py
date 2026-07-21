@@ -29,7 +29,7 @@ from trading_bot.broker.options import (
     OPTION_TYPE_PUT,
     OptionContract,
 )
-from trading_bot.models import LongTermPosition, OptionPosition
+from trading_bot.models import OptionPosition
 
 VEHICLE_OPTION_FULL = "option_full"
 VEHICLE_OPTION_UNDERSIZED = "option_undersized"
@@ -288,71 +288,6 @@ def submit_execution_order(
     return order
 
 
-def record_option_position(
-    decision: ExecutionDecision,
-    order: OrderResult,
-    *,
-    opened_at: datetime,
-    signal_id: int | None = None,
-    tp: float | None = None,
-    sl: float | None = None,
-    deadline: datetime | None = None,
-) -> int | None:
-    """Persist an option position from a filled/accepted decision. Returns the
-    row id, or None for a share fallback (no contract to record)."""
-    contract = decision.contract
-    if contract is None:
-        return None
-    pos = OptionPosition(
-        symbol=contract.symbol, underlying=contract.underlying,
-        option_type=contract.option_type, strike=contract.strike,
-        expiry=contract.expiry, contracts=decision.qty, opened_at=opened_at,
-        multiplier=config.OPTION_MULTIPLIER, signal_id=signal_id,
-        order_id=order.order_id, premium_entry=_premium(contract),
-        delta_entry=contract.delta, theta=contract.theta, vega=contract.vega,
-        gamma=contract.gamma, tp=tp, sl=sl, deadline=deadline, outcome="open",
-        vehicle=decision.vehicle,
-    )
-    return db.insert_option_position(pos)
-
-
-def record_shares_position(
-    decision: ExecutionDecision,
-    *,
-    opened_at: datetime,
-    tp: float | None = None,
-    sl: float | None = None,
-    deadline: datetime | None = None,
-) -> int | None:
-    """Persist a SHARES-FALLBACK position into the long-term lifecycle book
-    (Phase 19). Returns the row id, or None for a non-shares decision.
-
-    The third rung of the execution hierarchy submits a real order but had no
-    lifecycle tracking (Phase 18's reconciliation fix surfaced it as an
-    untracked ``broker_only`` position). It is tagged into
-    ``long_term_positions`` with ``source='swing_fallback'`` and its ORIGINAL
-    swing ``tp``/``sl``/``deadline`` — the position carries SWING intent, and
-    the Phase 14 watcher applies THESE levels to it, never the long-term
-    trend/drawdown rules. ``direction='short'`` records a put-signal fallback
-    (a SELL entry, whose close must BUY).
-    """
-    if decision.vehicle != VEHICLE_SHARES or decision.qty <= 0.0:
-        return None
-    return db.insert_long_term_position(LongTermPosition(
-        ticker=decision.symbol,
-        asset_class="crypto" if decision.symbol.endswith("-USD") else "stock",
-        entry_price=decision.est_cost / decision.qty,
-        entry_date=opened_at,
-        qty=decision.qty,
-        status="open",
-        source="swing_fallback",
-        direction="short" if decision.side == "sell" else "long",
-        tp=tp,
-        sl=sl,
-        deadline=deadline,
-    ))
-
-
 def _submit_execution_with_intent(
     broker: Broker,
     decision: ExecutionDecision,
@@ -431,12 +366,16 @@ def execute_decision(
     deadline: datetime | None = None,
     time_in_force: str = TIF_DAY,
 ) -> tuple[OrderResult, int | None]:
-    """Submit the decision and, on a broker-accepted order, persist the
-    position: an OPTION records into ``option_positions``; a SHARES FALLBACK
-    records into the long-term lifecycle book with its original swing exit
-    data (Phase 19 — previously untracked). Returns ``(order_result,
-    position_row_id | None)`` — the id belongs to whichever table matches the
-    vehicle. A rejected/errored order records nothing anywhere."""
+    """Submit a durably prepared decision and persist only broker fill truth.
+
+    Accepted-unfilled orders remain solely in ``pending_orders`` for scanner
+    refresh. A real partial/full fill records an OPTION position or SHARES
+    FALLBACK in the long-term lifecycle book; requested quantity and quote
+    values are never inserted as a holding.
+
+    The legacy return contract remains ``(order_result, position_row_id |
+    None)``; the position id is present only when a usable fill materialized.
+    """
     order = _submit_execution_with_intent(
         broker,
         decision,
@@ -448,17 +387,11 @@ def execute_decision(
         time_in_force=time_in_force,
     )
     risk_of_ruin.record_broker_result(order.ok)
-    position_id: int | None = None
-    if order.ok:
-        if decision.contract is not None:
-            position_id = record_option_position(
-                decision, order, opened_at=opened_at, signal_id=signal_id,
-                tp=tp, sl=sl, deadline=deadline,
-            )
-        elif decision.vehicle == VEHICLE_SHARES:
-            position_id = record_shares_position(
-                decision, opened_at=opened_at, tp=tp, sl=sl, deadline=deadline,
-            )
+    materialized = order_lifecycle.materialize_submitted_order_fill(
+        order,
+        observed_at=opened_at,
+    )
+    position_id = materialized.position_id if materialized is not None else None
     return order, position_id
 
 

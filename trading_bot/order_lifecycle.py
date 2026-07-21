@@ -1,8 +1,9 @@
-"""Durable capture and dormant refresh of broker-order lifecycle truth.
+"""Restart-safe capture, refresh, and fill materialization for broker orders.
 
-Fill materialization remains a separate capability.  Until the final cutover,
-the refresh functions in this module are callable but unscheduled and the
-existing eager position writers stay active.
+Opening paths durably prepare intent before submission and only materialize
+broker-reported cumulative fills.  Scanner reconciliation refreshes existing
+orders lookup-only, then replays every durable positive fill so a process crash
+between either step is harmless and retryable.
 """
 
 from __future__ import annotations
@@ -476,6 +477,14 @@ def submit_prepared_order(
             reason=str(exc),
         )
 
+    if order.client_order_id is None:
+        # The submitted identity is locally certain even when a broker response
+        # omits the echo. Preserve it so immediate handling can reload the exact
+        # prepared/abandoned row without inferring identity from order content.
+        order = dataclasses.replace(
+            order,
+            client_order_id=pending.client_order_id,
+        )
     has_broker_order_id = bool(order.order_id and order.order_id.strip())
     if order.status == STATUS_REJECTED and not has_broker_order_id:
         _abandon_prepared_order(
@@ -921,12 +930,31 @@ def refresh_pending_orders(
     *,
     observed_at: datetime | None = None,
 ) -> list[PendingOrderRefreshResult]:
-    """Refresh every nonterminal ledger row once; deliberately unscheduled."""
+    """Refresh every nonterminal ledger row once, isolating per-row failures."""
     moment = observed_at or datetime.now(UTC)
-    return [
-        refresh_pending_order(broker, pending, observed_at=moment)
-        for pending in db.get_nonterminal_pending_orders()
-    ]
+    try:
+        pending_orders = db.get_nonterminal_pending_orders()
+    except sqlite3.Error as exc:
+        print(
+            f"  order lifecycle: pending-order refresh query failed ({exc})",
+            file=sys.stderr,
+        )
+        return []
+    results: list[PendingOrderRefreshResult] = []
+    for pending in pending_orders:
+        try:
+            result = refresh_pending_order(broker, pending, observed_at=moment)
+        except (sqlite3.Error, TypeError, ValueError, RuntimeError) as exc:
+            reason = f"refresh attempt failed: {exc}"
+            _log_refresh_issue(pending, REFRESH_FAILED, reason)
+            result = _refresh_result(
+                pending,
+                pending,
+                action=REFRESH_FAILED,
+                reason=reason,
+            )
+        results.append(result)
+    return results
 
 
 def capture_accepted_order(
@@ -998,6 +1026,7 @@ def capture_accepted_order(
 # already persisted and materializes it.  It stays unscheduled until 02e.
 
 MATERIALIZE_CREATED = "created"
+MATERIALIZE_ADOPTED = "adopted"
 MATERIALIZE_UPDATED = "updated"
 MATERIALIZE_UNCHANGED = "unchanged"
 MATERIALIZE_SKIPPED = "skipped"
@@ -1220,12 +1249,42 @@ def _create_position(
             filled_avg_price=filled_avg_price,
             opened_at=observed_at,
         )
+        if not is_recoverable_pending_order_client_id(pending.client_order_id):
+            position_id = db.adopt_legacy_option_position(pending.id, option_pos)
+            if position_id is None:
+                reason = (
+                    "legacy option position identity is not uniquely provable; "
+                    "skipped for manual review"
+                )
+                _log_materialize_issue(pending, reason)
+                return _materialize_result(
+                    pending,
+                    action=MATERIALIZE_SKIPPED,
+                    reason=reason,
+                )
+            return _materialize_result(
+                pending,
+                action=MATERIALIZE_ADOPTED,
+                position_kind="option",
+                position_id=position_id,
+            )
         position_id = db.materialize_new_option_position(pending.id, option_pos)
         return _materialize_result(
             pending,
             action=MATERIALIZE_CREATED,
             position_kind="option",
             position_id=position_id,
+        )
+    if not is_recoverable_pending_order_client_id(pending.client_order_id):
+        reason = (
+            "legacy long-term/share position has no durable broker identity; "
+            "skipped for manual review"
+        )
+        _log_materialize_issue(pending, reason)
+        return _materialize_result(
+            pending,
+            action=MATERIALIZE_SKIPPED,
+            reason=reason,
         )
     long_term_pos = _build_long_term_position(
         pending,
@@ -1336,7 +1395,12 @@ def materialize_pending_order_fill(
     updates that same row; an exact snapshot is a no-op. Inconsistent intent or
     a regressed cumulative fill fails without mutating anything.
     """
-    current = _current_pending_order(pending)
+    try:
+        current = _current_pending_order(pending)
+    except sqlite3.Error as exc:
+        reason = f"durable materialization lookup failed: {exc}"
+        _log_materialize_issue(pending, reason)
+        return _materialize_result(pending, action=MATERIALIZE_FAILED, reason=reason)
     if current is None:
         return _materialize_result(
             pending,
@@ -1350,19 +1414,106 @@ def materialize_pending_order_fill(
         reason = str(exc)
         _log_materialize_issue(current, reason)
         return _materialize_result(current, action=MATERIALIZE_FAILED, reason=reason)
-    except (sqlite3.Error, TypeError, ValueError) as exc:
+    except (sqlite3.Error, TypeError, ValueError, RuntimeError) as exc:
         reason = f"durable materialization failed: {exc}"
         _log_materialize_issue(current, reason)
         return _materialize_result(current, action=MATERIALIZE_FAILED, reason=reason)
+
+
+def materialize_submitted_order_fill(
+    order: OrderResult,
+    *,
+    observed_at: datetime | None = None,
+) -> FillMaterializationResult | None:
+    """Opportunistically materialize a submit reply's already-durable fill.
+
+    This helper never infers quantity or price from requested values.  A new or
+    accepted-unfilled response therefore returns a skipped result with no
+    position.  Lookup/materialization failure is fail-soft because the durable
+    pending row remains available to the scanner reconciliation cycle.
+    """
+    try:
+        pending = (
+            db.get_pending_order_by_client_order_id(order.client_order_id)
+            if order.client_order_id is not None
+            else db.get_pending_order(order.order_id)
+        )
+    except sqlite3.Error as exc:
+        print(
+            f"  order lifecycle: immediate materialization lookup failed ({exc})",
+            file=sys.stderr,
+        )
+        return None
+    if pending is None:
+        identity = order.order_id or order.client_order_id or "unidentified"
+        print(
+            f"  order lifecycle: no durable intent found for {identity}; "
+            "immediate materialization deferred",
+            file=sys.stderr,
+        )
+        return None
+    return materialize_pending_order_fill(pending, observed_at=observed_at)
 
 
 def materialize_pending_order_fills(
     *,
     observed_at: datetime | None = None,
 ) -> list[FillMaterializationResult]:
-    """Materialize every fill-bearing ledger row once; deliberately unscheduled."""
+    """Materialize every fill-bearing row once, including terminal rows."""
     moment = observed_at or datetime.now(UTC)
+    try:
+        pending_orders = db.get_pending_orders_with_fills()
+    except sqlite3.Error as exc:
+        print(
+            f"  order lifecycle: fill materialization query failed ({exc})",
+            file=sys.stderr,
+        )
+        return []
     return [
         materialize_pending_order_fill(pending, observed_at=moment)
-        for pending in db.get_pending_orders_with_fills()
+        for pending in pending_orders
     ]
+
+
+@dataclass(frozen=True)
+class PendingOrderReconciliationResult:
+    """One ordered refresh-then-materialize scanner pass."""
+
+    refreshes: tuple[PendingOrderRefreshResult, ...]
+    materializations: tuple[FillMaterializationResult, ...]
+
+
+def reconcile_pending_orders(
+    broker: Broker,
+    *,
+    observed_at: datetime | None = None,
+) -> PendingOrderReconciliationResult:
+    """Refresh accepted orders, then replay all durable fills exactly once.
+
+    Prepared rows are lookup-only through ``recover_prepared_order``; this
+    function has no submission call.  Materialization is a separate second
+    phase and still runs if the refresh phase encounters an unexpected durable
+    read failure, allowing a prior terminal/full/partial snapshot to recover
+    after a crash between lifecycle persistence and position materialization.
+    """
+    moment = observed_at or datetime.now(UTC)
+    try:
+        refreshes = refresh_pending_orders(broker, observed_at=moment)
+    except Exception as exc:  # noqa: BLE001 - phase isolation preserves fill replay
+        print(
+            f"  order lifecycle: reconciliation refresh phase failed ({exc})",
+            file=sys.stderr,
+        )
+        refreshes = []
+    try:
+        materializations = materialize_pending_order_fills(observed_at=moment)
+    except Exception as exc:  # noqa: BLE001 - scanner cycle must remain fail-soft
+        print(
+            f"  order lifecycle: reconciliation materialization phase failed ({exc})",
+            file=sys.stderr,
+        )
+        materializations = []
+    return PendingOrderReconciliationResult(
+        refreshes=tuple(refreshes),
+        materializations=tuple(materializations),
+    )

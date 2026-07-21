@@ -34,6 +34,7 @@ from trading_bot import (
     evaluator_scheduling,
     indicators,
     news_client,
+    order_lifecycle,
     outcomes,
     performance,
     predictions,
@@ -1264,6 +1265,40 @@ def _run_readiness_evaluation() -> None:
         print(f"  readiness evaluation error: {exc}", file=sys.stderr)
 
 
+def _run_order_lifecycle_cycle() -> None:
+    """Refresh and materialize already-submitted paper orders once.
+
+    The reconciliation entry point is lookup/update-only: prepared intents may
+    be recovered by client ID, but this scanner hook never submits an opening
+    order. Any broker/DB/materialization failure remains durable and retryable
+    and cannot block stock or crypto scanning.
+    """
+    try:
+        from trading_bot.broker import AlpacaBroker
+
+        result = order_lifecycle.reconcile_pending_orders(AlpacaBroker())
+        changed = sum(
+            item.action == order_lifecycle.REFRESH_UPDATED
+            for item in result.refreshes
+        )
+        materialized = sum(
+            item.action
+            in {
+                order_lifecycle.MATERIALIZE_CREATED,
+                order_lifecycle.MATERIALIZE_ADOPTED,
+                order_lifecycle.MATERIALIZE_UPDATED,
+            }
+            for item in result.materializations
+        )
+        if changed or materialized:
+            print(
+                f"[{datetime.now().strftime('%H:%M:%S')}] order lifecycle: "
+                f"{changed} refreshed, {materialized} materialized"
+            )
+    except Exception as exc:  # noqa: BLE001 - scanner recovery must fail soft
+        print(f"  order lifecycle cycle error: {exc}", file=sys.stderr)
+
+
 def _run_risk_cycle() -> None:
     """Phase 15: one risk-of-ruin pass per scan cycle.
 
@@ -2063,6 +2098,10 @@ def main() -> None:
     _run_shadow_scan()
     _never_raise(scan_crypto)()
     _never_raise(send_morning_report)()
+    # One recovery/materialization pass at boot. It may query/update accepted
+    # orders but has no submission path, preserving the operator-confirmed
+    # boundary for every new opening order.
+    _run_order_lifecycle_cycle()
     # Evaluate readiness once at boot so a capability already over threshold is
     # announced promptly (idempotent — the one-time flag prevents re-notifying).
     _run_readiness_evaluation()
@@ -2088,6 +2127,11 @@ def main() -> None:
     # resolved counts are fresh — auto-activates deterministic capabilities and
     # summons ML builds on first crossing, notifying exactly once (Phase 10).
     schedule.every(1).hours.do(_run_readiness_evaluation)
+
+    # Refresh accepted paper orders and replay all durable positive fills once
+    # per hourly scanner cycle. This is registered exactly once; the pass
+    # itself isolates failures so scans continue and the next cycle retries.
+    schedule.every(1).hours.do(_run_order_lifecycle_cycle)
 
     # Phase 15: risk-of-ruin pass every hour — equity snapshot (drawdown source),
     # Tier-1 circuit breaker, catastrophic detectors, and holding-state retries.

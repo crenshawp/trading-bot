@@ -4273,6 +4273,89 @@ def materialize_new_option_position(
         conn.close()
 
 
+def adopt_legacy_option_position(
+    pending_order_id: int,
+    expected: OptionPosition,
+) -> int | None:
+    """Adopt one uniquely provable eager option row into the fill lifecycle.
+
+    Schema-v24/v25 compatibility rows use synthetic ``legacy-*`` client IDs.
+    Before the final lifecycle cutover, the option submit path also inserted an
+    eager position carrying Alpaca's broker order ID.  That provider identity
+    is strong enough to adopt only when exactly one matching position exists
+    and its immutable contract identity agrees with the pending intent.
+
+    The adoption, correction to actual cumulative fill truth, and ledger link
+    are one transaction.  Missing, duplicate, conflicting, or already-linked
+    candidates return ``None`` so callers can log/skip for manual review rather
+    than guessing.  Long-term rows deliberately have no equivalent helper:
+    their table carries no broker order identity.
+    """
+    if expected.order_id is None or not expected.order_id.strip():
+        raise ValueError("legacy option adoption requires a broker order ID")
+    if expected.premium_entry is None or expected.premium_entry <= 0:
+        raise ValueError("legacy option adoption requires a broker fill price")
+    if expected.contracts <= 0:
+        raise ValueError("legacy option adoption requires a positive fill")
+
+    conn = get_connection()
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _guard_unlinked_pending_order(
+            conn,
+            pending_order_id,
+            "option",
+            filled_qty=expected.contracts,
+            filled_avg_price=expected.premium_entry,
+        )
+        candidates = conn.execute(
+            "SELECT * FROM option_positions WHERE order_id = ?",
+            (expected.order_id,),
+        ).fetchall()
+        if len(candidates) != 1:
+            conn.commit()
+            return None
+        row = candidates[0]
+        identity_matches = (
+            row["symbol"] == expected.symbol
+            and row["underlying"] == expected.underlying
+            and row["option_type"] == expected.option_type
+            and float(row["strike"]) == expected.strike
+            and row["expiry"] == expected.expiry
+            and int(row["multiplier"]) == expected.multiplier
+            and row["signal_id"] == expected.signal_id
+            and row["vehicle"] == expected.vehicle
+        )
+        if not identity_matches:
+            conn.commit()
+            return None
+        position_id = int(row["id"])
+        existing_link = conn.execute(
+            "SELECT id FROM pending_orders "
+            "WHERE position_kind = 'option' AND position_id = ? AND id != ?",
+            (position_id, pending_order_id),
+        ).fetchone()
+        if existing_link is not None:
+            conn.commit()
+            return None
+        conn.execute(
+            "UPDATE option_positions SET contracts = ?, premium_entry = ? "
+            "WHERE id = ?",
+            (expected.contracts, expected.premium_entry, position_id),
+        )
+        _link_pending_order_position(
+            conn, pending_order_id, "option", position_id
+        )
+        conn.commit()
+        return position_id
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def materialize_new_long_term_position(
     pending_order_id: int, pos: LongTermPosition,
 ) -> int:
