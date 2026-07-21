@@ -34,6 +34,7 @@ ALPACA_OPTIONS_DATA_BASE_URL = "https://data.alpaca.markets"
 
 _HTTP_TIMEOUT_SECONDS = 10
 _MAX_CONTRACT_PAGES = 100
+_MAX_SNAPSHOT_PAGES = 100
 
 OPTION_TYPE_CALL = "call"
 OPTION_TYPE_PUT = "put"
@@ -186,24 +187,42 @@ def _parse_contracts_body(
 
 def _parse_snapshots_body(
     body: Any,
-) -> tuple[dict[str, Mapping[str, Any]], str]:
-    """Parse a 2xx snapshots body into ``(snapshots, malformed_reason)``.
+) -> tuple[dict[str, Mapping[str, Any]], str | None, str]:
+    """Parse a 2xx snapshots body into snapshots, next token, and error.
 
     An empty ``snapshots`` object is valid. Missing or wrongly typed top-level
-    data is not.
+    data is not. A missing, null, or empty ``next_page_token`` marks the final
+    page; any other token must be a string.
     """
     if body is None:
-        return {}, f"{_MALFORMED_SNAPSHOTS}: empty body or JSON null"
+        return {}, None, f"{_MALFORMED_SNAPSHOTS}: empty body or JSON null"
     if not isinstance(body, Mapping):
-        return {}, f"{_MALFORMED_SNAPSHOTS}: top-level body must be an object"
+        return (
+            {},
+            None,
+            f"{_MALFORMED_SNAPSHOTS}: top-level body must be an object",
+        )
     raw_snapshots = body.get("snapshots")
     if not isinstance(raw_snapshots, Mapping):
-        return {}, f"{_MALFORMED_SNAPSHOTS}: missing 'snapshots' object"
-    return {
+        return (
+            {},
+            None,
+            f"{_MALFORMED_SNAPSHOTS}: missing 'snapshots' object",
+        )
+    raw_page_token = body.get("next_page_token")
+    if raw_page_token is not None and not isinstance(raw_page_token, str):
+        return (
+            {},
+            None,
+            f"{_MALFORMED_SNAPSHOTS}: 'next_page_token' must be a string or null",
+        )
+    page_token = raw_page_token or None
+    snapshots = {
         str(symbol): snapshot
         for symbol, snapshot in raw_snapshots.items()
         if isinstance(snapshot, Mapping)
-    }, ""
+    }
+    return snapshots, page_token, ""
 
 
 def _apply_snapshot(
@@ -423,42 +442,97 @@ class AlpacaOptionsClient:
     def _fetch_snapshots_result(
         self, underlying: str,
     ) -> tuple[dict[str, Mapping[str, Any]], str]:
-        """Fetch snapshots while retaining malformed-2xx failure reasons.
+        """Fetch every snapshot page while retaining upstream-failure reasons.
 
-        Ordinary HTTP/transport failures keep the established free-tier
-        behavior: return an empty mapping so listed contracts remain available
-        without greeks. Only malformed successful responses carry a reason that
-        invalidates the chain.
+        A first-page HTTP/transport/access failure keeps the established
+        free-tier behavior: return an empty mapping so listed contracts remain
+        available without greeks. Once a continuation token has been followed,
+        any incomplete traversal returns an explicit reason that invalidates the
+        chain rather than exposing partial greeks as authoritative.
         """
-        ok, status, body, error = self._get(
-            self._data_base, f"/v1beta1/options/snapshots/{underlying}",
-            params={"limit": 1000},
-        )
-        if not ok or not self._ok2xx(status):
-            print(
-                f"  options: snapshots unavailable for {underlying} "
-                f"({error or f'HTTP {status}'})",
-                file=sys.stderr,
+        params: dict[str, Any] = {"limit": 1000}
+        snapshots_by_symbol: dict[str, Mapping[str, Any]] = {}
+        page_token: str | None = None
+        seen_page_tokens: set[str] = set()
+
+        for page_number in range(1, _MAX_SNAPSHOT_PAGES + 1):
+            page_params = dict(params)
+            if page_token is not None:
+                page_params["page_token"] = page_token
+            ok, status, body, error = self._get(
+                self._data_base,
+                f"/v1beta1/options/snapshots/{underlying}",
+                params=page_params,
             )
-            return {}, ""
-        snapshots, malformed_reason = _parse_snapshots_body(body)
-        if error:
-            malformed_reason = f"{_MALFORMED_SNAPSHOTS}: {error}"
-        if malformed_reason:
-            reason = f"{malformed_reason} for {underlying} (HTTP {status})"
-            print(f"  options: {reason}", file=sys.stderr)
-            return {}, reason
-        return snapshots, ""
+            if not ok or not self._ok2xx(status):
+                if page_number == 1:
+                    print(
+                        f"  options: snapshots unavailable for {underlying} "
+                        f"({error or f'HTTP {status}'})",
+                        file=sys.stderr,
+                    )
+                    return {}, ""
+                reason = (
+                    f"snapshots pagination incomplete for {underlying} on page "
+                    f"{page_number} after {len(snapshots_by_symbol)} unique "
+                    "snapshots; partial snapshots discarded "
+                    f"({error or f'HTTP {status}'})"
+                )
+                print(f"  options: {reason}", file=sys.stderr)
+                return {}, reason
+
+            page_snapshots, next_page_token, malformed_reason = (
+                _parse_snapshots_body(body)
+            )
+            if error:
+                malformed_reason = f"{_MALFORMED_SNAPSHOTS}: {error}"
+            if malformed_reason:
+                if page_number == 1:
+                    reason = (
+                        f"{malformed_reason} for {underlying} (HTTP {status})"
+                    )
+                else:
+                    reason = (
+                        f"{malformed_reason} for {underlying} on page "
+                        f"{page_number} after {len(snapshots_by_symbol)} unique "
+                        f"snapshots; partial snapshots discarded (HTTP {status})"
+                    )
+                print(f"  options: {reason}", file=sys.stderr)
+                return {}, reason
+
+            for symbol, snapshot in page_snapshots.items():
+                snapshots_by_symbol.setdefault(symbol, snapshot)
+            if next_page_token is None:
+                return snapshots_by_symbol, ""
+            if next_page_token in seen_page_tokens:
+                reason = (
+                    f"snapshots pagination incomplete for {underlying}: repeated "
+                    f"page token after page {page_number}; "
+                    f"{len(snapshots_by_symbol)} unique snapshots discarded"
+                )
+                print(f"  options: {reason}", file=sys.stderr)
+                return {}, reason
+            seen_page_tokens.add(next_page_token)
+            page_token = next_page_token
+
+        reason = (
+            f"snapshots pagination incomplete for {underlying}: exceeded maximum "
+            f"of {_MAX_SNAPSHOT_PAGES} pages; {len(snapshots_by_symbol)} unique "
+            "snapshots discarded"
+        )
+        print(f"  options: {reason}", file=sys.stderr)
+        return {}, reason
 
     def get_option_chain(self, underlying: str) -> OptionChainResult:
         """The full chain with greeks populated. Fail-soft → ``ok=False``.
 
         Contract metadata (strike/expiry/type/open_interest) is merged with the
         data-API snapshot (delta/theta/vega/gamma + bid/ask/mid). If contracts
-        cannot be listed the result is ``ok=False``. Snapshot transport, HTTP,
-        or access-policy failures retain the established degraded behavior:
-        contracts are returned with ``None`` greeks. A malformed successful
-        snapshot response is instead an explicit ``ok=False`` upstream failure.
+        cannot be listed the result is ``ok=False``. A first-page snapshot
+        transport, HTTP, or access-policy failure retains the established
+        degraded behavior: contracts are returned with ``None`` greeks. An
+        incomplete paginated response or malformed successful response is
+        instead an explicit ``ok=False`` upstream failure.
         """
         contracts, contracts_reason = self._list_option_contracts_result(underlying)
         if contracts_reason:
