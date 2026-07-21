@@ -362,6 +362,66 @@ def test_alpaca_get_positions_parses(monkeypatch: pytest.MonkeyPatch) -> None:
     assert res.positions[1].side == "short"
 
 
+def test_alpaca_get_positions_normalizes_only_crypto_wire_symbols(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_creds(monkeypatch)
+    occ_symbol = "AAPL260116C00190000"
+    _patch_request(monkeypatch, _FakeResp(200, [
+        {"symbol": "BTC/USD", "qty": "0.05", "side": "long"},
+        {"symbol": "ETH/USD", "qty": "1.5", "side": "long"},
+        {"symbol": "BRK.B", "qty": "2", "side": "long"},
+        {"symbol": occ_symbol, "qty": "1", "side": "long"},
+    ]))
+
+    result = alpaca.AlpacaBroker().get_positions()
+
+    assert result.ok is True
+    assert [position.symbol for position in result.positions] == [
+        "BTC-USD", "ETH-USD", "BRK.B", occ_symbol,
+    ]
+
+
+def test_alpaca_crypto_position_round_trips_through_close_submission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An emergency-close style position symbol returns to Alpaca wire form."""
+    _with_creds(monkeypatch)
+    responses = [
+        _FakeResp(200, [{
+            "symbol": "BTC/USD", "qty": "0.05", "side": "long",
+            "avg_entry_price": "64000", "market_value": "3250",
+        }]),
+        _FakeResp(200, {
+            "id": "close-1", "status": "accepted", "symbol": "BTC/USD",
+            "filled_qty": "0",
+        }),
+    ]
+    captured: list[dict[str, object]] = []
+
+    def fake_request(method: str, url: str, **kw: object) -> _FakeResp:
+        captured.append({"method": method, "url": url, **kw})
+        return responses.pop(0)
+
+    monkeypatch.setattr(
+        "trading_bot.broker.alpaca.requests.request", fake_request,
+    )
+    client = alpaca.AlpacaBroker()
+    position = client.get_positions().positions[0]
+
+    result = client.submit_order(
+        position.symbol, abs(position.qty), broker.SIDE_SELL,
+        limit_price=65_000.0,
+    )
+
+    assert position.symbol == "BTC-USD"
+    assert result.ok is True
+    assert result.symbol == "BTC-USD"
+    request_body = captured[1]["json"]
+    assert isinstance(request_body, dict)
+    assert request_body["symbol"] == "BTC/USD"
+
+
 def test_alpaca_get_positions_empty_is_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     _with_creds(monkeypatch)
     _patch_request(monkeypatch, _FakeResp(200, []))
@@ -479,6 +539,7 @@ def test_alpaca_submit_order_success_defaults_to_limit(
     assert res.ok is True
     assert res.status == broker.STATUS_NEW          # 'accepted' -> new
     assert res.order_id == "o1"
+    assert res.symbol == "AAPL"
     body = cap[0]["json"]
     assert isinstance(body, dict)
     assert body["type"] == "limit"                  # LIMIT is the default
@@ -583,13 +644,14 @@ def test_alpaca_submit_transport_error(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_alpaca_get_order_success(monkeypatch: pytest.MonkeyPatch) -> None:
     _with_creds(monkeypatch)
     _patch_request(monkeypatch, _FakeResp(200, {
-        "id": "o1", "status": "filled", "symbol": "AAPL",
+        "id": "o1", "status": "filled", "symbol": "BTC/USD",
         "filled_qty": "10", "filled_avg_price": "191.0",
     }))
     res = alpaca.AlpacaBroker().get_order("o1")
     assert res.ok is True
     assert res.status == broker.STATUS_FILLED
     assert res.filled_qty == 10.0
+    assert res.symbol == "BTC-USD"
 
 
 def test_alpaca_get_order_fills_in_missing_id(
@@ -654,6 +716,7 @@ def test_alpaca_get_order_by_client_id_success_uses_exact_endpoint_and_param(
         "client_order_id": "tradingbot-client-1",
         "status": "accepted",
         "filled_qty": "0",
+        "symbol": "ETH/USD",
     }), capture=capture)
 
     result = alpaca.AlpacaBroker().get_order_by_client_order_id(
@@ -663,6 +726,7 @@ def test_alpaca_get_order_by_client_id_success_uses_exact_endpoint_and_param(
     assert result.outcome == broker.ORDER_LOOKUP_FOUND
     assert result.order is not None
     assert result.order.order_id == "o-client-1"
+    assert result.order.symbol == "ETH-USD"
     assert capture[0]["method"] == "GET"
     assert str(capture[0]["url"]).endswith("/v2/orders:by_client_order_id")
     assert capture[0]["params"] == {"client_order_id": "tradingbot-client-1"}
@@ -761,6 +825,25 @@ def test_alpaca_list_orders_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert res.ok is True
     assert [o.status for o in res.orders] == [
         broker.STATUS_NEW, broker.STATUS_PARTIALLY_FILLED,
+    ]
+
+
+def test_alpaca_list_orders_normalizes_only_crypto_wire_symbols(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_creds(monkeypatch)
+    occ_symbol = "AAPL260116C00190000"
+    _patch_request(monkeypatch, _FakeResp(200, [
+        {"id": "o1", "status": "new", "symbol": "BTC/USD", "filled_qty": "0"},
+        {"id": "o2", "status": "new", "symbol": "BRK.B", "filled_qty": "0"},
+        {"id": "o3", "status": "new", "symbol": occ_symbol, "filled_qty": "0"},
+    ]))
+
+    result = alpaca.AlpacaBroker().list_orders("all")
+
+    assert result.ok is True
+    assert [order.symbol for order in result.orders] == [
+        "BTC-USD", "BRK.B", occ_symbol,
     ]
 
 

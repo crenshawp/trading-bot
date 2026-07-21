@@ -542,6 +542,7 @@ def test_to_alpaca_symbol_translates_crypto_pairs() -> None:
 
 def test_to_alpaca_symbol_leaves_non_crypto_untouched() -> None:
     assert alpaca.to_alpaca_symbol("AAPL") == "AAPL"
+    assert alpaca.to_alpaca_symbol("BRK.B") == "BRK.B"
     assert alpaca.to_alpaca_symbol("BRK-B") == "BRK-B"          # not a -USD pair
     assert alpaca.to_alpaca_symbol("AAPL260116C00190000") == "AAPL260116C00190000"
     assert alpaca.to_alpaca_symbol("btc-usd") == "btc-usd"      # not wire-format
@@ -568,7 +569,10 @@ def test_alpaca_submit_sends_translated_crypto_symbol(
 
     def fake(method: str, url: str, **kw: Any) -> _FakeResp:
         captured.append({"method": method, "url": url, **kw})
-        return _FakeResp({"id": "abc", "status": "accepted", "symbol": "BTC/USD"})
+        return _FakeResp({
+            "id": "abc", "status": "accepted", "symbol": "BTC/USD",
+            "filled_qty": "0",
+        })
 
     monkeypatch.setattr("trading_bot.broker.alpaca.requests.request", fake)
     result = alpaca.AlpacaBroker().submit_order(
@@ -576,6 +580,7 @@ def test_alpaca_submit_sends_translated_crypto_symbol(
     )
     assert result.ok is True
     assert captured[0]["json"]["symbol"] == "BTC/USD"    # translated at the wire
+    assert result.symbol == "BTC-USD"                     # normalized on response
 
 
 def test_alpaca_submit_leaves_stock_symbol_untouched(
@@ -588,11 +593,17 @@ def test_alpaca_submit_leaves_stock_symbol_untouched(
 
     def fake(method: str, url: str, **kw: Any) -> _FakeResp:
         captured.append({"method": method, "url": url, **kw})
-        return _FakeResp({"id": "abc", "status": "accepted", "symbol": "AAPL"})
+        return _FakeResp({
+            "id": "abc", "status": "accepted", "symbol": "AAPL",
+            "filled_qty": "0",
+        })
 
     monkeypatch.setattr("trading_bot.broker.alpaca.requests.request", fake)
-    alpaca.AlpacaBroker().submit_order("AAPL", 1.0, "buy", limit_price=190.0)
+    result = alpaca.AlpacaBroker().submit_order(
+        "AAPL", 1.0, "buy", limit_price=190.0,
+    )
     assert captured[0]["json"]["symbol"] == "AAPL"
+    assert result.symbol == "AAPL"
 
 
 # ───────────────────────── CLI wiring (live default) ─────────────────────────

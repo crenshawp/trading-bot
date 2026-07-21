@@ -66,6 +66,7 @@ _HTTP_TIMEOUT_SECONDS = 10
 # tight so only crypto pairs translate — stock tickers and OCC option symbols
 # contain no '-USD' suffix and pass through untouched.
 _CRYPTO_TICKER_RE = re.compile(r"^(?P<base>[A-Z0-9]+)-USD$")
+_ALPACA_CRYPTO_SYMBOL_RE = re.compile(r"^(?P<base>[A-Z0-9]+)/USD$")
 
 
 def to_alpaca_symbol(symbol: str) -> str:
@@ -81,6 +82,19 @@ def to_alpaca_symbol(symbol: str) -> str:
     if match is None:
         return symbol
     return f"{match.group('base')}/USD"
+
+
+def _from_alpaca_symbol(symbol: str) -> str:
+    """Translate only Alpaca crypto wire symbols back to internal form.
+
+    This is a response adapter, not a general ingress canonicalizer. Exact
+    uppercase alphanumeric ``BASE/USD`` pairs become ``BASE-USD``; stock,
+    dual-class, and OCC option symbols pass through unchanged.
+    """
+    match = _ALPACA_CRYPTO_SYMBOL_RE.match(symbol)
+    if match is None:
+        return symbol
+    return f"{match.group('base')}-USD"
 
 
 def round_limit_price(price: float) -> float:
@@ -288,7 +302,7 @@ def _orders_body_error(body: Any) -> str:
 
 def _parse_position(d: Mapping[str, Any]) -> Position:
     return Position(
-        symbol=str(d.get("symbol", "")),
+        symbol=_from_alpaca_symbol(str(d.get("symbol", ""))),
         qty=_to_float(d.get("qty")) or 0.0,
         side=str(d.get("side", "long")),
         avg_entry_price=_to_float(d.get("avg_entry_price")),
@@ -301,12 +315,13 @@ def _parse_order(d: Mapping[str, Any]) -> OrderResult:
     """Map an Alpaca order object onto the neutral ``OrderResult`` (``ok=True``
     — the record was read successfully; its lifecycle is carried by ``status``)."""
     raw_status = _str_or_none(d.get("status"))
+    raw_symbol = _str_or_none(d.get("symbol"))
     return OrderResult(
         ok=True,
         status=map_status(raw_status),
         order_id=_str_or_none(d.get("id")),
         client_order_id=_str_or_none(d.get("client_order_id")),
-        symbol=_str_or_none(d.get("symbol")),
+        symbol=_from_alpaca_symbol(raw_symbol) if raw_symbol is not None else None,
         qty=_to_float(d.get("qty")),
         filled_qty=_to_float(d.get("filled_qty")) or 0.0,
         filled_avg_price=_to_float(d.get("filled_avg_price")),
