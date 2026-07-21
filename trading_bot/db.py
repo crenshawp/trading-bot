@@ -16,6 +16,7 @@ from typing import Any
 
 from trading_bot import config
 from trading_bot.models import (
+    LEGACY_PENDING_ORDER_CLIENT_ID_PREFIX,
     PENDING_ORDER_INTENT_VERSION,
     TERMINAL_PENDING_ORDER_STATUSES,
     VALID_ASSET_CLASSES,
@@ -44,6 +45,7 @@ from trading_bot.models import (
     Prediction,
     Signal,
     Trade,
+    is_recoverable_pending_order_client_id,
     normalize_risk_text,
 )
 
@@ -57,6 +59,7 @@ from trading_bot.models import (
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
+# Version 25 (cross-cutting audit) — adds pre-submit pending-order identity.
 # Version 24 (cross-cutting audit) — adds the durable pending_orders ledger.
 # Version 23 (Phase 24) — signals earnings/news risk store full text grades.
 # Version 22 (Phase 19) — adds long_term_positions.source/direction/tp/sl/
@@ -72,7 +75,7 @@ from trading_bot.models import (
 # Version 13 (Phase 6) — adds trades.ind_* advisory indicator-family columns.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -396,12 +399,15 @@ CREATE TABLE IF NOT EXISTS plan_executions (
 CREATE INDEX IF NOT EXISTS idx_plan_executions_ticker_pool
     ON plan_executions(ticker, pool, executed_at);
 
--- Cross-cutting order-lifecycle audit: every broker-accepted order is durable
--- before any position is materialized.  Queryable common intent is normalized;
--- vehicle-specific intent remains an immutable, versioned JSON object.
+-- Cross-cutting order-lifecycle audit: every submission intent is durable
+-- before network I/O. Queryable common intent is normalized; vehicle-specific
+-- intent remains an immutable, versioned JSON object.
 CREATE TABLE IF NOT EXISTS pending_orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    broker_order_id TEXT NOT NULL UNIQUE,
+    client_order_id TEXT NOT NULL UNIQUE CHECK (TRIM(client_order_id) <> ''),
+    broker_order_id TEXT UNIQUE CHECK (
+        broker_order_id IS NULL OR TRIM(broker_order_id) <> ''
+    ),
     ticker TEXT NOT NULL,
     broker_symbol TEXT NOT NULL,
     asset_class TEXT NOT NULL CHECK (asset_class IN ('stock','crypto')),
@@ -421,7 +427,8 @@ CREATE TABLE IF NOT EXISTS pending_orders (
     intent_payload_json TEXT NOT NULL,
     lifecycle_status TEXT NOT NULL DEFAULT 'new' CHECK (
         lifecycle_status IN (
-            'new','partially_filled','filled','canceled','rejected','expired','unknown'
+            'prepared','new','partially_filled','filled','canceled','rejected',
+            'expired','unknown','abandoned'
         )
     ),
     broker_status TEXT,
@@ -443,11 +450,34 @@ CREATE TABLE IF NOT EXISTS pending_orders (
         OR (filled_qty > 0 AND filled_avg_price > 0)
     ),
     CHECK (
-        (lifecycle_status IN ('filled','canceled','rejected','expired')
+        (lifecycle_status IN ('filled','canceled','rejected','expired','abandoned')
          AND terminal_at IS NOT NULL
          AND TRIM(COALESCE(terminal_reason, '')) <> '')
-        OR (lifecycle_status IN ('new','partially_filled','unknown')
+        OR (lifecycle_status IN ('prepared','new','partially_filled','unknown')
             AND terminal_at IS NULL AND terminal_reason IS NULL)
+    ),
+    CHECK (
+        (lifecycle_status IN ('prepared','abandoned') AND broker_order_id IS NULL)
+        OR (
+            lifecycle_status NOT IN ('prepared','abandoned')
+            AND broker_order_id IS NOT NULL
+        )
+    ),
+    CHECK (
+        lifecycle_status <> 'prepared'
+        OR (
+            broker_status IS NULL AND filled_qty = 0
+            AND filled_avg_price IS NULL AND last_refreshed_at IS NULL
+            AND position_kind IS NULL AND position_id IS NULL
+        )
+    ),
+    CHECK (
+        lifecycle_status <> 'abandoned'
+        OR (
+            broker_status IS NULL AND filled_qty = 0
+            AND filled_avg_price IS NULL
+            AND position_kind IS NULL AND position_id IS NULL
+        )
     ),
     CHECK (
         (position_kind IS NULL AND position_id IS NULL)
@@ -466,12 +496,24 @@ CREATE INDEX IF NOT EXISTS idx_pending_orders_nonterminal
 -- whitelisted Python update helper.
 CREATE TRIGGER IF NOT EXISTS trg_pending_orders_immutable_intent
 BEFORE UPDATE OF
-    broker_order_id, ticker, broker_symbol, asset_class, vehicle,
+    client_order_id, ticker, broker_symbol, asset_class, vehicle,
     target_position_kind, side, requested_qty, requested_limit_price,
     submitted_at, signal_id, intent_payload_version, intent_payload_json
 ON pending_orders
 BEGIN
     SELECT RAISE(ABORT, 'pending order materialization intent is immutable');
+END;
+
+-- A prepared row may bind its broker identity exactly once.  Rebinding or
+-- removing an already-bound ID is forbidden even for direct SQL callers.
+CREATE TRIGGER IF NOT EXISTS trg_pending_orders_broker_id_bind_once
+BEFORE UPDATE OF broker_order_id ON pending_orders
+WHEN NOT (
+    OLD.broker_order_id IS NULL
+    AND NEW.broker_order_id IS NOT NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'pending order broker_order_id may only bind once');
 END;
 
 -- Broker fill snapshots are cumulative.  An older snapshot may be ignored by
@@ -528,9 +570,9 @@ _LONG_TERM_UPDATABLE_FIELDS: frozenset[str] = frozenset(
 
 _PENDING_ORDER_UPDATABLE_FIELDS: frozenset[str] = frozenset(
     {
-        "lifecycle_status", "broker_status", "filled_qty", "filled_avg_price",
-        "last_refreshed_at", "terminal_reason", "terminal_at",
-        "position_kind", "position_id",
+        "broker_order_id", "lifecycle_status", "broker_status", "filled_qty",
+        "filled_avg_price", "last_refreshed_at", "terminal_reason",
+        "terminal_at", "position_kind", "position_id",
     }
 )
 
@@ -883,6 +925,208 @@ def _migrate_to_v24(_conn: sqlite3.Connection) -> None:
     return None
 
 
+def _migrate_to_v25(conn: sqlite3.Connection) -> None:
+    """Add pre-submit identity while preserving every v24 ledger row.
+
+    SQLite cannot add the required UNIQUE/NULLability/CHECK contract with
+    ``ALTER COLUMN``, so the dormant v24 ledger is rebuilt transactionally.
+    Bound legacy rows receive deterministic synthetic client IDs.  Those IDs
+    are audit keys only and are explicitly recovery-ineligible in ``models``.
+    """
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(pending_orders)")
+    }
+    if "client_order_id" in columns:
+        return
+
+    conn.execute("DROP INDEX IF EXISTS idx_pending_orders_nonterminal")
+    for trigger in (
+        "trg_pending_orders_immutable_intent",
+        "trg_pending_orders_filled_qty_monotonic",
+        "trg_pending_orders_position_link_once",
+        "trg_pending_orders_broker_id_bind_once",
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    conn.execute(
+        """
+        CREATE TABLE pending_orders_v25 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_order_id TEXT NOT NULL UNIQUE
+                CHECK (TRIM(client_order_id) <> ''),
+            broker_order_id TEXT UNIQUE CHECK (
+                broker_order_id IS NULL OR TRIM(broker_order_id) <> ''
+            ),
+            ticker TEXT NOT NULL,
+            broker_symbol TEXT NOT NULL,
+            asset_class TEXT NOT NULL CHECK (asset_class IN ('stock','crypto')),
+            vehicle TEXT NOT NULL
+                CHECK (vehicle IN ('option_full','option_undersized','shares')),
+            target_position_kind TEXT NOT NULL
+                CHECK (target_position_kind IN ('option','long_term')),
+            side TEXT NOT NULL CHECK (side IN ('buy','sell')),
+            requested_qty REAL NOT NULL CHECK (requested_qty > 0),
+            requested_limit_price REAL CHECK (
+                requested_limit_price IS NULL OR requested_limit_price > 0
+            ),
+            submitted_at TEXT NOT NULL,
+            signal_id INTEGER,
+            intent_payload_version INTEGER NOT NULL DEFAULT 1
+                CHECK (intent_payload_version >= 1),
+            intent_payload_json TEXT NOT NULL,
+            lifecycle_status TEXT NOT NULL DEFAULT 'new' CHECK (
+                lifecycle_status IN (
+                    'prepared','new','partially_filled','filled','canceled',
+                    'rejected','expired','unknown','abandoned'
+                )
+            ),
+            broker_status TEXT,
+            filled_qty REAL NOT NULL DEFAULT 0 CHECK (filled_qty >= 0),
+            filled_avg_price REAL,
+            last_refreshed_at TEXT,
+            terminal_reason TEXT,
+            terminal_at TEXT,
+            position_kind TEXT CHECK (position_kind IN ('option','long_term')),
+            position_id INTEGER,
+            CHECK (
+                (target_position_kind = 'option'
+                 AND vehicle IN ('option_full','option_undersized')
+                 AND side = 'buy')
+                OR (target_position_kind = 'long_term' AND vehicle = 'shares')
+            ),
+            CHECK (
+                (filled_qty = 0 AND filled_avg_price IS NULL)
+                OR (filled_qty > 0 AND filled_avg_price > 0)
+            ),
+            CHECK (
+                (lifecycle_status IN (
+                    'filled','canceled','rejected','expired','abandoned'
+                 )
+                 AND terminal_at IS NOT NULL
+                 AND TRIM(COALESCE(terminal_reason, '')) <> '')
+                OR (lifecycle_status IN (
+                    'prepared','new','partially_filled','unknown'
+                ) AND terminal_at IS NULL AND terminal_reason IS NULL)
+            ),
+            CHECK (
+                (lifecycle_status IN ('prepared','abandoned')
+                 AND broker_order_id IS NULL)
+                OR (
+                    lifecycle_status NOT IN ('prepared','abandoned')
+                    AND broker_order_id IS NOT NULL
+                )
+            ),
+            CHECK (
+                lifecycle_status <> 'prepared'
+                OR (
+                    broker_status IS NULL AND filled_qty = 0
+                    AND filled_avg_price IS NULL AND last_refreshed_at IS NULL
+                    AND position_kind IS NULL AND position_id IS NULL
+                )
+            ),
+            CHECK (
+                lifecycle_status <> 'abandoned'
+                OR (
+                    broker_status IS NULL AND filled_qty = 0
+                    AND filled_avg_price IS NULL
+                    AND position_kind IS NULL AND position_id IS NULL
+                )
+            ),
+            CHECK (
+                (position_kind IS NULL AND position_id IS NULL)
+                OR (position_kind IS NOT NULL AND position_id > 0)
+            ),
+            CHECK (position_kind IS NULL OR position_kind = target_position_kind),
+            CHECK (
+                position_id IS NULL OR (filled_qty > 0 AND filled_avg_price > 0)
+            )
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO pending_orders_v25 (
+            id, client_order_id, broker_order_id, ticker, broker_symbol,
+            asset_class, vehicle, target_position_kind, side, requested_qty,
+            requested_limit_price, submitted_at, signal_id,
+            intent_payload_version, intent_payload_json, lifecycle_status,
+            broker_status, filled_qty, filled_avg_price, last_refreshed_at,
+            terminal_reason, terminal_at, position_kind, position_id
+        )
+        SELECT
+            id, ? || id, broker_order_id, ticker, broker_symbol, asset_class,
+            vehicle, target_position_kind, side, requested_qty,
+            requested_limit_price, submitted_at, signal_id,
+            intent_payload_version, intent_payload_json, lifecycle_status,
+            broker_status, filled_qty, filled_avg_price, last_refreshed_at,
+            terminal_reason, terminal_at, position_kind, position_id
+        FROM pending_orders
+        """,
+        (f"{LEGACY_PENDING_ORDER_CLIENT_ID_PREFIX}v24-",),
+    )
+    conn.execute("DROP TABLE pending_orders")
+    conn.execute("ALTER TABLE pending_orders_v25 RENAME TO pending_orders")
+    conn.execute(
+        "CREATE INDEX idx_pending_orders_nonterminal "
+        "ON pending_orders(submitted_at) WHERE terminal_at IS NULL"
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER trg_pending_orders_immutable_intent
+        BEFORE UPDATE OF
+            client_order_id, ticker, broker_symbol, asset_class, vehicle,
+            target_position_kind, side, requested_qty, requested_limit_price,
+            submitted_at, signal_id, intent_payload_version, intent_payload_json
+        ON pending_orders
+        BEGIN
+            SELECT RAISE(
+                ABORT, 'pending order materialization intent is immutable'
+            );
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER trg_pending_orders_broker_id_bind_once
+        BEFORE UPDATE OF broker_order_id ON pending_orders
+        WHEN NOT (
+            OLD.broker_order_id IS NULL
+            AND NEW.broker_order_id IS NOT NULL
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT, 'pending order broker_order_id may only bind once'
+            );
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER trg_pending_orders_filled_qty_monotonic
+        BEFORE UPDATE OF filled_qty ON pending_orders
+        WHEN NEW.filled_qty < OLD.filled_qty
+        BEGIN
+            SELECT RAISE(ABORT, 'pending order filled_qty cannot decrease');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER trg_pending_orders_position_link_once
+        BEFORE UPDATE OF position_kind, position_id ON pending_orders
+        WHEN OLD.position_id IS NOT NULL AND (
+            NEW.position_id IS NOT OLD.position_id
+            OR NEW.position_kind IS NOT OLD.position_kind
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT, 'pending order position link is immutable once set'
+            );
+        END
+        """
+    )
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -911,6 +1155,7 @@ def init_db() -> None:
         _migrate_to_v22(conn)
         _migrate_to_v23(conn)
         _migrate_to_v24(conn)
+        _migrate_to_v25(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -3410,12 +3655,27 @@ def _validate_pending_order_payload(order: PendingOrder) -> None:
             ) from exc
 
 
-def _validate_pending_order(order: PendingOrder) -> None:
-    for field, value in (
-        ("broker_order_id", order.broker_order_id),
-        ("ticker", order.ticker),
-        ("broker_symbol", order.broker_symbol),
+def _resolved_pending_order_client_id(order: PendingOrder) -> str:
+    """Return durable identity, synthesizing only for the legacy bound path."""
+    if order.client_order_id is not None:
+        if not isinstance(order.client_order_id, str) or not order.client_order_id.strip():
+            raise ValueError("pending-order client_order_id must not be empty")
+        if not is_recoverable_pending_order_client_id(order.client_order_id):
+            raise ValueError("pending-order legacy client_order_id namespace is reserved")
+        return order.client_order_id
+    if (
+        order.broker_order_id is not None
+        and order.lifecycle_status not in {"prepared", "abandoned"}
     ):
+        return (
+            f"{LEGACY_PENDING_ORDER_CLIENT_ID_PREFIX}broker-"
+            f"{order.broker_order_id}"
+        )
+    raise ValueError("pending-order client_order_id must be explicit before submit")
+
+
+def _validate_pending_order(order: PendingOrder) -> str:
+    for field, value in (("ticker", order.ticker), ("broker_symbol", order.broker_symbol)):
         if not value.strip():
             raise ValueError(f"pending-order {field} must not be empty")
     if order.asset_class not in VALID_ASSET_CLASSES:
@@ -3436,6 +3696,18 @@ def _validate_pending_order(order: PendingOrder) -> None:
         raise ValueError("pending-order signal_id must be positive")
     if order.lifecycle_status not in VALID_PENDING_ORDER_STATUSES:
         raise ValueError(f"Invalid pending-order status '{order.lifecycle_status}'")
+    if order.broker_order_id is not None and (
+        not isinstance(order.broker_order_id, str)
+        or not order.broker_order_id.strip()
+    ):
+        raise ValueError("pending-order broker_order_id must not be empty")
+    client_order_id = _resolved_pending_order_client_id(order)
+    is_unbound_status = order.lifecycle_status in {"prepared", "abandoned"}
+    if is_unbound_status != (order.broker_order_id is None):
+        raise ValueError(
+            "prepared/abandoned pending orders must be unbound; "
+            "all broker lifecycle rows must be bound"
+        )
     if order.filled_qty < 0:
         raise ValueError("pending-order filled_qty must not be negative")
     has_fill_price = (
@@ -3459,6 +3731,17 @@ def _validate_pending_order(order: PendingOrder) -> None:
         order.terminal_at is not None or order.terminal_reason is not None
     ):
         raise ValueError("nonterminal pending order cannot carry terminal fields")
+    if order.lifecycle_status in {"prepared", "abandoned"}:
+        if order.broker_status is not None:
+            raise ValueError(
+                "prepared/abandoned pending order cannot carry broker status"
+            )
+        if order.filled_qty != 0 or order.filled_avg_price is not None:
+            raise ValueError("prepared/abandoned pending order cannot carry a fill")
+        if order.position_kind is not None or order.position_id is not None:
+            raise ValueError("prepared/abandoned pending order cannot link a position")
+    if order.lifecycle_status == "prepared" and order.last_refreshed_at is not None:
+        raise ValueError("prepared pending order cannot have a broker refresh time")
     has_position_link = order.position_kind is not None or order.position_id is not None
     if has_position_link:
         if order.position_kind not in VALID_PENDING_ORDER_POSITION_KINDS:
@@ -3470,22 +3753,27 @@ def _validate_pending_order(order: PendingOrder) -> None:
         if order.filled_qty <= 0 or not has_fill_price:
             raise ValueError("pending order cannot link a position before a usable fill")
     _validate_pending_order_payload(order)
+    return client_order_id
 
 
 def insert_pending_order(order: PendingOrder) -> int:
-    """Insert one accepted order's immutable intent and return its ledger id."""
-    _validate_pending_order(order)
+    """Insert one prepared/accepted immutable intent and return its ledger id."""
+    client_order_id = _validate_pending_order(order)
     sql = """
         INSERT INTO pending_orders (
-            broker_order_id, ticker, broker_symbol, asset_class, vehicle,
+            client_order_id, broker_order_id, ticker, broker_symbol,
+            asset_class, vehicle,
             target_position_kind, side, requested_qty, requested_limit_price,
             submitted_at, signal_id, intent_payload_version, intent_payload_json,
             lifecycle_status, broker_status, filled_qty, filled_avg_price,
             last_refreshed_at, terminal_reason, terminal_at, position_kind,
             position_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
     """
     params = (
+        client_order_id,
         order.broker_order_id,
         order.ticker,
         order.broker_symbol,
@@ -3526,7 +3814,11 @@ def insert_pending_order(order: PendingOrder) -> int:
 
 def _row_to_pending_order(row: sqlite3.Row) -> PendingOrder:
     return PendingOrder(
-        broker_order_id=str(row["broker_order_id"]),
+        client_order_id=str(row["client_order_id"]),
+        broker_order_id=(
+            str(row["broker_order_id"])
+            if row["broker_order_id"] is not None else None
+        ),
         ticker=str(row["ticker"]),
         broker_symbol=str(row["broker_symbol"]),
         asset_class=str(row["asset_class"]),
@@ -3557,13 +3849,28 @@ def _row_to_pending_order(row: sqlite3.Row) -> PendingOrder:
     )
 
 
-def get_pending_order(broker_order_id: str) -> PendingOrder | None:
+def get_pending_order(broker_order_id: str | None) -> PendingOrder | None:
     """Return the unique ledger row for a broker order id, if present."""
     conn = get_connection()
     try:
         row = conn.execute(
             "SELECT * FROM pending_orders WHERE broker_order_id = ?",
             (broker_order_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return _row_to_pending_order(row) if row is not None else None
+
+
+def get_pending_order_by_client_order_id(
+    client_order_id: str,
+) -> PendingOrder | None:
+    """Return one durable intent by its unique client order identity."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM pending_orders WHERE client_order_id = ?",
+            (client_order_id,),
         ).fetchone()
     finally:
         conn.close()
@@ -3598,7 +3905,7 @@ def get_nonterminal_pending_orders() -> list[PendingOrder]:
 
 
 def update_pending_order(pending_order_id: int, **fields: Any) -> None:
-    """Update only cumulative broker truth and the eventual position link."""
+    """Bind once, or update cumulative broker truth and the position link."""
     unknown = set(fields) - _PENDING_ORDER_UPDATABLE_FIELDS
     if unknown:
         raise ValueError(
@@ -3610,6 +3917,15 @@ def update_pending_order(pending_order_id: int, **fields: Any) -> None:
     normalized: dict[str, Any] = {}
     for key, value in fields.items():
         normalized[key] = value.isoformat() if isinstance(value, datetime) else value
+    if (
+        "broker_order_id" in normalized
+        and normalized["broker_order_id"] is not None
+        and (
+            not isinstance(normalized["broker_order_id"], str)
+            or not normalized["broker_order_id"].strip()
+        )
+    ):
+        raise ValueError("pending-order broker_order_id must not be empty")
     if (
         "lifecycle_status" in normalized
         and normalized["lifecycle_status"] not in VALID_PENDING_ORDER_STATUSES

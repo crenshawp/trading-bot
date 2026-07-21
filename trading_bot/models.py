@@ -261,10 +261,13 @@ VALID_PENDING_ORDER_INTENT_KINDS: frozenset[str] = frozenset(
     {"option", "long_term", "shares_fallback"}
 )
 VALID_PENDING_ORDER_STATUSES: frozenset[str] = frozenset(
-    {"new", "partially_filled", "filled", "canceled", "rejected", "expired", "unknown"}
+    {
+        "prepared", "new", "partially_filled", "filled", "canceled",
+        "rejected", "expired", "unknown", "abandoned",
+    }
 )
 TERMINAL_PENDING_ORDER_STATUSES: frozenset[str] = frozenset(
-    {"filled", "canceled", "rejected", "expired"}
+    {"filled", "canceled", "rejected", "expired", "abandoned"}
 )
 VALID_PENDING_ORDER_VEHICLES: frozenset[str] = frozenset(
     {"option_full", "option_undersized", "shares"}
@@ -274,10 +277,23 @@ VALID_PENDING_ORDER_POSITION_KINDS: frozenset[str] = frozenset(
 )
 VALID_PENDING_ORDER_SIDES: frozenset[str] = frozenset({"buy", "sell"})
 
+# Reserved for rows that predate the atomic submit handoff.  These values are
+# durable uniqueness keys only: they were never sent to Alpaca and therefore
+# must never be used with Alpaca's order-by-client-ID recovery endpoint.
+LEGACY_PENDING_ORDER_CLIENT_ID_PREFIX = "legacy-"
+
+
+def is_recoverable_pending_order_client_id(client_order_id: str | None) -> bool:
+    """Whether a client ID is eligible for provider-side recovery lookup."""
+    return bool(
+        client_order_id
+        and not client_order_id.startswith(LEGACY_PENDING_ORDER_CLIENT_ID_PREFIX)
+    )
+
 
 @dataclass(frozen=True)
 class PendingOrder:
-    """Accepted broker order awaiting cumulative fill materialization.
+    """Prepared or accepted broker order awaiting fill materialization.
 
     Common submission intent is normalized for restart-safe lookup.  Target-
     specific materialization data lives in immutable ``intent_payload_json``;
@@ -290,7 +306,7 @@ class PendingOrder:
     link to the eventual option_positions or long_term_positions row.
     """
 
-    broker_order_id: str
+    broker_order_id: str | None
     ticker: str
     broker_symbol: str
     asset_class: str
@@ -301,6 +317,7 @@ class PendingOrder:
     requested_limit_price: float | None
     submitted_at: datetime
     intent_payload_json: str
+    client_order_id: str | None = None
     signal_id: int | None = None
     intent_payload_version: int = PENDING_ORDER_INTENT_VERSION
     lifecycle_status: str = "new"

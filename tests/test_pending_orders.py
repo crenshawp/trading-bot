@@ -13,6 +13,7 @@ import pytest
 
 from trading_bot import db
 from trading_bot.models import (
+    LEGACY_PENDING_ORDER_CLIENT_ID_PREFIX,
     PENDING_ORDER_INTENT_VERSION,
     TERMINAL_PENDING_ORDER_STATUSES,
     VALID_PENDING_ORDER_INTENT_KINDS,
@@ -20,6 +21,7 @@ from trading_bot.models import (
     VALID_PENDING_ORDER_STATUSES,
     VALID_PENDING_ORDER_VEHICLES,
     PendingOrder,
+    is_recoverable_pending_order_client_id,
 )
 
 
@@ -68,6 +70,7 @@ def _share_payload(
 
 def _pending_order(**overrides: Any) -> PendingOrder:
     base: dict[str, Any] = {
+        "client_order_id": "bot-order-1",
         "broker_order_id": "broker-order-1",
         "ticker": "GOOGL",
         "broker_symbol": "GOOGL260918C00190000",
@@ -96,11 +99,11 @@ def test_pending_order_model_is_frozen_and_vocabularies_are_explicit() -> None:
         "option", "long_term", "shares_fallback",
     } == VALID_PENDING_ORDER_INTENT_KINDS
     assert {
-        "new", "partially_filled", "filled", "canceled", "rejected",
-        "expired", "unknown",
+        "prepared", "new", "partially_filled", "filled", "canceled",
+        "rejected", "expired", "unknown", "abandoned",
     } == VALID_PENDING_ORDER_STATUSES
     assert {
-        "filled", "canceled", "rejected", "expired",
+        "filled", "canceled", "rejected", "expired", "abandoned",
     } == TERMINAL_PENDING_ORDER_STATUSES
     assert {
         "option_full", "option_undersized", "shares",
@@ -130,8 +133,8 @@ def test_pending_order_schema_has_exact_columns_and_constraints(tmp_db: Path) ->
         conn.close()
 
     assert columns == {
-        "id", "broker_order_id", "ticker", "broker_symbol", "asset_class",
-        "vehicle", "target_position_kind", "side", "requested_qty",
+        "id", "client_order_id", "broker_order_id", "ticker", "broker_symbol",
+        "asset_class", "vehicle", "target_position_kind", "side", "requested_qty",
         "requested_limit_price", "submitted_at", "signal_id",
         "intent_payload_version", "intent_payload_json", "lifecycle_status",
         "broker_status", "filled_qty", "filled_avg_price", "last_refreshed_at",
@@ -140,6 +143,7 @@ def test_pending_order_schema_has_exact_columns_and_constraints(tmp_db: Path) ->
     assert "idx_pending_orders_nonterminal" in indexes
     assert triggers == {
         "trg_pending_orders_immutable_intent",
+        "trg_pending_orders_broker_id_bind_once",
         "trg_pending_orders_filled_qty_monotonic",
         "trg_pending_orders_position_link_once",
     }
@@ -152,6 +156,8 @@ def test_option_pending_order_round_trip_preserves_full_intent(tmp_db: Path) -> 
     fetched = db.get_pending_order("broker-order-1")
     assert fetched == dataclasses.replace(order, id=pending_id)
     assert db.get_pending_order("missing") is None
+    assert db.get_pending_order_by_client_order_id("bot-order-1") == fetched
+    assert db.get_pending_order_by_client_order_id("missing") is None
     assert db.get_pending_orders() == [fetched]
     assert db.get_nonterminal_pending_orders() == [fetched]
 
@@ -202,7 +208,67 @@ def test_share_intents_round_trip_without_rerunning_selection(
 def test_duplicate_broker_order_id_is_rejected(tmp_db: Path) -> None:
     db.insert_pending_order(_pending_order())
     with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
-        db.insert_pending_order(_pending_order(ticker="META"))
+        db.insert_pending_order(
+            _pending_order(client_order_id="bot-order-2", ticker="META")
+        )
+
+
+def test_prepared_rows_allow_multiple_null_broker_ids_with_unique_client_ids(
+    tmp_db: Path,
+) -> None:
+    first = _pending_order(
+        client_order_id="bot-prepared-1",
+        broker_order_id=None,
+        lifecycle_status="prepared",
+        broker_status=None,
+    )
+    second = dataclasses.replace(first, client_order_id="bot-prepared-2")
+
+    first_id = db.insert_pending_order(first)
+    second_id = db.insert_pending_order(second)
+
+    assert first_id != second_id
+    assert db.get_pending_order_by_client_order_id(
+        "bot-prepared-1"
+    ) == dataclasses.replace(first, id=first_id)
+    assert db.get_pending_order_by_client_order_id(
+        "bot-prepared-2"
+    ) == dataclasses.replace(second, id=second_id)
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+        db.insert_pending_order(dataclasses.replace(second, client_order_id="bot-prepared-1"))
+
+
+def test_only_bound_legacy_path_synthesizes_recovery_ineligible_client_id(
+    tmp_db: Path,
+) -> None:
+    pending_id = db.insert_pending_order(_pending_order(client_order_id=None))
+    fetched = db.get_pending_order("broker-order-1")
+
+    assert fetched is not None
+    assert fetched.id == pending_id
+    assert fetched.client_order_id == (
+        f"{LEGACY_PENDING_ORDER_CLIENT_ID_PREFIX}broker-broker-order-1"
+    )
+    assert not is_recoverable_pending_order_client_id(fetched.client_order_id)
+
+    with pytest.raises(ValueError, match="explicit before submit"):
+        db.insert_pending_order(
+            _pending_order(
+                client_order_id=None,
+                broker_order_id=None,
+                lifecycle_status="prepared",
+                broker_status=None,
+            )
+        )
+    with pytest.raises(ValueError, match="namespace is reserved"):
+        db.insert_pending_order(
+            _pending_order(
+                client_order_id="legacy-prepared-1",
+                broker_order_id=None,
+                lifecycle_status="prepared",
+                broker_status=None,
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -352,6 +418,130 @@ def test_insert_pending_order_rejects_invalid_normalized_fields(
         db.insert_pending_order(_pending_order(**overrides))
 
 
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"broker_order_id": "broker-order-1"}, "must be unbound"),
+        ({"broker_status": "pending"}, "broker status"),
+        (
+            {"filled_qty": 1.0, "filled_avg_price": 4.2},
+            "cannot carry a fill",
+        ),
+        (
+            {"last_refreshed_at": datetime(2026, 7, 20, 15, 1, tzinfo=UTC)},
+            "refresh time",
+        ),
+        (
+            {
+                "filled_qty": 1.0,
+                "filled_avg_price": 4.2,
+                "position_kind": "option",
+                "position_id": 1,
+            },
+            "cannot carry a fill",
+        ),
+    ],
+)
+def test_prepared_insert_enforces_pre_submit_invariants(
+    tmp_db: Path, overrides: dict[str, Any], match: str,
+) -> None:
+    prepared_fields: dict[str, Any] = {
+        "client_order_id": "bot-prepared-1",
+        "broker_order_id": None,
+        "lifecycle_status": "prepared",
+        "broker_status": None,
+    }
+    prepared_fields.update(overrides)
+    order = _pending_order(**prepared_fields)
+    with pytest.raises(ValueError, match=match):
+        db.insert_pending_order(order)
+
+
+def test_prepared_order_binds_broker_id_once_and_id_becomes_immutable(
+    tmp_db: Path,
+) -> None:
+    prepared = _pending_order(
+        client_order_id="bot-prepared-1",
+        broker_order_id=None,
+        lifecycle_status="prepared",
+        broker_status=None,
+    )
+    pending_id = db.insert_pending_order(prepared)
+    observed_at = datetime(2026, 7, 20, 15, 1, tzinfo=UTC)
+
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint"):
+        db.update_pending_order(
+            pending_id,
+            broker_order_id="broker-bound-too-early",
+        )
+    db.update_pending_order(
+        pending_id,
+        broker_order_id="broker-bound-1",
+        lifecycle_status="new",
+        broker_status="accepted",
+        last_refreshed_at=observed_at,
+    )
+
+    bound = db.get_pending_order_by_client_order_id("bot-prepared-1")
+    assert bound is not None
+    assert bound.broker_order_id == "broker-bound-1"
+    assert bound.lifecycle_status == "new"
+    assert bound.last_refreshed_at == observed_at
+    with pytest.raises(sqlite3.IntegrityError, match="may only bind once"):
+        db.update_pending_order(pending_id, broker_order_id="broker-rebound-2")
+    with pytest.raises(sqlite3.IntegrityError, match="may only bind once"):
+        db.update_pending_order(pending_id, broker_order_id=None)
+
+
+def test_abandoned_is_unbound_zero_fill_terminal_with_reason_and_time(
+    tmp_db: Path,
+) -> None:
+    terminal_at = datetime(2026, 7, 20, 15, 5, tzinfo=UTC)
+    prepared = _pending_order(
+        client_order_id="bot-abandoned-1",
+        broker_order_id=None,
+        lifecycle_status="prepared",
+        broker_status=None,
+    )
+    pending_id = db.insert_pending_order(prepared)
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint"):
+        db.update_pending_order(pending_id, lifecycle_status="abandoned")
+    db.update_pending_order(
+        pending_id,
+        lifecycle_status="abandoned",
+        terminal_reason="client_order_id not found",
+        terminal_at=terminal_at,
+    )
+    abandoned = dataclasses.replace(
+        prepared,
+        lifecycle_status="abandoned",
+        terminal_reason="client_order_id not found",
+        terminal_at=terminal_at,
+    )
+
+    assert db.get_pending_order_by_client_order_id(
+        "bot-abandoned-1"
+    ) == dataclasses.replace(abandoned, id=pending_id)
+    assert db.get_nonterminal_pending_orders() == []
+    with pytest.raises(ValueError, match="terminal_reason"):
+        db.insert_pending_order(
+            dataclasses.replace(
+                abandoned,
+                client_order_id="bot-abandoned-2",
+                terminal_reason=None,
+                terminal_at=None,
+            )
+        )
+    with pytest.raises(ValueError, match="broker status"):
+        db.insert_pending_order(
+            dataclasses.replace(
+                abandoned,
+                client_order_id="bot-abandoned-3",
+                broker_status="not_found",
+            )
+        )
+
+
 def test_cumulative_fill_update_links_once_and_terminalizes(tmp_db: Path) -> None:
     pending_id = db.insert_pending_order(_pending_order())
     refreshed_at = datetime(2026, 7, 20, 15, 2, tzinfo=UTC)
@@ -402,6 +592,7 @@ def test_zero_fill_cancel_has_no_position_and_partial_cancel_preserves_link(
 ) -> None:
     terminal_at = datetime(2026, 7, 20, 20, 0, tzinfo=UTC)
     zero = _pending_order(
+        client_order_id="bot-zero-cancel",
         broker_order_id="zero-cancel",
         lifecycle_status="canceled",
         broker_status="expired",
@@ -409,6 +600,7 @@ def test_zero_fill_cancel_has_no_position_and_partial_cancel_preserves_link(
         terminal_at=terminal_at,
     )
     partial = _pending_order(
+        client_order_id="bot-partial-cancel",
         broker_order_id="partial-cancel",
         lifecycle_status="canceled",
         broker_status="canceled",
@@ -461,6 +653,11 @@ def test_update_whitelist_and_database_triggers_protect_durable_truth(
             conn.execute(
                 "UPDATE pending_orders SET ticker = 'META' WHERE id = ?",
                 (pending_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="intent is immutable"):
+            conn.execute(
+                "UPDATE pending_orders SET client_order_id = ? WHERE id = ?",
+                ("bot-order-rebound", pending_id),
             )
     finally:
         conn.close()
@@ -520,7 +717,7 @@ def test_v23_database_migrates_without_rewriting_existing_rows(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 24
+    assert db.schema_version() == 25
     migrated = db.get_connection()
     try:
         sentinel = migrated.execute(
@@ -535,3 +732,200 @@ def test_v23_database_migrates_without_rewriting_existing_rows(
     assert sentinel is not None and sentinel["value"] == "preserved"
     assert table is not None
     assert db.get_pending_orders() == []
+
+
+def _create_v24_pending_orders(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE pending_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            broker_order_id TEXT NOT NULL UNIQUE,
+            ticker TEXT NOT NULL,
+            broker_symbol TEXT NOT NULL,
+            asset_class TEXT NOT NULL CHECK (asset_class IN ('stock','crypto')),
+            vehicle TEXT NOT NULL CHECK (
+                vehicle IN ('option_full','option_undersized','shares')
+            ),
+            target_position_kind TEXT NOT NULL CHECK (
+                target_position_kind IN ('option','long_term')
+            ),
+            side TEXT NOT NULL CHECK (side IN ('buy','sell')),
+            requested_qty REAL NOT NULL CHECK (requested_qty > 0),
+            requested_limit_price REAL CHECK (
+                requested_limit_price IS NULL OR requested_limit_price > 0
+            ),
+            submitted_at TEXT NOT NULL,
+            signal_id INTEGER,
+            intent_payload_version INTEGER NOT NULL DEFAULT 1 CHECK (
+                intent_payload_version >= 1
+            ),
+            intent_payload_json TEXT NOT NULL,
+            lifecycle_status TEXT NOT NULL DEFAULT 'new' CHECK (
+                lifecycle_status IN (
+                    'new','partially_filled','filled','canceled','rejected',
+                    'expired','unknown'
+                )
+            ),
+            broker_status TEXT,
+            filled_qty REAL NOT NULL DEFAULT 0 CHECK (filled_qty >= 0),
+            filled_avg_price REAL,
+            last_refreshed_at TEXT,
+            terminal_reason TEXT,
+            terminal_at TEXT,
+            position_kind TEXT CHECK (position_kind IN ('option','long_term')),
+            position_id INTEGER,
+            CHECK (
+                (target_position_kind = 'option'
+                 AND vehicle IN ('option_full','option_undersized')
+                 AND side = 'buy')
+                OR (target_position_kind = 'long_term' AND vehicle = 'shares')
+            ),
+            CHECK (
+                (filled_qty = 0 AND filled_avg_price IS NULL)
+                OR (filled_qty > 0 AND filled_avg_price > 0)
+            ),
+            CHECK (
+                (lifecycle_status IN ('filled','canceled','rejected','expired')
+                 AND terminal_at IS NOT NULL
+                 AND TRIM(COALESCE(terminal_reason, '')) <> '')
+                OR (lifecycle_status IN ('new','partially_filled','unknown')
+                    AND terminal_at IS NULL AND terminal_reason IS NULL)
+            ),
+            CHECK (
+                (position_kind IS NULL AND position_id IS NULL)
+                OR (position_kind IS NOT NULL AND position_id > 0)
+            ),
+            CHECK (position_kind IS NULL OR position_kind = target_position_kind),
+            CHECK (
+                position_id IS NULL OR (filled_qty > 0 AND filled_avg_price > 0)
+            )
+        );
+        CREATE INDEX idx_pending_orders_nonterminal
+            ON pending_orders(submitted_at) WHERE terminal_at IS NULL;
+        CREATE TRIGGER trg_pending_orders_immutable_intent
+        BEFORE UPDATE OF
+            broker_order_id, ticker, broker_symbol, asset_class, vehicle,
+            target_position_kind, side, requested_qty, requested_limit_price,
+            submitted_at, signal_id, intent_payload_version, intent_payload_json
+        ON pending_orders
+        BEGIN
+            SELECT RAISE(
+                ABORT, 'pending order materialization intent is immutable'
+            );
+        END;
+        CREATE TRIGGER trg_pending_orders_filled_qty_monotonic
+        BEFORE UPDATE OF filled_qty ON pending_orders
+        WHEN NEW.filled_qty < OLD.filled_qty
+        BEGIN
+            SELECT RAISE(ABORT, 'pending order filled_qty cannot decrease');
+        END;
+        CREATE TRIGGER trg_pending_orders_position_link_once
+        BEFORE UPDATE OF position_kind, position_id ON pending_orders
+        WHEN OLD.position_id IS NOT NULL AND (
+            NEW.position_id IS NOT OLD.position_id
+            OR NEW.position_kind IS NOT OLD.position_kind
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT, 'pending order position link is immutable once set'
+            );
+        END;
+        """
+    )
+
+
+def test_v24_pending_order_rows_migrate_collision_free_and_preserve_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy_path = tmp_path / "legacy-v24.db"
+    conn = sqlite3.connect(legacy_path)
+    try:
+        conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (24)")
+        _create_v24_pending_orders(conn)
+        rows = (
+            (
+                7, "legacy-bound-7", "GOOGL", "GOOGL260918C00190000",
+                "stock", "option_full", "option", "buy", 2.0, 4.25,
+                "2026-07-20T15:00:00+00:00", 17, 1, _option_payload(),
+                "new", "accepted", 0.0, None, None, None, None, None, None,
+            ),
+            (
+                11, "legacy-bound-11", "GOOGL", "GOOGL260918C00190000",
+                "stock", "option_full", "option", "buy", 2.0, 4.25,
+                "2026-07-20T15:00:00+00:00", 17, 1, _option_payload(),
+                "canceled", "canceled", 1.0, 4.2,
+                "2026-07-20T15:04:00+00:00", "canceled",
+                "2026-07-20T15:04:00+00:00", "option", 88,
+            ),
+        )
+        conn.executemany(
+            """
+            INSERT INTO pending_orders (
+                id, broker_order_id, ticker, broker_symbol, asset_class,
+                vehicle, target_position_kind, side, requested_qty,
+                requested_limit_price, submitted_at, signal_id,
+                intent_payload_version, intent_payload_json, lifecycle_status,
+                broker_status, filled_qty, filled_avg_price, last_refreshed_at,
+                terminal_reason, terminal_at, position_kind, position_id
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?
+            )
+            """,
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr("trading_bot.config.DB_PATH", legacy_path)
+
+    db.init_db()
+    db.init_db()
+
+    assert db.schema_version() == 25
+    first = db.get_pending_order("legacy-bound-7")
+    second = db.get_pending_order("legacy-bound-11")
+    assert first is not None and second is not None
+    assert first.client_order_id == "legacy-v24-7"
+    assert second.client_order_id == "legacy-v24-11"
+    assert first.id == 7 and second.id == 11
+    assert first.broker_status == "accepted" and first.filled_qty == 0
+    assert second.lifecycle_status == "canceled"
+    assert second.filled_qty == 1.0 and second.filled_avg_price == 4.2
+    assert second.position_kind == "option" and second.position_id == 88
+    assert not is_recoverable_pending_order_client_id(first.client_order_id)
+    assert not is_recoverable_pending_order_client_id(second.client_order_id)
+    assert db.insert_pending_order(
+        _pending_order(
+            client_order_id="bot-post-migration-1",
+            broker_order_id=None,
+            lifecycle_status="prepared",
+            broker_status=None,
+        )
+    ) == 12
+
+    migrated = db.get_connection()
+    try:
+        indexes = {
+            str(row["name"])
+            for row in migrated.execute(
+                "PRAGMA index_list(pending_orders)"
+            ).fetchall()
+        }
+        triggers = {
+            str(row["name"])
+            for row in migrated.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'trigger' AND tbl_name = 'pending_orders'"
+            ).fetchall()
+        }
+    finally:
+        migrated.close()
+    assert "idx_pending_orders_nonterminal" in indexes
+    assert triggers == {
+        "trg_pending_orders_immutable_intent",
+        "trg_pending_orders_broker_id_bind_once",
+        "trg_pending_orders_filled_qty_monotonic",
+        "trg_pending_orders_position_link_once",
+    }
