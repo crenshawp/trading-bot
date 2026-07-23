@@ -15,8 +15,10 @@ Phase 7 introduces position sizing.
 from __future__ import annotations
 
 import dataclasses
+import math
 import sys
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from typing import Any
 
 import pandas as pd
@@ -113,9 +115,41 @@ def _interval(signal: Signal) -> str:
 # yfinance fetch (with per-resolver-run cache)
 # ────────────────────────────────────────────────────────────────────────────
 
+class _CandleFetchStatus(Enum):
+    OK = "ok"
+    PROVIDER_ERROR = "provider_error"
+    EMPTY = "empty"
+    MALFORMED = "malformed"
+
+
+@dataclasses.dataclass(frozen=True)
+class _CandleFetchResult:
+    status: _CandleFetchStatus
+    candles: pd.DataFrame | None = None
+    reason: str | None = None
+
+
 # Cache key: (ticker, interval, start_iso, end_iso). Cleared at the start of
 # every ``resolve_all_open_trades`` call so stale data doesn't leak across runs.
-_CandleCache = dict[tuple[str, str, str, str], pd.DataFrame | None]
+_CandleCache = dict[tuple[str, str, str, str], _CandleFetchResult]
+
+
+def _validate_candles(df: pd.DataFrame) -> str | None:
+    """Return a retry reason when a provider response cannot be replayed safely."""
+    required = {"High", "Low", "Close"}
+    missing = required.difference(df.columns)
+    if missing:
+        return f"malformed candle response (missing columns: {', '.join(sorted(missing))})"
+
+    for raw_ts, row in df.iterrows():
+        try:
+            _to_utc(raw_ts)
+            values = (float(row["High"]), float(row["Low"]), float(row["Close"]))
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            return f"malformed candle response ({exc})"
+        if not all(math.isfinite(value) for value in values):
+            return "malformed candle response (non-finite OHLC value)"
+    return None
 
 
 def _fetch_candles(
@@ -124,8 +158,8 @@ def _fetch_candles(
     start: datetime,
     end: datetime,
     cache: _CandleCache | None = None,
-) -> pd.DataFrame | None:
-    """Pull OHLCV candles from yfinance. Returns ``None`` on empty/failure."""
+) -> _CandleFetchResult:
+    """Pull OHLCV candles and preserve why a replay is unavailable."""
     key = (ticker, interval, start.isoformat(), end.isoformat())
     if cache is not None and key in cache:
         return cache[key]
@@ -140,23 +174,85 @@ def _fetch_candles(
             auto_adjust=False,
         )
     except Exception as exc:
-        print(f"  yfinance error for {ticker}: {exc}", file=sys.stderr)
+        result = _CandleFetchResult(
+            _CandleFetchStatus.PROVIDER_ERROR,
+            reason=f"provider exception ({type(exc).__name__}): {exc}",
+        )
         if cache is not None:
-            cache[key] = None
-        return None
+            cache[key] = result
+        return result
 
-    if df is None or df.empty:
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        result = _CandleFetchResult(
+            _CandleFetchStatus.EMPTY,
+            reason="empty candle response",
+        )
         if cache is not None:
-            cache[key] = None
-        return None
+            cache[key] = result
+        return result
+
+    if not isinstance(df, pd.DataFrame):
+        result = _CandleFetchResult(
+            _CandleFetchStatus.MALFORMED,
+            reason=f"malformed candle response ({type(df).__name__})",
+        )
+        if cache is not None:
+            cache[key] = result
+        return result
 
     # yfinance sometimes returns MultiIndex columns for single tickers — flatten.
     if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
         df.columns = df.columns.droplevel(1)
 
+    malformed_reason = _validate_candles(df)
+    if malformed_reason is not None:
+        result = _CandleFetchResult(
+            _CandleFetchStatus.MALFORMED,
+            reason=malformed_reason,
+        )
+        if cache is not None:
+            cache[key] = result
+        return result
+
+    result = _CandleFetchResult(_CandleFetchStatus.OK, candles=df)
     if cache is not None:
-        cache[key] = df
-    return df
+        cache[key] = result
+    return result
+
+
+def _candle_width(interval: str) -> timedelta:
+    return timedelta(hours=1) if interval == _INTERVAL_CRYPTO else timedelta(days=1)
+
+
+def _covers_deadline(
+    df: pd.DataFrame,
+    *,
+    interval: str,
+    opened_at: datetime,
+    deadline: datetime,
+    now: datetime,
+) -> bool:
+    """Whether closed candles cover the complete settlement hold window."""
+    width = _candle_width(interval)
+    closed_coverage_ends = (
+        candle_time + width
+        for raw_ts in df.index
+        if (candle_time := _to_utc(raw_ts)) >= opened_at
+        and candle_time < deadline
+        and candle_time + width <= now
+    )
+    return max(closed_coverage_ends, default=opened_at) >= deadline
+
+
+def _retry_open(trade: Trade, signal: Signal, reason: str) -> Trade:
+    trade_label = f"#{trade.id}" if trade.id is not None else "without id"
+    print(
+        f"  settlement retry for trade {trade_label} ({signal.ticker}): "
+        f"{reason}; leaving open",
+        file=sys.stderr,
+    )
+    return dataclasses.replace(trade, outcome="open")
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -212,15 +308,12 @@ def resolve_trade(
         # Brand-new trade, no price action to evaluate yet.
         return dataclasses.replace(trade, outcome="open")
 
-    df = _fetch_candles(signal.ticker, _interval(signal), opened_at, end, cache)
-    if df is None or df.empty:
-        # No data. If we're already past the deadline, give up and mark expired
-        # at the deadline timestamp with no exit price.
-        if now_utc >= deadline:
-            return dataclasses.replace(
-                trade, outcome="expired", closed_at=deadline, exit_price=None, pnl_pct=None
-            )
-        return dataclasses.replace(trade, outcome="open")
+    interval = _interval(signal)
+    fetch = _fetch_candles(signal.ticker, interval, opened_at, end, cache)
+    if fetch.status is not _CandleFetchStatus.OK or fetch.candles is None:
+        return _retry_open(trade, signal, fetch.reason or "candle replay unavailable")
+
+    df = fetch.candles
 
     last_close: float | None = None
     for raw_ts, row in df.iterrows():
@@ -261,6 +354,18 @@ def resolve_trade(
 
     # No TP/SL hit in any candle.
     if now_utc >= deadline:
+        if not _covers_deadline(
+            df,
+            interval=interval,
+            opened_at=opened_at,
+            deadline=deadline,
+            now=now_utc,
+        ):
+            return _retry_open(
+                trade,
+                signal,
+                f"insufficient candle coverage through deadline {deadline.isoformat()}",
+            )
         # Hold window elapsed — close at deadline using last available close.
         return _close_trade(
             trade, signal,

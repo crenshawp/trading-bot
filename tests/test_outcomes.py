@@ -255,7 +255,12 @@ def test_pre_fix_null_estimate_row_resolves_identically_on_default(
     sid = _make_signal(hold_estimate_days=None)          # pre-Phase-21 row shape
     tid = _make_trade(sid, opened_at=opened)
     # Flat candles that never touch TP (110) or SL (95).
-    df = fake_candles(highs=[105, 104, 106], lows=[98, 99, 97], closes=[100, 101, 102])
+    df = fake_candles(
+        highs=[105] * 30,
+        lows=[98] * 30,
+        closes=[102] * 30,
+        start=opened,
+    )
     _patch_yf(monkeypatch, df)
 
     trade  = next(t for t in db.get_open_trades() if t.id == tid)
@@ -368,9 +373,13 @@ def test_crypto_signal_still_resolves_on_unchanged_default(
     assert trade is not None
     opened = trade.opened_at
     # Flat candles between SL (49500) and TP (51000) — no touch.
+    candle_count = 14 * 24
     df = fake_candles(
-        highs=[50_500] * 3, lows=[49_800] * 3, closes=[50_000] * 3,
-        start=opened, interval="1h",
+        highs=[50_500] * candle_count,
+        lows=[49_800] * candle_count,
+        closes=[50_000] * candle_count,
+        start=opened,
+        interval="1h",
     )
     _patch_yf(monkeypatch, df)
 
@@ -464,19 +473,191 @@ def test_resolve_all_open_trades_caches_yfinance_calls(
 def test_resolve_all_open_trades_handles_yfinance_exception(
     tmp_db: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A yfinance exception is logged but doesn't crash the resolver loop."""
+    """A deadline outage is logged and remains open for the next sweep."""
     sid = _make_signal(direction="call", hold_estimate_days=1)
-    _make_trade(sid)
+    tid = _make_trade(sid)
 
     def boom(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("yfinance simulated failure")
 
     monkeypatch.setattr("trading_bot.outcomes.yf.download", boom)
-    result = outcomes.resolve_all_open_trades(now=datetime(2026, 5, 1, tzinfo=UTC))
-    # Trade marked expired (no data, past deadline) — exact bucket depends on
-    # _fetch_candles' fallback path; just verify we didn't crash.
-    assert sum(result.values()) == 1
+    result = outcomes.resolve_all_open_trades(now=datetime(2026, 4, 2, tzinfo=UTC))
+    assert result == {"wins": 0, "losses": 0, "expired": 0, "still_open": 1}
+
+    stored = next(trade for trade in db.get_open_trades() if trade.id == tid)
+    assert stored.outcome == "open"
+    assert stored.closed_at is None
+    assert stored.exit_price is None
+
+    error = capsys.readouterr().err
+    assert "settlement retry" in error
+    assert "provider exception (RuntimeError): yfinance simulated failure" in error
+    assert "leaving open" in error
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_reason"),
+    [
+        (pd.DataFrame(), "empty candle response"),
+        (
+            pd.DataFrame(
+                {"High": [105.0], "Low": [98.0]},
+                index=pd.DatetimeIndex([datetime(2026, 4, 1, tzinfo=UTC)]),
+            ),
+            "malformed candle response (missing columns: Close)",
+        ),
+    ],
+)
+def test_unusable_candle_response_remains_retryable(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    response: pd.DataFrame,
+    expected_reason: str,
+) -> None:
+    sid = _make_signal(hold_estimate_days=1)
+    tid = _make_trade(sid)
+    _patch_yf(monkeypatch, response)
+
+    trade = next(candidate for candidate in db.get_open_trades() if candidate.id == tid)
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+
+    resolved = outcomes.resolve_trade(
+        trade,
+        signal,
+        now=datetime(2026, 4, 3, tzinfo=UTC),
+    )
+
+    assert resolved.outcome == "open"
+    assert resolved.closed_at is None
+    assert resolved.exit_price is None
+    assert expected_reason in capsys.readouterr().err
+
+
+def test_stale_candle_coverage_remains_retryable(
+    tmp_db: Path,
+    fake_candles: Callable[..., pd.DataFrame],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    opened = datetime(2026, 4, 1, tzinfo=UTC)
+    sid = _make_signal(hold_estimate_days=3)
+    tid = _make_trade(sid, opened_at=opened)
+    stale = fake_candles(
+        highs=[105.0, 104.0],
+        lows=[98.0, 99.0],
+        closes=[101.0, 102.0],
+        start=opened,
+    )
+    _patch_yf(monkeypatch, stale)
+
+    trade = next(candidate for candidate in db.get_open_trades() if candidate.id == tid)
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+
+    resolved = outcomes.resolve_trade(
+        trade,
+        signal,
+        now=opened + timedelta(days=10),
+    )
+
+    assert resolved.outcome == "open"
+    assert resolved.closed_at is None
+    assert resolved.exit_price is None
+    error = capsys.readouterr().err
+    assert "insufficient candle coverage through deadline" in error
+    assert (opened + timedelta(days=3)).isoformat() in error
+
+
+def test_deadline_covering_candle_must_be_closed_before_expiry(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    opened = datetime(2026, 4, 1, tzinfo=UTC)
+    deadline = opened + timedelta(days=1)
+    sid = _make_signal(asset_class="crypto", hold_estimate_days=1)
+    tid = _make_trade(sid, opened_at=opened)
+    replay = pd.DataFrame(
+        {
+            "High": [105.0, 104.0],
+            "Low": [98.0, 99.0],
+            "Close": [101.0, 102.0],
+        },
+        index=pd.DatetimeIndex([opened, deadline - timedelta(minutes=30)]),
+    )
+    _patch_yf(monkeypatch, replay)
+
+    trade = next(candidate for candidate in db.get_open_trades() if candidate.id == tid)
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+
+    forming = outcomes.resolve_trade(trade, signal, now=deadline)
+    assert forming.outcome == "open"
+    assert "insufficient candle coverage" in capsys.readouterr().err
+
+    closed = outcomes.resolve_trade(
+        trade,
+        signal,
+        now=deadline + timedelta(minutes=30),
+    )
+    assert closed.outcome == "expired"
+    assert closed.closed_at == deadline
+    assert closed.exit_price == 102.0
+
+
+@pytest.mark.parametrize(
+    ("high", "low", "expected_outcome", "summary_key"),
+    [
+        (112.0, 100.0, "win", "wins"),
+        (105.0, 94.0, "loss", "losses"),
+    ],
+)
+def test_provider_outage_retries_then_finalizes_once(
+    tmp_db: Path,
+    fake_candles: Callable[..., pd.DataFrame],
+    monkeypatch: pytest.MonkeyPatch,
+    high: float,
+    low: float,
+    expected_outcome: str,
+    summary_key: str,
+) -> None:
+    opened = datetime(2026, 4, 1, tzinfo=UTC)
+    sid = _make_signal(hold_estimate_days=1)
+    _make_trade(sid, opened_at=opened)
+    replay = fake_candles(highs=[high], lows=[low], start=opened)
+    calls = 0
+
+    def flaky_download(*_args: object, **_kwargs: object) -> pd.DataFrame:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("temporary provider outage")
+        return replay
+
+    monkeypatch.setattr("trading_bot.outcomes.yf.download", flaky_download)
+
+    first = outcomes.resolve_all_open_trades(now=opened + timedelta(days=1))
+    assert first == {"wins": 0, "losses": 0, "expired": 0, "still_open": 1}
+    assert db.get_trade_by_signal_id(sid).outcome == "open"
+
+    second = outcomes.resolve_all_open_trades(now=opened + timedelta(days=2))
+    expected_summary = {"wins": 0, "losses": 0, "expired": 0, "still_open": 0}
+    expected_summary[summary_key] = 1
+    assert second == expected_summary
+
+    finalized = db.get_trade_by_signal_id(sid)
+    assert finalized is not None
+    assert finalized.outcome == expected_outcome
+    assert finalized.closed_at == opened
+
+    third = outcomes.resolve_all_open_trades(now=opened + timedelta(days=3))
+    assert third == {"wins": 0, "losses": 0, "expired": 0, "still_open": 0}
+    assert db.get_trade_by_signal_id(sid) == finalized
+    assert calls == 2
 
 
 # ────────────────────── backfill ──────────────────────
