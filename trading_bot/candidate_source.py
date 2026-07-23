@@ -83,6 +83,7 @@ def _to_candidate(
         vol_regime=row["trade_ind_vol_regime"] or "unknown",
         sentiment_score=row["trade_sentiment_score"],
         concentration=row["trade_ind_concentration"] or "unknown",
+        signal_id=int(row["id"]),
     )
     # Phase 20: SWING-pool candidates carry the signal's EXISTING resolver
     # settlement deadline (fire timestamp + the Phase 1 hold window) so a

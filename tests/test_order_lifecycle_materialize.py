@@ -196,7 +196,7 @@ def test_option_first_fill_creates_and_links_position(tmp_db: Path) -> None:
         broker_symbol=_OCC_SYMBOL,
         filled_qty=2.0,
         filled_avg_price=3.25,
-        signal_id=None,
+        signal_id=29,
     )
 
     result = order_lifecycle.materialize_pending_order_fill(
@@ -222,6 +222,7 @@ def test_option_first_fill_creates_and_links_position(tmp_db: Path) -> None:
     assert pos.sl == 170.0
     assert pos.deadline == datetime.fromisoformat(_DEADLINE)
     assert pos.order_id == "opt-1"
+    assert pos.signal_id == 29
     assert pos.opened_at == _OPENED_AT
     assert pos.vehicle == "option_full"
     assert pos.outcome == "open"
@@ -547,6 +548,7 @@ def test_restart_style_replay_never_duplicates_position(tmp_db: Path) -> None:
         broker_symbol=_OCC_SYMBOL,
         filled_qty=2.0,
         filled_avg_price=3.0,
+        signal_id=31,
     )
     first = order_lifecycle.materialize_pending_order_fill(pending)
     assert first.action == order_lifecycle.MATERIALIZE_CREATED
@@ -559,6 +561,9 @@ def test_restart_style_replay_never_duplicates_position(tmp_db: Path) -> None:
         assert replay.action == order_lifecycle.MATERIALIZE_UNCHANGED
         assert replay.position_id == first.position_id
     assert len(db.get_option_positions()) == 1
+    position = db.get_option_position(first.position_id)
+    assert position is not None
+    assert position.signal_id == 31
 
 
 def test_missing_ledger_row_is_skipped(tmp_db: Path) -> None:

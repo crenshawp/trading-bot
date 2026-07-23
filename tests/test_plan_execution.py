@@ -146,12 +146,13 @@ def _swing_order(
     *, ticker: str = "META", qty: float = 10.0, entry: float = 480.0,
     est_cost: float = 600.0, dollar_risk: float = 150.0, side: str = "buy",
     rank: int = 1, hold_deadline: datetime | None = None,
+    signal_id: int | None = None,
 ) -> PlannedOrder:
     return PlannedOrder(
         rank=rank, pool=config.POOL_SWING, tier="HIGH", ticker=ticker,
         signal_type="ema21_pullback", side=side, qty=qty, entry=entry,
         est_cost=est_cost, dollar_risk=dollar_risk, score=0.8,
-        hold_deadline=hold_deadline,
+        hold_deadline=hold_deadline, signal_id=signal_id,
     )
 
 
@@ -227,7 +228,7 @@ def test_execute_plan_refuses_when_unauthorized_zero_broker_calls(
 def test_swing_order_routes_through_options_hierarchy(tmp_db: Path) -> None:
     broker = SpyBroker()
     run = pe.execute_plan(
-        broker, ExecutionPlan(orders=[_swing_order()]), now=_NOW,
+        broker, ExecutionPlan(orders=[_swing_order(signal_id=37)]), now=_NOW,
         option_chain_fetch=_chain_fetch,
     )
 
@@ -245,12 +246,17 @@ def test_swing_order_routes_through_options_hierarchy(tmp_db: Path) -> None:
     assert pos.underlying == "META"
     assert pos.tp == 500.0
     assert pos.sl == 465.0
+    assert pos.signal_id == 37
+
+    pending = db.get_pending_order(execution.order_ref)
+    assert pending is not None
+    assert pending.signal_id == 37
 
 
 def test_swing_order_falls_back_to_shares_without_options(tmp_db: Path) -> None:
     broker = SpyBroker()
     run = pe.execute_plan(
-        broker, ExecutionPlan(orders=[_swing_order()]), now=_NOW,
+        broker, ExecutionPlan(orders=[_swing_order(signal_id=41)]), now=_NOW,
         option_chain_fetch=None, options_available=False,
     )
     (execution,) = run.executions
@@ -258,6 +264,9 @@ def test_swing_order_falls_back_to_shares_without_options(tmp_db: Path) -> None:
     assert execution.vehicle == "shares"
     assert broker.submissions == ["META"]            # fractional shares fallback
     assert db.get_open_option_positions() == []      # no contract to record
+    pending = db.get_pending_order(execution.order_ref)
+    assert pending is not None
+    assert pending.signal_id is None                  # long-term contract unchanged
 
 
 def test_swing_chain_fetch_error_falls_back_to_shares(tmp_db: Path) -> None:

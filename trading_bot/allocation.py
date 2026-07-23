@@ -74,6 +74,10 @@ class Candidate:
     # SWING-pool candidates only; LONG_TERM/CRYPTO have no time stop by design
     # and stay None. Carried, never computed here.
     hold_deadline: datetime | None = None
+    # Originating persisted signal, when this candidate came from the live
+    # fired-signal source. Samples/manual candidates have no durable origin and
+    # keep the compatibility default rather than inventing an ID.
+    signal_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -122,6 +126,9 @@ class PlannedOrder:
     # Phase 20: the candidate's hold_deadline, passed through UNCHANGED so the
     # shares-fallback record inherits the original swing time stop.
     hold_deadline: datetime | None = None
+    # Pure pass-through from Candidate. None means the source had no persisted
+    # signal row (for example sample/manual candidates).
+    signal_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -464,6 +471,7 @@ def allocate(
                 side="buy" if _is_long(c.direction) else "sell",
                 qty=qty, entry=c.entry, est_cost=pv, dollar_risk=dollar_risk,
                 score=rc.score, hold_deadline=c.hold_deadline,
+                signal_id=c.signal_id,
             ))
             deployed += pv
             cash_remaining -= pv

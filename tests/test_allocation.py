@@ -103,6 +103,29 @@ def test_execution_plan_empty_defaults() -> None:
     assert plan.total_est_cost == 0.0
 
 
+def test_signal_id_survives_ranking_and_planning() -> None:
+    candidate = _candidate(signal_id=123)
+    ranked = allocation.rank_candidates([(candidate, config.POOL_SWING)])
+    assert ranked[0].candidate.signal_id == 123
+
+    orders, skipped, _pools = allocation.allocate(
+        ranked, {config.POOL_SWING: (10_000.0, 10_000.0)},
+    )
+    assert skipped == []
+    assert orders[0].signal_id == 123
+
+
+def test_manual_candidate_signal_id_defaults_to_none() -> None:
+    candidate = _candidate()
+    assert candidate.signal_id is None
+
+    ranked = allocation.rank_candidates([(candidate, config.POOL_SWING)])
+    orders, _skipped, _pools = allocation.allocate(
+        ranked, {config.POOL_SWING: (10_000.0, 10_000.0)},
+    )
+    assert orders[0].signal_id is None
+
+
 # ───────────────────────── indicator agreement ──────────────────────────────
 
 

@@ -230,6 +230,10 @@ def test_execute_decision_records_option_position(tmp_db: Path) -> None:
     assert p.premium_entry == 5.1            # broker-reported limit fill
     assert p.multiplier == 100               # the multiplier is persisted
     assert p.tp == 110.0 and p.sl == 95.0 and p.outcome == "open"
+    assert p.signal_id == 7
+    pending = db.get_pending_order(order.order_id)
+    assert pending is not None
+    assert pending.signal_id == 7
 
 
 def test_execute_decision_shares_records_swing_fallback_not_option(

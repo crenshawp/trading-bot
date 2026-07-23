@@ -238,7 +238,11 @@ def _execute_swing(
                 file=sys.stderr,
             )
     result, _position_id = oe.execute_decision(
-        broker, decision, opened_at=now, tp=tp, sl=sl, deadline=deadline,
+        broker, decision, opened_at=now,
+        # Only option positions currently own signal lineage. Shares fallback
+        # keeps its existing long-term persistence contract unchanged.
+        signal_id=order.signal_id if decision.contract is not None else None,
+        tp=tp, sl=sl, deadline=deadline,
     )
     return OrderExecution(
         order, _status_from_order_result(result),

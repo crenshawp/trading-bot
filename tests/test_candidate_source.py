@@ -75,6 +75,7 @@ def test_fresh_signal_is_returned(tmp_db: Path) -> None:
     (candidate,) = _live()
     assert candidate.ticker == "META"
     assert candidate.signal_type == "ema21_pullback"
+    assert candidate.signal_id == sid
 
 
 def test_stale_signal_outside_window_is_excluded(tmp_db: Path) -> None:
@@ -298,6 +299,7 @@ def test_dedupe_keeps_newest_signal_per_pair(tmp_db: Path) -> None:
 
     (c,) = _live(mark_considered=True)
     assert c.entry == 480.0                   # the re-fired setup supersedes
+    assert c.signal_id == newer               # exact newest persisted origin
 
     # BOTH rows were pulled, so BOTH are consumed — the superseded older
     # duplicate is never re-offered on its own next cycle.
@@ -357,6 +359,7 @@ def test_hold_deadline_survives_allocation_into_planned_order(
     result = allocation.build_plan(_live(), _ACCOUNT)
     (order,) = result.plan.orders
     assert order.hold_deadline == _NOW + timedelta(days=2)   # pass-through
+    assert order.signal_id == sid
 
 
 def test_fired_signal_carries_tightened_window_downstream(
@@ -527,8 +530,10 @@ def test_live_swing_signal_reaches_the_plan(tmp_db: Path) -> None:
 def test_sample_candidates_still_works_standalone(tmp_db: Path) -> None:
     cands = allocation.sample_candidates()
     assert len(cands) >= 4                     # demos/tests unaffected
+    assert all(c.signal_id is None for c in cands)
     result = allocation.build_plan(cands, _ACCOUNT)
     assert result.plan.orders                  # the fixture still plans
+    assert all(order.signal_id is None for order in result.plan.orders)
 
 
 # ───────────────────────── crypto symbol translation ─────────────────────────
