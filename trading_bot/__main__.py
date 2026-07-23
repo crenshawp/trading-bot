@@ -1909,6 +1909,7 @@ def cmd_marketdata_compare(
 def cmd_risk_ror_status() -> None:
     """Current tier state, drawdown, streaks, and entry authorization."""
     drawdown = risk_of_ruin.current_drawdown_pct()
+    losses = risk_of_ruin.consecutive_losses()
     print("RISK-OF-RUIN STATUS  (Phase 15 safety layer)")
     print("-" * 64)
     print(f"  State:                 {risk_of_ruin.get_state()}")
@@ -1920,7 +1921,8 @@ def cmd_risk_ror_status() -> None:
     if reason:
         print(f"  Revoke reason:         {reason}")
     print(
-        f"  Consecutive losses:    {risk_of_ruin.consecutive_losses()} "
+        f"  Consecutive losses:    "
+        f"{'unknown' if losses is None else losses} "
         f"/ {config.MAX_CONSECUTIVE_LOSSES} limit"
     )
     dd_txt = "-" if drawdown is None else f"{drawdown:.1f}%"

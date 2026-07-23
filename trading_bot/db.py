@@ -40,6 +40,7 @@ from trading_bot.models import (
     VALID_TRACK_MODES,
     VALID_VIX_BANDS,
     VALID_WATCHLIST_STATUSES,
+    BrokerExecutionOutcomeCandidate,
     DailyPerf,
     LongTermPosition,
     OptionPosition,
@@ -4712,6 +4713,149 @@ def get_pending_entry_orders_for_position(
     finally:
         conn.close()
     return [_row_to_pending_order(row) for row in rows]
+
+
+def _candidate_datetime(value: object) -> tuple[datetime | None, bool]:
+    """Decode one optional ordering/summary time without inventing a fallback."""
+    if value is None:
+        return None, True
+    if not isinstance(value, str) or not value.strip():
+        return None, False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None, False
+    if parsed.tzinfo is None:
+        return None, False
+    return parsed, True
+
+
+def _row_to_broker_execution_outcome_candidate(
+    row: sqlite3.Row,
+) -> BrokerExecutionOutcomeCandidate:
+    summary_exit_at, summary_time_ok = _candidate_datetime(row["summary_exit_at"])
+    evidence_fill_at, evidence_time_ok = _candidate_datetime(
+        row["evidence_final_fill_at"]
+    )
+    return BrokerExecutionOutcomeCandidate(
+        position_kind=str(row["position_kind"]),
+        position_id=int(row["position_id"]),
+        position_exists=bool(row["position_exists"]),
+        position_closed=bool(row["position_closed"]),
+        position_source=row["position_source"],
+        position_direction=row["position_direction"],
+        summary_exit_at=summary_exit_at,
+        summary_exit_price=row["summary_exit_price"],
+        summary_exit_reason=row["summary_exit_reason"],
+        summary_outcome=row["summary_outcome"],
+        summary_pnl_dollars=row["summary_pnl_dollars"],
+        evidence_final_fill_at=evidence_fill_at,
+        evidence_final_exit_pending_order_id=row[
+            "evidence_final_exit_pending_order_id"
+        ],
+        evidence_decoded=summary_time_ok and evidence_time_ok,
+    )
+
+
+def get_broker_execution_outcome_candidates(
+) -> list[BrokerExecutionOutcomeCandidate]:
+    """Return every exact typed target named by an exit-role pending order.
+
+    This is deliberately an unbounded, read-only candidate query.  It neither
+    infers links from ticker/time/signal data nor calculates an outcome; the
+    order-lifecycle fill analyzer performs those jobs after this query returns.
+    """
+    sql = """
+        WITH exit_targets AS (
+            SELECT
+                closes_position_kind AS position_kind,
+                closes_position_id AS position_id
+            FROM pending_orders
+            WHERE order_role = 'exit'
+            GROUP BY closes_position_kind, closes_position_id
+        ),
+        ranked_fill_evidence AS (
+            SELECT
+                closes_position_kind AS position_kind,
+                closes_position_id AS position_id,
+                id AS pending_order_id,
+                last_fill_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY closes_position_kind, closes_position_id
+                    ORDER BY submitted_at DESC, id DESC
+                ) AS evidence_rank
+            FROM pending_orders
+            WHERE order_role = 'exit' AND filled_qty > 0
+        )
+        SELECT
+            targets.position_kind,
+            targets.position_id,
+            CASE
+                WHEN targets.position_kind = 'option' THEN options.id IS NOT NULL
+                WHEN targets.position_kind = 'long_term' THEN long_terms.id IS NOT NULL
+                ELSE 0
+            END AS position_exists,
+            CASE
+                WHEN targets.position_kind = 'option'
+                    THEN options.id IS NOT NULL
+                         AND options.outcome IS NOT NULL
+                         AND options.outcome != 'open'
+                WHEN targets.position_kind = 'long_term'
+                    THEN long_terms.id IS NOT NULL
+                         AND long_terms.status = 'closed'
+                ELSE 0
+            END AS position_closed,
+            CASE
+                WHEN targets.position_kind = 'option' AND options.id IS NOT NULL
+                    THEN 'option'
+                WHEN targets.position_kind = 'long_term'
+                    THEN long_terms.source
+            END AS position_source,
+            CASE
+                WHEN targets.position_kind = 'option' AND options.id IS NOT NULL
+                    THEN 'long'
+                WHEN targets.position_kind = 'long_term'
+                    THEN long_terms.direction
+            END AS position_direction,
+            CASE
+                WHEN targets.position_kind = 'option' THEN options.closed_at
+                WHEN targets.position_kind = 'long_term' THEN long_terms.exit_date
+            END AS summary_exit_at,
+            CASE
+                WHEN targets.position_kind = 'option' THEN options.exit_price
+                WHEN targets.position_kind = 'long_term' THEN long_terms.exit_price
+            END AS summary_exit_price,
+            CASE
+                WHEN targets.position_kind = 'option' THEN options.exit_reason
+                WHEN targets.position_kind = 'long_term' THEN long_terms.exit_reason
+            END AS summary_exit_reason,
+            CASE
+                WHEN targets.position_kind = 'option' THEN options.outcome
+            END AS summary_outcome,
+            CASE
+                WHEN targets.position_kind = 'option' THEN options.pnl_dollars
+            END AS summary_pnl_dollars,
+            evidence.last_fill_at AS evidence_final_fill_at,
+            evidence.pending_order_id AS evidence_final_exit_pending_order_id
+        FROM exit_targets AS targets
+        LEFT JOIN option_positions AS options
+            ON targets.position_kind = 'option'
+            AND options.id = targets.position_id
+        LEFT JOIN long_term_positions AS long_terms
+            ON targets.position_kind = 'long_term'
+            AND long_terms.id = targets.position_id
+        LEFT JOIN ranked_fill_evidence AS evidence
+            ON evidence.position_kind = targets.position_kind
+            AND evidence.position_id = targets.position_id
+            AND evidence.evidence_rank = 1
+        ORDER BY targets.position_kind ASC, targets.position_id ASC
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_broker_execution_outcome_candidate(row) for row in rows]
 
 
 def update_pending_order(pending_order_id: int, **fields: Any) -> None:

@@ -131,13 +131,16 @@ def test_revoke_and_authorize_round_trip(tmp_db: Path) -> None:
 # ───────────────────────── Tier 1: consecutive losses ───────────────────────
 
 
-def test_consecutive_losses_counts_trailing_run(tmp_db: Path) -> None:
+def test_consecutive_losses_ignores_trade_tracking_rows(tmp_db: Path) -> None:
     _seed_resolved(["loss", "win", "loss", "loss"])   # chronological
-    assert ror.consecutive_losses() == 2              # trailing run only
+    assert ror.consecutive_losses() == 0
 
 
-def test_tier1_does_not_trip_at_six_losses(tmp_db: Path) -> None:
+def test_tier1_does_not_trip_at_six_losses(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _seed_resolved(["win"] + ["loss"] * 6)
+    monkeypatch.setattr(ror, "consecutive_losses", lambda: 6)
     rec = _Recorder()
     result = ror.evaluate_tier1(notifier=rec)
     assert result.tripped is False
@@ -145,8 +148,11 @@ def test_tier1_does_not_trip_at_six_losses(tmp_db: Path) -> None:
     assert rec.calls == []
 
 
-def test_tier1_trips_at_exactly_seven_losses(tmp_db: Path) -> None:
+def test_tier1_trips_at_exactly_seven_losses(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _seed_resolved(["win"] + ["loss"] * 7)
+    monkeypatch.setattr(ror, "consecutive_losses", lambda: 7)
     rec = _Recorder()
     result = ror.evaluate_tier1(notifier=rec)
     assert result.tripped is True and result.trigger == "consecutive_losses"
@@ -196,23 +202,20 @@ def test_data_only_losing_streak_does_not_trip_tier1(tmp_db: Path) -> None:
     assert rec.calls == []
 
 
-def test_real_losing_streak_of_same_length_still_trips(tmp_db: Path) -> None:
-    """The same streak length in REAL (active, executable) trades trips the
-    breaker exactly as it always has — the scope fix removed noise, not the
-    protection."""
-    _seed_resolved(["win"] + ["loss"] * 7)          # identical to the pre-fix case
+def test_active_trade_tracking_loss_streak_does_not_trip(tmp_db: Path) -> None:
+    """Active trade tracking is not broker execution truth."""
+    _seed_resolved(["win"] + ["loss"] * 7)
     rec = _Recorder()
     result = ror.evaluate_tier1(notifier=rec)
-    assert result.tripped is True and result.trigger == "consecutive_losses"
-    assert result.losses == 7
-    assert ror.is_entry_authorized() is False
-    assert ror.get_state() == ror.STATE_PAUSED
+    assert result.tripped is False
+    assert result.losses == 0
+    assert ror.is_entry_authorized() is True
+    assert ror.get_state() == ror.STATE_NORMAL
+    assert rec.calls == []
 
 
-def test_mixed_streak_counts_only_real_losses(tmp_db: Path) -> None:
-    """Interleaved data-only and real losses: only the real ones count toward
-    the threshold. Six real losses + a pile of newer data-only losses stays
-    below the 7-loss trip."""
+def test_mixed_trade_tracking_streaks_are_all_excluded(tmp_db: Path) -> None:
+    """Neither stock nor data-only trade rows are execution outcomes."""
     _seed_resolved(
         ["loss"] * 6, ticker_prefix="REAL-", start_minute=0,      # real: 6
     )
@@ -221,16 +224,16 @@ def test_mixed_streak_counts_only_real_losses(tmp_db: Path) -> None:
         ticker_prefix="DATA-", start_minute=100,                  # newer, data-only
     )
 
-    assert ror.consecutive_losses() == 6            # the real run only
+    assert ror.consecutive_losses() == 0
     result = ror.evaluate_tier1(notifier=_Recorder())
     assert result.tripped is False                  # 6 < 7 — no trip
     assert ror.is_entry_authorized() is True
 
-    # One more REAL loss (newest of all) completes a real 7-run: trips.
+    # More trade-tracking rows still cannot create a broker loss event.
     _seed_resolved(["loss"], ticker_prefix="REAL7-", start_minute=200)
-    assert ror.consecutive_losses() == 7
+    assert ror.consecutive_losses() == 0
     result = ror.evaluate_tier1(notifier=_Recorder())
-    assert result.tripped is True and result.trigger == "consecutive_losses"
+    assert result.tripped is False
 
 
 def test_pre_existing_pause_is_not_auto_cleared_by_scope_fix(
@@ -288,7 +291,9 @@ def test_tier1_trips_at_exactly_20_pct_drawdown_from_unrealized(tmp_db: Path) ->
     assert len(rec.calls) == 1
 
 
-def test_tier1_leaves_existing_positions_untouched(tmp_db: Path) -> None:
+def test_tier1_leaves_existing_positions_untouched(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Open option + long-term positions exist; a Tier-1 trip must NOT close them
     # (no close calls occur — Tier 1 never touches a broker or a position row).
     db.insert_option_position(OptionPosition(
@@ -301,14 +306,18 @@ def test_tier1_leaves_existing_positions_untouched(tmp_db: Path) -> None:
         qty=5.0, status="open",
     ))
     _seed_resolved(["loss"] * 7)
+    monkeypatch.setattr(ror, "consecutive_losses", lambda: 7)
     result = ror.evaluate_tier1(notifier=_Recorder())
     assert result.tripped is True
     assert len(db.get_open_option_positions()) == 1     # untouched
     assert len(db.get_open_long_term_positions()) == 1  # untouched
 
 
-def test_tier1_does_not_retrip_when_already_paused(tmp_db: Path) -> None:
+def test_tier1_does_not_retrip_when_already_paused(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _seed_resolved(["loss"] * 7)
+    monkeypatch.setattr(ror, "consecutive_losses", lambda: 7)
     rec = _Recorder()
     first = ror.evaluate_tier1(notifier=rec)
     second = ror.evaluate_tier1(notifier=rec)
@@ -870,8 +879,11 @@ def test_reauthorize_requires_exact_token(tmp_db: Path) -> None:
     assert ror.is_entry_authorized() is False           # nothing changed
 
 
-def test_reauthorize_clears_tier1_pause(tmp_db: Path) -> None:
+def test_reauthorize_clears_tier1_pause(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _seed_resolved(["loss"] * 7)
+    monkeypatch.setattr(ror, "consecutive_losses", lambda: 7)
     ror.evaluate_tier1(notifier=_Recorder())
     assert ror.get_state() == ror.STATE_PAUSED
     ok, _ = ror.reauthorize(config.ROR_REAUTHORIZE_TOKEN)

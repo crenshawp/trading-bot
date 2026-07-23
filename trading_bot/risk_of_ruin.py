@@ -28,6 +28,7 @@ it does not flip that switch.
 
 from __future__ import annotations
 
+import math
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -35,9 +36,13 @@ from datetime import UTC, datetime
 
 import requests
 
-from trading_bot import config, db, secrets, settings
+from trading_bot import config, db, order_lifecycle, secrets, settings
 from trading_bot.broker.base import Broker
 from trading_bot.broker.reconcile import reconcile
+from trading_bot.models import (
+    BrokerExecutionOutcome,
+    BrokerExecutionOutcomeCandidate,
+)
 
 # A notifier sends (title, message) and returns True on a confirmed send —
 # dependency-injected so tests capture it; the default posts to Pushover.
@@ -168,20 +173,168 @@ def current_drawdown_pct() -> float | None:
 # ── Tier 1: consecutive losses + drawdown → pause new entries ────────────────
 
 
-def consecutive_losses() -> int:
-    """The trailing run of resolved REAL-EXECUTION losses, newest first.
+_KNOWN_EXECUTION_OUTCOMES = frozenset({"win", "loss", "breakeven", "expired"})
+_NEUTRAL_EXECUTION_OUTCOMES = frozenset({"breakeven", "expired"})
+_EXECUTION_KIND_RANK = {"option": 0, "long_term": 1}
 
-    Phase 23 scope audit: the source query excludes shadow-tracked trades AND
-    the data-only crypto swing signals — paper losses from a subsystem that
-    can never touch capital must not pause real swing/long-term entry."""
+
+def _same_execution_number(left: float | None, right: float | None) -> bool:
+    if left is None or right is None:
+        return left is right
+    return math.isclose(float(left), float(right), rel_tol=1e-9, abs_tol=1e-9)
+
+
+def _candidate_summary_matches(
+    candidate: BrokerExecutionOutcomeCandidate,
+    state: order_lifecycle.ExitFillMaterializationResult,
+) -> bool:
+    """Guard the read/analyze boundary against missing, stale, or changed truth."""
+    if (
+        not candidate.evidence_decoded
+        or not candidate.position_exists
+        or not candidate.position_closed
+        or candidate.position_kind not in _EXECUTION_KIND_RANK
+        or state.position_kind != candidate.position_kind
+        or state.position_id != candidate.position_id
+        or not state.integrity_ok
+        or state.action != order_lifecycle.EXIT_FILL_UNCHANGED
+        or state.remaining_qty != 0.0
+        or state.outcome not in _KNOWN_EXECUTION_OUTCOMES
+        or state.final_fill_at is None
+        or state.final_exit_pending_order_id is None
+        or candidate.evidence_final_fill_at != state.final_fill_at
+        or candidate.evidence_final_exit_pending_order_id
+        != state.final_exit_pending_order_id
+        or candidate.summary_exit_at != state.final_fill_at
+        or candidate.summary_exit_reason != state.exit_reason
+        or not _same_execution_number(
+            candidate.summary_exit_price,
+            state.exit_vwap,
+        )
+    ):
+        return False
+    if candidate.position_kind == "option":
+        return (
+            candidate.position_source == "option"
+            and candidate.position_direction == "long"
+            and candidate.summary_outcome == state.outcome
+            and _same_execution_number(
+                candidate.summary_pnl_dollars,
+                state.pnl_dollars,
+            )
+        )
+    return (
+        candidate.position_source in {"long_term", "swing_fallback"}
+        and candidate.position_direction in {"long", "short"}
+        and candidate.summary_outcome is None
+        and candidate.summary_pnl_dollars is None
+    )
+
+
+def _unknown_execution_outcome(
+    candidate: BrokerExecutionOutcomeCandidate,
+    state: order_lifecycle.ExitFillMaterializationResult,
+    reason: str,
+) -> BrokerExecutionOutcome:
+    """Preserve actual fill evidence solely to place an unknown event safely."""
+    return BrokerExecutionOutcome(
+        position_kind=candidate.position_kind,
+        position_id=candidate.position_id,
+        outcome="unknown",
+        final_fill_at=(
+            state.final_fill_at
+            if state.final_fill_at is not None
+            else candidate.evidence_final_fill_at
+        ),
+        final_exit_pending_order_id=(
+            state.final_exit_pending_order_id
+            if state.final_exit_pending_order_id is not None
+            else candidate.evidence_final_exit_pending_order_id
+        ),
+        reason=reason,
+    )
+
+
+def _map_execution_candidate(
+    candidate: BrokerExecutionOutcomeCandidate,
+) -> BrokerExecutionOutcome | None:
+    state = order_lifecycle.position_exit_fill_state(
+        candidate.position_kind,
+        candidate.position_id,
+    )
+    if state.action in {
+        order_lifecycle.EXIT_FILL_OPEN,
+        order_lifecycle.EXIT_FILL_PENDING,
+    } and state.integrity_ok:
+        return None
+    if not _candidate_summary_matches(candidate, state):
+        reason = state.reason or "typed close summary or execution evidence mismatch"
+        return _unknown_execution_outcome(candidate, state, reason)
+    assert state.outcome is not None
+    return BrokerExecutionOutcome(
+        position_kind=candidate.position_kind,
+        position_id=candidate.position_id,
+        outcome=state.outcome,
+        final_fill_at=state.final_fill_at,
+        final_exit_pending_order_id=state.final_exit_pending_order_id,
+    )
+
+
+def _ordered_broker_execution_outcomes() -> list[BrokerExecutionOutcome]:
+    """Map the unbounded exit-target set and order it by actual fill truth."""
+    mapped = [
+        outcome
+        for candidate in db.get_broker_execution_outcome_candidates()
+        if (outcome := _map_execution_candidate(candidate)) is not None
+    ]
+    for outcome in mapped:
+        if (
+            outcome.final_fill_at is None
+            or outcome.final_fill_at.tzinfo is None
+            or outcome.final_exit_pending_order_id is None
+            or outcome.final_exit_pending_order_id <= 0
+            or outcome.position_kind not in _EXECUTION_KIND_RANK
+            or outcome.position_id <= 0
+        ):
+            raise ValueError(
+                "broker execution event lacks deterministic actual-fill ordering"
+            )
+    return sorted(
+        mapped,
+        key=lambda event: (
+            event.final_fill_at,
+            event.final_exit_pending_order_id,
+            -_EXECUTION_KIND_RANK[event.position_kind],
+            event.position_id,
+        ),
+        reverse=True,
+    )
+
+
+def consecutive_losses() -> int | None:
+    """Return the provable leading real-execution loss run, or ``None``.
+
+    A known threshold is monotonic: once the configured number of newer losses
+    is reached, older unknown history cannot undo the Tier-1 trigger.  Before
+    that point an unknown event makes the streak indeterminate.
+    """
+    try:
+        outcomes = _ordered_broker_execution_outcomes()
+    except Exception as exc:  # noqa: BLE001 - safety truth must fail unknown
+        print(f"  risk: broker execution outcomes unknown ({exc})", file=sys.stderr)
+        return None
     streak = 0
-    for outcome in db.get_recent_resolved_outcomes(limit=max(
-        config.MAX_CONSECUTIVE_LOSSES * 2, 20,
-    )):
-        if outcome == "loss":
+    for event in outcomes:
+        if event.outcome == "loss":
             streak += 1
+            if streak >= config.MAX_CONSECUTIVE_LOSSES:
+                return config.MAX_CONSECUTIVE_LOSSES
+        elif event.outcome == "win":
+            return streak
+        elif event.outcome in _NEUTRAL_EXECUTION_OUTCOMES:
+            continue
         else:
-            break
+            return None
     return streak
 
 
@@ -191,7 +344,7 @@ class Tier1Result:
 
     tripped: bool
     trigger: str | None          # 'consecutive_losses' | 'drawdown' | None
-    losses: int
+    losses: int | None
     drawdown_pct: float | None
     state: str
 
@@ -216,7 +369,7 @@ def evaluate_tier1(
         return Tier1Result(False, None, losses, drawdown, state)
 
     trigger: str | None = None
-    if losses >= config.MAX_CONSECUTIVE_LOSSES:
+    if losses is not None and losses >= config.MAX_CONSECUTIVE_LOSSES:
         trigger = "consecutive_losses"
     elif drawdown is not None and drawdown >= config.MAX_DRAWDOWN_PCT:
         trigger = "drawdown"

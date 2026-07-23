@@ -357,6 +357,44 @@ class PendingOrder:
 
 
 @dataclass(frozen=True)
+class BrokerExecutionOutcomeCandidate:
+    """Read-only typed close target anchored by an exit pending order.
+
+    The candidate intentionally carries only durable execution evidence and the
+    common close summary from the exact typed position.  It is not itself an
+    outcome: :func:`order_lifecycle.position_exit_fill_state` remains the sole
+    authority that validates entry/exit fills and calculates gross P/L.
+    """
+
+    position_kind: str
+    position_id: int
+    position_exists: bool
+    position_closed: bool
+    position_source: str | None
+    position_direction: str | None
+    summary_exit_at: datetime | None
+    summary_exit_price: float | None
+    summary_exit_reason: str | None
+    summary_outcome: str | None
+    summary_pnl_dollars: float | None
+    evidence_final_fill_at: datetime | None
+    evidence_final_exit_pending_order_id: int | None
+    evidence_decoded: bool = True
+
+
+@dataclass(frozen=True)
+class BrokerExecutionOutcome:
+    """One ordered Tier-1 execution event, known or indeterminate."""
+
+    position_kind: str
+    position_id: int
+    outcome: str  # win | loss | breakeven | expired | unknown
+    final_fill_at: datetime | None
+    final_exit_pending_order_id: int | None
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class OptionPosition:
     """An open/closed single-leg option position (Phase 13).
 
