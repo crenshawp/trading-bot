@@ -266,8 +266,13 @@ class PlanExecution:
 # distinct here even though the current Alpaca adapter maps it to ``canceled``;
 # the raw broker status is retained alongside it for the lifecycle materializer.
 PENDING_ORDER_INTENT_VERSION = 1
+PENDING_ORDER_POSITION_EXIT_INTENT_VERSION = 1
 VALID_PENDING_ORDER_INTENT_KINDS: frozenset[str] = frozenset(
-    {"option", "long_term", "shares_fallback"}
+    {"option", "long_term", "shares_fallback", "position_exit"}
+)
+VALID_PENDING_ORDER_ROLES: frozenset[str] = frozenset({"entry", "exit"})
+VALID_PENDING_ORDER_FILL_TIME_SOURCES: frozenset[str] = frozenset(
+    {"broker", "observed"}
 )
 VALID_PENDING_ORDER_STATUSES: frozenset[str] = frozenset(
     {
@@ -306,13 +311,17 @@ class PendingOrder:
 
     Common submission intent is normalized for restart-safe lookup.  Target-
     specific materialization data lives in immutable ``intent_payload_json``;
-    ``intent_payload_version`` selects its decoder.  Version 1 payloads use an
-    ``intent_kind`` of ``option``, ``long_term``, or ``shares_fallback``.
+    ``intent_payload_version`` selects its decoder.  Version 1 entry payloads
+    use an ``intent_kind`` of ``option``, ``long_term``, or
+    ``shares_fallback``.  Version 1 exit payloads use ``position_exit`` and
+    preserve the operator-facing ``exit_reason``.
 
     Lifecycle fields always represent the latest *usable* cumulative broker
     snapshot.  Broker read errors are not records and must leave these values
-    unchanged.  ``position_kind`` plus ``position_id`` is the typed, one-time
-    link to the eventual option_positions or long_term_positions row.
+    unchanged.  Entry rows use ``position_kind`` plus ``position_id`` as the
+    typed, one-time materialization link.  Exit rows instead use immutable
+    ``closes_position_kind`` plus ``closes_position_id`` and never use the
+    entry-materialization link.
     """
 
     broker_order_id: str | None
@@ -329,10 +338,16 @@ class PendingOrder:
     client_order_id: str | None = None
     signal_id: int | None = None
     intent_payload_version: int = PENDING_ORDER_INTENT_VERSION
+    order_role: str = "entry"
+    closes_position_kind: str | None = None
+    closes_position_id: int | None = None
     lifecycle_status: str = "new"
     broker_status: str | None = None
     filled_qty: float = 0.0
     filled_avg_price: float | None = None
+    last_fill_at: datetime | None = None
+    last_fill_time_source: str | None = None
+    fees_dollars: float | None = None
     last_refreshed_at: datetime | None = None
     terminal_reason: str | None = None
     terminal_at: datetime | None = None
@@ -373,6 +388,7 @@ class OptionPosition:
     deadline: datetime | None = None
     closed_at: datetime | None = None
     exit_price: float | None = None
+    exit_reason: str | None = None
     outcome: str | None = None       # 'win' | 'loss' | 'expired' | 'open'
     pnl_dollars: float | None = None
     vehicle: str = "option_full"     # option_full | option_undersized

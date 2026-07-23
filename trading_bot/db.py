@@ -18,14 +18,17 @@ from trading_bot import config
 from trading_bot.models import (
     LEGACY_PENDING_ORDER_CLIENT_ID_PREFIX,
     PENDING_ORDER_INTENT_VERSION,
+    PENDING_ORDER_POSITION_EXIT_INTENT_VERSION,
     TERMINAL_PENDING_ORDER_STATUSES,
     VALID_ASSET_CLASSES,
     VALID_DIRECTIONS,
     VALID_MARKET_REGIMES,
     VALID_OUTCOMES,
     VALID_PAIR_STATUSES,
+    VALID_PENDING_ORDER_FILL_TIME_SOURCES,
     VALID_PENDING_ORDER_INTENT_KINDS,
     VALID_PENDING_ORDER_POSITION_KINDS,
+    VALID_PENDING_ORDER_ROLES,
     VALID_PENDING_ORDER_SIDES,
     VALID_PENDING_ORDER_STATUSES,
     VALID_PENDING_ORDER_VEHICLES,
@@ -59,6 +62,7 @@ from trading_bot.models import (
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
+# Version 29 (cross-cutting audit) — adds exit-role order lifecycle truth.
 # Version 28 (cross-cutting audit) — persists risk assessment status + reason.
 # Version 27 (cross-cutting audit) — persists indicator computation status.
 # Version 26 (cross-cutting audit) — persists sentiment success + rationale.
@@ -78,7 +82,7 @@ from trading_bot.models import (
 # Version 13 (Phase 6) — adds trades.ind_* advisory indicator-family columns.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -115,6 +119,7 @@ CREATE TABLE IF NOT EXISTS trades (
     opened_at TEXT NOT NULL,
     closed_at TEXT,
     exit_price REAL,
+    exit_reason TEXT,
     outcome TEXT CHECK (outcome IN ('win','loss','breakeven','open','expired')),
     pnl_pct REAL,
     pnl_dollars REAL,
@@ -411,6 +416,8 @@ CREATE TABLE IF NOT EXISTS pending_orders (
     broker_order_id TEXT UNIQUE CHECK (
         broker_order_id IS NULL OR TRIM(broker_order_id) <> ''
     ),
+    order_role TEXT NOT NULL DEFAULT 'entry'
+        CHECK (order_role IN ('entry','exit')),
     ticker TEXT NOT NULL,
     broker_symbol TEXT NOT NULL,
     asset_class TEXT NOT NULL CHECK (asset_class IN ('stock','crypto')),
@@ -418,6 +425,10 @@ CREATE TABLE IF NOT EXISTS pending_orders (
         CHECK (vehicle IN ('option_full','option_undersized','shares')),
     target_position_kind TEXT NOT NULL
         CHECK (target_position_kind IN ('option','long_term')),
+    closes_position_kind TEXT CHECK (
+        closes_position_kind IN ('option','long_term')
+    ),
+    closes_position_id INTEGER,
     side TEXT NOT NULL CHECK (side IN ('buy','sell')),
     requested_qty REAL NOT NULL CHECK (requested_qty > 0),
     requested_limit_price REAL CHECK (
@@ -437,20 +448,46 @@ CREATE TABLE IF NOT EXISTS pending_orders (
     broker_status TEXT,
     filled_qty REAL NOT NULL DEFAULT 0 CHECK (filled_qty >= 0),
     filled_avg_price REAL,
+    last_fill_at TEXT,
+    last_fill_time_source TEXT CHECK (
+        last_fill_time_source IN ('broker','observed')
+    ),
+    fees_dollars REAL CHECK (fees_dollars IS NULL OR fees_dollars >= 0),
     last_refreshed_at TEXT,
     terminal_reason TEXT,
     terminal_at TEXT,
     position_kind TEXT CHECK (position_kind IN ('option','long_term')),
     position_id INTEGER,
     CHECK (
+        (order_role = 'entry'
+         AND closes_position_kind IS NULL AND closes_position_id IS NULL)
+        OR (
+            order_role = 'exit'
+            AND closes_position_kind = target_position_kind
+            AND closes_position_id > 0
+        )
+    ),
+    CHECK (
         (target_position_kind = 'option'
          AND vehicle IN ('option_full','option_undersized')
-         AND side = 'buy')
+         AND (
+             (order_role = 'entry' AND side = 'buy')
+             OR (order_role = 'exit' AND side = 'sell')
+         ))
         OR (target_position_kind = 'long_term' AND vehicle = 'shares')
     ),
     CHECK (
-        (filled_qty = 0 AND filled_avg_price IS NULL)
-        OR (filled_qty > 0 AND filled_avg_price > 0)
+        (filled_qty = 0 AND filled_avg_price IS NULL
+         AND last_fill_at IS NULL AND last_fill_time_source IS NULL
+         AND fees_dollars IS NULL)
+        OR (filled_qty > 0 AND filled_avg_price > 0
+            AND (
+                (last_fill_at IS NULL AND last_fill_time_source IS NULL)
+                OR (
+                    TRIM(COALESCE(last_fill_at, '')) <> ''
+                    AND last_fill_time_source IN ('broker','observed')
+                )
+            ))
     ),
     CHECK (
         (lifecycle_status IN ('filled','canceled','rejected','expired','abandoned')
@@ -486,6 +523,10 @@ CREATE TABLE IF NOT EXISTS pending_orders (
         (position_kind IS NULL AND position_id IS NULL)
         OR (position_kind IS NOT NULL AND position_id > 0)
     ),
+    CHECK (
+        order_role = 'entry'
+        OR (position_kind IS NULL AND position_id IS NULL)
+    ),
     CHECK (position_kind IS NULL OR position_kind = target_position_kind),
     CHECK (
         position_id IS NULL OR (filled_qty > 0 AND filled_avg_price > 0)
@@ -499,9 +540,10 @@ CREATE INDEX IF NOT EXISTS idx_pending_orders_nonterminal
 -- whitelisted Python update helper.
 CREATE TRIGGER IF NOT EXISTS trg_pending_orders_immutable_intent
 BEFORE UPDATE OF
-    client_order_id, ticker, broker_symbol, asset_class, vehicle,
-    target_position_kind, side, requested_qty, requested_limit_price,
-    submitted_at, signal_id, intent_payload_version, intent_payload_json
+    client_order_id, order_role, ticker, broker_symbol, asset_class, vehicle,
+    target_position_kind, closes_position_kind, closes_position_id, side,
+    requested_qty, requested_limit_price, submitted_at, signal_id,
+    intent_payload_version, intent_payload_json
 ON pending_orders
 BEGIN
     SELECT RAISE(ABORT, 'pending order materialization intent is immutable');
@@ -564,7 +606,10 @@ _TABLE_NAMES: tuple[str, ...] = (
 )
 
 _OPTION_POSITION_UPDATABLE_FIELDS: frozenset[str] = frozenset(
-    {"order_id", "closed_at", "exit_price", "outcome", "pnl_dollars"}
+    {
+        "order_id", "closed_at", "exit_price", "exit_reason", "outcome",
+        "pnl_dollars",
+    }
 )
 
 _LONG_TERM_UPDATABLE_FIELDS: frozenset[str] = frozenset(
@@ -574,8 +619,9 @@ _LONG_TERM_UPDATABLE_FIELDS: frozenset[str] = frozenset(
 _PENDING_ORDER_UPDATABLE_FIELDS: frozenset[str] = frozenset(
     {
         "broker_order_id", "lifecycle_status", "broker_status", "filled_qty",
-        "filled_avg_price", "last_refreshed_at", "terminal_reason",
-        "terminal_at", "position_kind", "position_id",
+        "filled_avg_price", "last_fill_at", "last_fill_time_source",
+        "fees_dollars", "last_refreshed_at", "terminal_reason", "terminal_at",
+        "position_kind", "position_id",
     }
 )
 
@@ -1175,6 +1221,335 @@ def _migrate_to_v28(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE trades ADD COLUMN risk_reason TEXT")
 
 
+def _create_v29_pending_order_objects(conn: sqlite3.Connection) -> None:
+    """Create the v29 index/triggers after fresh creation or table rebuild."""
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_orders_exit_target "
+        "ON pending_orders(closes_position_kind, closes_position_id, "
+        "submitted_at, id) WHERE order_role = 'exit'"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_orders_nonterminal "
+        "ON pending_orders(submitted_at) WHERE terminal_at IS NULL"
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_pending_orders_fill_time_on_insert
+        AFTER INSERT ON pending_orders
+        WHEN NEW.filled_qty > 0
+             AND NEW.last_fill_at IS NULL
+             AND NEW.last_fill_time_source IS NULL
+        BEGIN
+            UPDATE pending_orders
+            SET last_fill_at = COALESCE(NEW.last_refreshed_at, NEW.submitted_at),
+                last_fill_time_source = 'observed'
+            WHERE id = NEW.id;
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_pending_orders_fill_time_on_update
+        BEFORE UPDATE OF filled_qty, last_fill_at, last_fill_time_source
+        ON pending_orders
+        WHEN NEW.filled_qty > 0
+             AND (
+                 NEW.last_fill_at IS NULL
+                 OR NEW.last_fill_time_source IS NULL
+             )
+        BEGIN
+            SELECT RAISE(
+                ABORT, 'positive pending order fill requires fill-time provenance'
+            );
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_pending_orders_immutable_intent
+        BEFORE UPDATE OF
+            client_order_id, order_role, ticker, broker_symbol, asset_class,
+            vehicle, target_position_kind, closes_position_kind,
+            closes_position_id, side, requested_qty, requested_limit_price,
+            submitted_at, signal_id, intent_payload_version, intent_payload_json
+        ON pending_orders
+        BEGIN
+            SELECT RAISE(
+                ABORT, 'pending order materialization intent is immutable'
+            );
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_pending_orders_broker_id_bind_once
+        BEFORE UPDATE OF broker_order_id ON pending_orders
+        WHEN NOT (
+            OLD.broker_order_id IS NULL
+            AND NEW.broker_order_id IS NOT NULL
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT, 'pending order broker_order_id may only bind once'
+            );
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_pending_orders_filled_qty_monotonic
+        BEFORE UPDATE OF filled_qty ON pending_orders
+        WHEN NEW.filled_qty < OLD.filled_qty
+        BEGIN
+            SELECT RAISE(ABORT, 'pending order filled_qty cannot decrease');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_pending_orders_position_link_once
+        BEFORE UPDATE OF position_kind, position_id ON pending_orders
+        WHEN OLD.position_id IS NOT NULL AND (
+            NEW.position_id IS NOT OLD.position_id
+            OR NEW.position_kind IS NOT OLD.position_kind
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT, 'pending order position link is immutable once set'
+            );
+        END
+        """
+    )
+
+
+def _migrate_to_v29(conn: sqlite3.Connection) -> None:
+    """Add dormant exit-role lifecycle truth without rewriting legacy intent.
+
+    SQLite cannot add the role-dependent close-target and fill-time CHECKs via
+    ``ALTER TABLE``.  Rebuild the ledger transactionally, preserving every v28
+    value and row id.  All historical rows are entry intent; positive fills
+    receive explicitly observed provenance from the durable refresh time, or
+    submission time when no refresh was ever persisted.  Broker time and fees
+    remain unknown rather than being invented.
+    """
+    option_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(option_positions)")
+    }
+    if "exit_reason" not in option_columns:
+        conn.execute("ALTER TABLE option_positions ADD COLUMN exit_reason TEXT")
+
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(pending_orders)")
+    }
+    v29_columns = {
+        "order_role", "closes_position_kind", "closes_position_id",
+        "last_fill_at", "last_fill_time_source", "fees_dollars",
+    }
+    if "order_role" in columns:
+        if not v29_columns.issubset(columns):
+            missing = sorted(v29_columns - columns)
+            raise RuntimeError(
+                f"partial pending_orders v29 schema; missing columns: {missing}"
+            )
+        _create_v29_pending_order_objects(conn)
+        return
+
+    conn.execute("DROP INDEX IF EXISTS idx_pending_orders_nonterminal")
+    conn.execute("DROP INDEX IF EXISTS idx_pending_orders_exit_target")
+    for trigger in (
+        "trg_pending_orders_immutable_intent",
+        "trg_pending_orders_broker_id_bind_once",
+        "trg_pending_orders_filled_qty_monotonic",
+        "trg_pending_orders_position_link_once",
+        "trg_pending_orders_fill_time_on_insert",
+        "trg_pending_orders_fill_time_on_update",
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    conn.execute(
+        """
+        CREATE TABLE pending_orders_v29 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_order_id TEXT NOT NULL UNIQUE
+                CHECK (TRIM(client_order_id) <> ''),
+            broker_order_id TEXT UNIQUE CHECK (
+                broker_order_id IS NULL OR TRIM(broker_order_id) <> ''
+            ),
+            order_role TEXT NOT NULL DEFAULT 'entry'
+                CHECK (order_role IN ('entry','exit')),
+            ticker TEXT NOT NULL,
+            broker_symbol TEXT NOT NULL,
+            asset_class TEXT NOT NULL CHECK (asset_class IN ('stock','crypto')),
+            vehicle TEXT NOT NULL CHECK (
+                vehicle IN ('option_full','option_undersized','shares')
+            ),
+            target_position_kind TEXT NOT NULL CHECK (
+                target_position_kind IN ('option','long_term')
+            ),
+            closes_position_kind TEXT CHECK (
+                closes_position_kind IN ('option','long_term')
+            ),
+            closes_position_id INTEGER,
+            side TEXT NOT NULL CHECK (side IN ('buy','sell')),
+            requested_qty REAL NOT NULL CHECK (requested_qty > 0),
+            requested_limit_price REAL CHECK (
+                requested_limit_price IS NULL OR requested_limit_price > 0
+            ),
+            submitted_at TEXT NOT NULL,
+            signal_id INTEGER,
+            intent_payload_version INTEGER NOT NULL DEFAULT 1
+                CHECK (intent_payload_version >= 1),
+            intent_payload_json TEXT NOT NULL,
+            lifecycle_status TEXT NOT NULL DEFAULT 'new' CHECK (
+                lifecycle_status IN (
+                    'prepared','new','partially_filled','filled','canceled',
+                    'rejected','expired','unknown','abandoned'
+                )
+            ),
+            broker_status TEXT,
+            filled_qty REAL NOT NULL DEFAULT 0 CHECK (filled_qty >= 0),
+            filled_avg_price REAL,
+            last_fill_at TEXT,
+            last_fill_time_source TEXT CHECK (
+                last_fill_time_source IN ('broker','observed')
+            ),
+            fees_dollars REAL CHECK (
+                fees_dollars IS NULL OR fees_dollars >= 0
+            ),
+            last_refreshed_at TEXT,
+            terminal_reason TEXT,
+            terminal_at TEXT,
+            position_kind TEXT CHECK (position_kind IN ('option','long_term')),
+            position_id INTEGER,
+            CHECK (
+                (order_role = 'entry'
+                 AND closes_position_kind IS NULL
+                 AND closes_position_id IS NULL)
+                OR (
+                    order_role = 'exit'
+                    AND closes_position_kind = target_position_kind
+                    AND closes_position_id > 0
+                )
+            ),
+            CHECK (
+                (target_position_kind = 'option'
+                 AND vehicle IN ('option_full','option_undersized')
+                 AND (
+                     (order_role = 'entry' AND side = 'buy')
+                     OR (order_role = 'exit' AND side = 'sell')
+                 ))
+                OR (
+                    target_position_kind = 'long_term'
+                    AND vehicle = 'shares'
+                )
+            ),
+            CHECK (
+                (filled_qty = 0 AND filled_avg_price IS NULL
+                 AND last_fill_at IS NULL AND last_fill_time_source IS NULL
+                 AND fees_dollars IS NULL)
+                OR (
+                    filled_qty > 0 AND filled_avg_price > 0
+                    AND (
+                        (last_fill_at IS NULL
+                         AND last_fill_time_source IS NULL)
+                        OR (
+                            TRIM(COALESCE(last_fill_at, '')) <> ''
+                            AND last_fill_time_source IN ('broker','observed')
+                        )
+                    )
+                )
+            ),
+            CHECK (
+                (lifecycle_status IN (
+                    'filled','canceled','rejected','expired','abandoned'
+                 )
+                 AND terminal_at IS NOT NULL
+                 AND TRIM(COALESCE(terminal_reason, '')) <> '')
+                OR (
+                    lifecycle_status IN (
+                        'prepared','new','partially_filled','unknown'
+                    )
+                    AND terminal_at IS NULL AND terminal_reason IS NULL
+                )
+            ),
+            CHECK (
+                (lifecycle_status IN ('prepared','abandoned')
+                 AND broker_order_id IS NULL)
+                OR (
+                    lifecycle_status NOT IN ('prepared','abandoned')
+                    AND broker_order_id IS NOT NULL
+                )
+            ),
+            CHECK (
+                lifecycle_status <> 'prepared'
+                OR (
+                    broker_status IS NULL AND filled_qty = 0
+                    AND filled_avg_price IS NULL AND last_refreshed_at IS NULL
+                    AND position_kind IS NULL AND position_id IS NULL
+                )
+            ),
+            CHECK (
+                lifecycle_status <> 'abandoned'
+                OR (
+                    broker_status IS NULL AND filled_qty = 0
+                    AND filled_avg_price IS NULL
+                    AND position_kind IS NULL AND position_id IS NULL
+                )
+            ),
+            CHECK (
+                (position_kind IS NULL AND position_id IS NULL)
+                OR (position_kind IS NOT NULL AND position_id > 0)
+            ),
+            CHECK (
+                order_role = 'entry'
+                OR (position_kind IS NULL AND position_id IS NULL)
+            ),
+            CHECK (
+                position_kind IS NULL
+                OR position_kind = target_position_kind
+            ),
+            CHECK (
+                position_id IS NULL
+                OR (filled_qty > 0 AND filled_avg_price > 0)
+            )
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO pending_orders_v29 (
+            id, client_order_id, broker_order_id, order_role, ticker,
+            broker_symbol, asset_class, vehicle, target_position_kind,
+            closes_position_kind, closes_position_id, side, requested_qty,
+            requested_limit_price, submitted_at, signal_id,
+            intent_payload_version, intent_payload_json, lifecycle_status,
+            broker_status, filled_qty, filled_avg_price, last_fill_at,
+            last_fill_time_source, fees_dollars, last_refreshed_at,
+            terminal_reason, terminal_at, position_kind, position_id
+        )
+        SELECT
+            id, client_order_id, broker_order_id, 'entry', ticker,
+            broker_symbol, asset_class, vehicle, target_position_kind,
+            NULL, NULL, side, requested_qty, requested_limit_price,
+            submitted_at, signal_id, intent_payload_version,
+            intent_payload_json, lifecycle_status, broker_status, filled_qty,
+            filled_avg_price,
+            CASE
+                WHEN filled_qty > 0
+                THEN COALESCE(last_refreshed_at, submitted_at)
+                ELSE NULL
+            END,
+            CASE WHEN filled_qty > 0 THEN 'observed' ELSE NULL END,
+            NULL, last_refreshed_at, terminal_reason, terminal_at,
+            position_kind, position_id
+        FROM pending_orders
+        """
+    )
+    conn.execute("DROP TABLE pending_orders")
+    conn.execute("ALTER TABLE pending_orders_v29 RENAME TO pending_orders")
+    _create_v29_pending_order_objects(conn)
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -1207,6 +1582,7 @@ def init_db() -> None:
         _migrate_to_v26(conn)
         _migrate_to_v27(conn)
         _migrate_to_v28(conn)
+        _migrate_to_v29(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -3175,9 +3551,9 @@ def _insert_option_position_row(conn: sqlite3.Connection, pos: OptionPosition) -
         INSERT INTO option_positions (
             signal_id, order_id, symbol, underlying, option_type, strike, expiry,
             contracts, multiplier, premium_entry, delta_entry, theta, vega, gamma,
-            tp, sl, deadline, opened_at, closed_at, exit_price, outcome,
-            pnl_dollars, vehicle
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            tp, sl, deadline, opened_at, closed_at, exit_price, exit_reason,
+            outcome, pnl_dollars, vehicle
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = (
         pos.signal_id,
@@ -3200,6 +3576,7 @@ def _insert_option_position_row(conn: sqlite3.Connection, pos: OptionPosition) -
         pos.opened_at.isoformat(),
         pos.closed_at.isoformat() if pos.closed_at is not None else None,
         pos.exit_price,
+        pos.exit_reason,
         pos.outcome,
         pos.pnl_dollars,
         pos.vehicle,
@@ -3248,6 +3625,7 @@ def _row_to_option_position(row: sqlite3.Row) -> OptionPosition:
             datetime.fromisoformat(row["closed_at"]) if row["closed_at"] else None
         ),
         exit_price=row["exit_price"],
+        exit_reason=row["exit_reason"],
         outcome=row["outcome"],
         pnl_dollars=row["pnl_dollars"],
         vehicle=str(row["vehicle"]),
@@ -3864,10 +4242,15 @@ def _validate_optional_json_number(
 
 def _validate_pending_order_payload(order: PendingOrder) -> None:
     """Validate the supported immutable materialization-payload contract."""
-    if order.intent_payload_version != PENDING_ORDER_INTENT_VERSION:
+    expected_version = (
+        PENDING_ORDER_POSITION_EXIT_INTENT_VERSION
+        if order.order_role == "exit"
+        else PENDING_ORDER_INTENT_VERSION
+    )
+    if order.intent_payload_version != expected_version:
         raise ValueError(
             "Unsupported pending-order intent payload version "
-            f"{order.intent_payload_version}; expected {PENDING_ORDER_INTENT_VERSION}"
+            f"{order.intent_payload_version}; expected {expected_version}"
         )
     try:
         payload = json.loads(order.intent_payload_json)
@@ -3882,6 +4265,18 @@ def _validate_pending_order_payload(order: PendingOrder) -> None:
             f"Invalid pending-order intent_kind '{intent_kind}' "
             f"(expected one of {sorted(VALID_PENDING_ORDER_INTENT_KINDS)})"
         )
+
+    if order.order_role == "exit":
+        if intent_kind != "position_exit":
+            raise ValueError("exit-role pending order requires position_exit intent")
+        exit_reason = payload.get("exit_reason")
+        if not isinstance(exit_reason, str) or not exit_reason.strip():
+            raise ValueError(
+                "position_exit intent requires a non-empty exit_reason"
+            )
+        return
+    if intent_kind == "position_exit":
+        raise ValueError("position_exit intent requires an exit-role pending order")
 
     if intent_kind == "option":
         if order.target_position_kind != "option" or order.vehicle not in (
@@ -3971,7 +4366,9 @@ def _resolved_pending_order_client_id(order: PendingOrder) -> str:
     raise ValueError("pending-order client_order_id must be explicit before submit")
 
 
-def _validate_pending_order(order: PendingOrder) -> str:
+def _validate_pending_order(
+    order: PendingOrder,
+) -> tuple[str, datetime | None, str | None]:
     for field, value in (("ticker", order.ticker), ("broker_symbol", order.broker_symbol)):
         if not value.strip():
             raise ValueError(f"pending-order {field} must not be empty")
@@ -3983,6 +4380,28 @@ def _validate_pending_order(order: PendingOrder) -> str:
         raise ValueError(
             f"Invalid pending-order target position kind '{order.target_position_kind}'"
         )
+    if order.order_role not in VALID_PENDING_ORDER_ROLES:
+        raise ValueError(f"Invalid pending-order role '{order.order_role}'")
+    if order.order_role == "entry":
+        if (
+            order.closes_position_kind is not None
+            or order.closes_position_id is not None
+        ):
+            raise ValueError("entry pending order cannot carry a close target")
+    else:
+        if order.closes_position_kind not in VALID_PENDING_ORDER_POSITION_KINDS:
+            raise ValueError("exit pending order requires a valid close target kind")
+        if order.closes_position_id is None or order.closes_position_id <= 0:
+            raise ValueError("exit pending order requires a positive close target id")
+        if order.closes_position_kind != order.target_position_kind:
+            raise ValueError("exit pending-order close target must match its target kind")
+        if order.target_position_kind == "option":
+            if order.vehicle not in ("option_full", "option_undersized"):
+                raise ValueError("option exit requires an option vehicle")
+            if order.side != "sell":
+                raise ValueError("option exit must be a sell order")
+        elif order.vehicle != "shares":
+            raise ValueError("long_term exit requires the shares vehicle")
     if order.side not in VALID_PENDING_ORDER_SIDES:
         raise ValueError(f"Invalid pending-order side '{order.side}'")
     if order.requested_qty <= 0:
@@ -4014,6 +4433,36 @@ def _validate_pending_order(order: PendingOrder) -> str:
         raise ValueError(
             "pending-order filled_qty and positive filled_avg_price must appear together"
         )
+    last_fill_at = order.last_fill_at
+    last_fill_time_source = order.last_fill_time_source
+    if (
+        order.filled_qty > 0
+        and last_fill_at is None
+        and last_fill_time_source is None
+        and order.last_refreshed_at is not None
+    ):
+        last_fill_at = order.last_refreshed_at
+        last_fill_time_source = "observed"
+    has_fill_time = last_fill_at is not None
+    has_fill_time_source = last_fill_time_source is not None
+    if order.filled_qty > 0:
+        if not has_fill_time or not has_fill_time_source:
+            raise ValueError(
+                "positive pending-order fill requires last_fill_at and "
+                "last_fill_time_source"
+            )
+        if last_fill_time_source not in VALID_PENDING_ORDER_FILL_TIME_SOURCES:
+            raise ValueError(
+                "Invalid pending-order last_fill_time_source "
+                f"'{last_fill_time_source}'"
+            )
+    elif has_fill_time or has_fill_time_source:
+        raise ValueError("zero-fill pending order cannot carry fill-time metadata")
+    if order.fees_dollars is not None:
+        if order.filled_qty == 0:
+            raise ValueError("zero-fill pending order cannot carry fees")
+        if order.fees_dollars < 0:
+            raise ValueError("pending-order fees_dollars must not be negative")
     is_terminal = order.lifecycle_status in TERMINAL_PENDING_ORDER_STATUSES
     has_terminal = (
         order.terminal_at is not None
@@ -4041,6 +4490,10 @@ def _validate_pending_order(order: PendingOrder) -> str:
         raise ValueError("prepared pending order cannot have a broker refresh time")
     has_position_link = order.position_kind is not None or order.position_id is not None
     if has_position_link:
+        if order.order_role != "entry":
+            raise ValueError(
+                "exit pending order cannot use the entry-materialization link"
+            )
         if order.position_kind not in VALID_PENDING_ORDER_POSITION_KINDS:
             raise ValueError(f"Invalid pending-order position kind '{order.position_kind}'")
         if order.position_id is None or order.position_id <= 0:
@@ -4050,33 +4503,39 @@ def _validate_pending_order(order: PendingOrder) -> str:
         if order.filled_qty <= 0 or not has_fill_price:
             raise ValueError("pending order cannot link a position before a usable fill")
     _validate_pending_order_payload(order)
-    return client_order_id
+    return client_order_id, last_fill_at, last_fill_time_source
 
 
 def insert_pending_order(order: PendingOrder) -> int:
     """Insert one prepared/accepted immutable intent and return its ledger id."""
-    client_order_id = _validate_pending_order(order)
+    client_order_id, last_fill_at, last_fill_time_source = (
+        _validate_pending_order(order)
+    )
     sql = """
         INSERT INTO pending_orders (
-            client_order_id, broker_order_id, ticker, broker_symbol,
-            asset_class, vehicle,
-            target_position_kind, side, requested_qty, requested_limit_price,
+            client_order_id, broker_order_id, order_role, ticker, broker_symbol,
+            asset_class, vehicle, target_position_kind, closes_position_kind,
+            closes_position_id, side, requested_qty, requested_limit_price,
             submitted_at, signal_id, intent_payload_version, intent_payload_json,
             lifecycle_status, broker_status, filled_qty, filled_avg_price,
-            last_refreshed_at, terminal_reason, terminal_at, position_kind,
-            position_id
+            last_fill_at, last_fill_time_source, fees_dollars, last_refreshed_at,
+            terminal_reason, terminal_at, position_kind, position_id
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?
         )
     """
     params = (
         client_order_id,
         order.broker_order_id,
+        order.order_role,
         order.ticker,
         order.broker_symbol,
         order.asset_class,
         order.vehicle,
         order.target_position_kind,
+        order.closes_position_kind,
+        order.closes_position_id,
         order.side,
         order.requested_qty,
         order.requested_limit_price,
@@ -4088,6 +4547,9 @@ def insert_pending_order(order: PendingOrder) -> int:
         order.broker_status,
         order.filled_qty,
         order.filled_avg_price,
+        last_fill_at.isoformat() if last_fill_at is not None else None,
+        last_fill_time_source,
+        order.fees_dollars,
         (
             order.last_refreshed_at.isoformat()
             if order.last_refreshed_at is not None else None
@@ -4116,11 +4578,14 @@ def _row_to_pending_order(row: sqlite3.Row) -> PendingOrder:
             str(row["broker_order_id"])
             if row["broker_order_id"] is not None else None
         ),
+        order_role=str(row["order_role"]),
         ticker=str(row["ticker"]),
         broker_symbol=str(row["broker_symbol"]),
         asset_class=str(row["asset_class"]),
         vehicle=str(row["vehicle"]),
         target_position_kind=str(row["target_position_kind"]),
+        closes_position_kind=row["closes_position_kind"],
+        closes_position_id=row["closes_position_id"],
         side=str(row["side"]),
         requested_qty=float(row["requested_qty"]),
         requested_limit_price=row["requested_limit_price"],
@@ -4132,6 +4597,12 @@ def _row_to_pending_order(row: sqlite3.Row) -> PendingOrder:
         broker_status=row["broker_status"],
         filled_qty=float(row["filled_qty"]),
         filled_avg_price=row["filled_avg_price"],
+        last_fill_at=(
+            datetime.fromisoformat(row["last_fill_at"])
+            if row["last_fill_at"] else None
+        ),
+        last_fill_time_source=row["last_fill_time_source"],
+        fees_dollars=row["fees_dollars"],
         last_refreshed_at=(
             datetime.fromisoformat(row["last_refreshed_at"])
             if row["last_refreshed_at"] else None
@@ -4201,6 +4672,27 @@ def get_nonterminal_pending_orders() -> list[PendingOrder]:
     return [_row_to_pending_order(row) for row in rows]
 
 
+def get_pending_exit_orders_for_position(
+    position_kind: str, position_id: int,
+) -> list[PendingOrder]:
+    """Return every exit attempt for one immutable typed close target."""
+    if position_kind not in VALID_PENDING_ORDER_POSITION_KINDS:
+        raise ValueError(f"Invalid pending-order position kind '{position_kind}'")
+    if position_id <= 0:
+        raise ValueError("pending-order position_id must be positive")
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM pending_orders "
+            "WHERE order_role = 'exit' AND closes_position_kind = ? "
+            "AND closes_position_id = ? ORDER BY submitted_at ASC, id ASC",
+            (position_kind, position_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_pending_order(row) for row in rows]
+
+
 def update_pending_order(pending_order_id: int, **fields: Any) -> None:
     """Bind once, or update cumulative broker truth and the position link."""
     unknown = set(fields) - _PENDING_ORDER_UPDATABLE_FIELDS
@@ -4239,6 +4731,22 @@ def update_pending_order(pending_order_id: int, **fields: Any) -> None:
     ):
         raise ValueError("pending-order filled_avg_price must be positive")
     if (
+        "last_fill_time_source" in normalized
+        and normalized["last_fill_time_source"] is not None
+        and normalized["last_fill_time_source"]
+        not in VALID_PENDING_ORDER_FILL_TIME_SOURCES
+    ):
+        raise ValueError(
+            "Invalid pending-order last_fill_time_source "
+            f"'{normalized['last_fill_time_source']}'"
+        )
+    if (
+        "fees_dollars" in normalized
+        and normalized["fees_dollars"] is not None
+        and normalized["fees_dollars"] < 0
+    ):
+        raise ValueError("pending-order fees_dollars must not be negative")
+    if (
         "position_kind" in normalized
         and normalized["position_kind"] is not None
         and normalized["position_kind"] not in VALID_PENDING_ORDER_POSITION_KINDS
@@ -4252,10 +4760,32 @@ def update_pending_order(pending_order_id: int, **fields: Any) -> None:
         and normalized["position_id"] <= 0
     ):
         raise ValueError("pending-order position_id must be positive")
-    set_clause = ", ".join(f"{key} = ?" for key in normalized)
-    sql = f"UPDATE pending_orders SET {set_clause} WHERE id = ?"  # noqa: S608
     conn = get_connection()
     try:
+        current = conn.execute(
+            "SELECT filled_qty FROM pending_orders WHERE id = ?",
+            (pending_order_id,),
+        ).fetchone()
+        if (
+            current is not None
+            and "filled_qty" in normalized
+            and normalized["filled_qty"] > float(current["filled_qty"])
+            and "last_fill_at" not in normalized
+            and "last_fill_time_source" not in normalized
+        ):
+            observed_at = normalized.get("last_refreshed_at")
+            if observed_at is None:
+                observed_at = datetime.now(UTC).isoformat()
+            normalized["last_fill_at"] = observed_at
+            normalized["last_fill_time_source"] = "observed"
+        if ("last_fill_at" in normalized) != (
+            "last_fill_time_source" in normalized
+        ):
+            raise ValueError(
+                "last_fill_at and last_fill_time_source must be updated together"
+            )
+        set_clause = ", ".join(f"{key} = ?" for key in normalized)
+        sql = f"UPDATE pending_orders SET {set_clause} WHERE id = ?"  # noqa: S608
         conn.execute(sql, [*normalized.values(), pending_order_id])
         conn.commit()
     finally:
@@ -4271,7 +4801,8 @@ def get_pending_orders_with_fills() -> list[PendingOrder]:
     conn = get_connection()
     try:
         rows = conn.execute(
-            "SELECT * FROM pending_orders WHERE filled_qty > 0 "
+            "SELECT * FROM pending_orders "
+            "WHERE order_role = 'entry' AND filled_qty > 0 "
             "ORDER BY submitted_at ASC, id ASC"
         ).fetchall()
     finally:
@@ -4295,12 +4826,15 @@ def _guard_unlinked_pending_order(
     insert a second position.
     """
     row = conn.execute(
-        "SELECT target_position_kind, position_id, filled_qty, filled_avg_price "
+        "SELECT order_role, target_position_kind, position_id, filled_qty, "
+        "filled_avg_price "
         "FROM pending_orders WHERE id = ?",
         (pending_order_id,),
     ).fetchone()
     if row is None:
         raise ValueError(f"pending order {pending_order_id} not found")
+    if row["order_role"] != "entry":
+        raise ValueError("exit pending order cannot materialize an entry position")
     if row["position_id"] is not None:
         raise ValueError("pending order already links a materialized position")
     if row["target_position_kind"] != position_kind:
@@ -4326,12 +4860,15 @@ def _guard_linked_pending_order_fill(
 ) -> None:
     """Verify a cumulative position update still matches durable ledger truth."""
     row = conn.execute(
-        "SELECT position_kind, position_id, filled_qty, filled_avg_price "
+        "SELECT order_role, position_kind, position_id, filled_qty, "
+        "filled_avg_price "
         "FROM pending_orders WHERE id = ?",
         (pending_order_id,),
     ).fetchone()
     if row is None:
         raise ValueError(f"pending order {pending_order_id} not found")
+    if row["order_role"] != "entry":
+        raise ValueError("exit pending order cannot update an entry position")
     if row["position_kind"] != position_kind or row["position_id"] != position_id:
         raise ValueError("pending-order position link changed before the fill update")
     if (

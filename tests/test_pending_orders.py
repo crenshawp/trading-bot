@@ -15,11 +15,15 @@ from trading_bot import db
 from trading_bot.models import (
     LEGACY_PENDING_ORDER_CLIENT_ID_PREFIX,
     PENDING_ORDER_INTENT_VERSION,
+    PENDING_ORDER_POSITION_EXIT_INTENT_VERSION,
     TERMINAL_PENDING_ORDER_STATUSES,
+    VALID_PENDING_ORDER_FILL_TIME_SOURCES,
     VALID_PENDING_ORDER_INTENT_KINDS,
     VALID_PENDING_ORDER_POSITION_KINDS,
+    VALID_PENDING_ORDER_ROLES,
     VALID_PENDING_ORDER_STATUSES,
     VALID_PENDING_ORDER_VEHICLES,
+    OptionPosition,
     PendingOrder,
     Signal,
     Trade,
@@ -70,6 +74,15 @@ def _share_payload(
     return json.dumps(payload, sort_keys=True)
 
 
+def _exit_payload(exit_reason: str = "take_profit", **overrides: Any) -> str:
+    payload: dict[str, Any] = {
+        "intent_kind": "position_exit",
+        "exit_reason": exit_reason,
+    }
+    payload.update(overrides)
+    return json.dumps(payload, sort_keys=True)
+
+
 def _pending_order(**overrides: Any) -> PendingOrder:
     base: dict[str, Any] = {
         "client_order_id": "bot-order-1",
@@ -88,6 +101,17 @@ def _pending_order(**overrides: Any) -> PendingOrder:
         "broker_status": "accepted",
     }
     base.update(overrides)
+    if (
+        base.get("filled_qty", 0) > 0
+        and "last_fill_at" not in overrides
+        and "last_fill_time_source" not in overrides
+    ):
+        base["last_fill_at"] = (
+            base.get("last_refreshed_at")
+            or base.get("terminal_at")
+            or base["submitted_at"]
+        )
+        base["last_fill_time_source"] = "observed"
     return PendingOrder(**base)
 
 
@@ -97,9 +121,12 @@ def test_pending_order_model_is_frozen_and_vocabularies_are_explicit() -> None:
         order.ticker = "META"
 
     assert PENDING_ORDER_INTENT_VERSION == 1
+    assert PENDING_ORDER_POSITION_EXIT_INTENT_VERSION == 1
     assert {
-        "option", "long_term", "shares_fallback",
+        "option", "long_term", "shares_fallback", "position_exit",
     } == VALID_PENDING_ORDER_INTENT_KINDS
+    assert {"entry", "exit"} == VALID_PENDING_ORDER_ROLES
+    assert {"broker", "observed"} == VALID_PENDING_ORDER_FILL_TIME_SOURCES
     assert {
         "prepared", "new", "partially_filled", "filled", "canceled",
         "rejected", "expired", "unknown", "abandoned",
@@ -135,19 +162,24 @@ def test_pending_order_schema_has_exact_columns_and_constraints(tmp_db: Path) ->
         conn.close()
 
     assert columns == {
-        "id", "client_order_id", "broker_order_id", "ticker", "broker_symbol",
-        "asset_class", "vehicle", "target_position_kind", "side", "requested_qty",
+        "id", "client_order_id", "broker_order_id", "order_role", "ticker",
+        "broker_symbol", "asset_class", "vehicle", "target_position_kind",
+        "closes_position_kind", "closes_position_id", "side", "requested_qty",
         "requested_limit_price", "submitted_at", "signal_id",
         "intent_payload_version", "intent_payload_json", "lifecycle_status",
-        "broker_status", "filled_qty", "filled_avg_price", "last_refreshed_at",
+        "broker_status", "filled_qty", "filled_avg_price", "last_fill_at",
+        "last_fill_time_source", "fees_dollars", "last_refreshed_at",
         "terminal_reason", "terminal_at", "position_kind", "position_id",
     }
     assert "idx_pending_orders_nonterminal" in indexes
+    assert "idx_pending_orders_exit_target" in indexes
     assert triggers == {
         "trg_pending_orders_immutable_intent",
         "trg_pending_orders_broker_id_bind_once",
         "trg_pending_orders_filled_qty_monotonic",
         "trg_pending_orders_position_link_once",
+        "trg_pending_orders_fill_time_on_insert",
+        "trg_pending_orders_fill_time_on_update",
     }
 
 
@@ -183,7 +215,7 @@ def test_v25_sentiment_migration_preserves_pending_order_and_legacy_trade(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 28
+    assert db.schema_version() == 29
     assert db.get_pending_order("broker-order-1") == pending_before
     assert pending_before is not None and pending_before.id == pending_id
     legacy = db.get_trade_by_signal_id(signal_id)
@@ -224,7 +256,7 @@ def test_v26_indicator_migration_preserves_pending_order_and_legacy_trade(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 28
+    assert db.schema_version() == 29
     assert db.get_pending_order("broker-order-1") == pending_before
     assert pending_before is not None and pending_before.id == pending_id
     legacy = db.get_trade_by_signal_id(signal_id)
@@ -266,7 +298,7 @@ def test_v27_risk_migration_preserves_pending_order_and_legacy_trade(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 28
+    assert db.schema_version() == 29
     assert db.get_pending_order("broker-order-1") == pending_before
     assert pending_before is not None and pending_before.id == pending_id
     legacy = db.get_trade_by_signal_id(signal_id)
@@ -330,6 +362,257 @@ def test_share_intents_round_trip_without_rerunning_selection(
 
     assert fetched == dataclasses.replace(order, id=pending_id)
     assert json.loads(fetched.intent_payload_json) == payload
+
+
+def test_exit_role_round_trip_uses_typed_close_target_not_entry_link(
+    tmp_db: Path,
+) -> None:
+    exit_order = _pending_order(
+        client_order_id="bot-exit-1",
+        broker_order_id="broker-exit-1",
+        order_role="exit",
+        side="sell",
+        closes_position_kind="option",
+        closes_position_id=41,
+        intent_payload_json=_exit_payload("take_profit"),
+        lifecycle_status="partially_filled",
+        broker_status="partially_filled",
+        filled_qty=0.5,
+        filled_avg_price=4.5,
+        last_fill_at=datetime(2026, 7, 20, 15, 2, tzinfo=UTC),
+        last_fill_time_source="broker",
+    )
+
+    pending_id = db.insert_pending_order(exit_order)
+    fetched = db.get_pending_order("broker-exit-1")
+
+    assert fetched == dataclasses.replace(exit_order, id=pending_id)
+    assert fetched is not None
+    assert fetched.position_kind is None and fetched.position_id is None
+    assert fetched.fees_dollars is None
+    assert db.get_pending_exit_orders_for_position("option", 41) == [fetched]
+    assert db.get_pending_orders_with_fills() == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"closes_position_kind": "option", "closes_position_id": 1}, "entry"),
+        (
+            {
+                "order_role": "exit", "side": "sell",
+                "intent_payload_json": _exit_payload(),
+            },
+            "close target",
+        ),
+        (
+            {
+                "order_role": "exit", "side": "sell",
+                "closes_position_kind": "long_term", "closes_position_id": 1,
+                "intent_payload_json": _exit_payload(),
+            },
+            "match",
+        ),
+        (
+            {
+                "order_role": "exit", "side": "buy",
+                "closes_position_kind": "option", "closes_position_id": 1,
+                "intent_payload_json": _exit_payload(),
+            },
+            "sell",
+        ),
+        (
+            {
+                "order_role": "exit", "side": "sell",
+                "closes_position_kind": "option", "closes_position_id": 1,
+            },
+            "position_exit",
+        ),
+        ({"intent_payload_json": _exit_payload()}, "exit-role"),
+        (
+            {
+                "order_role": "exit", "side": "sell",
+                "closes_position_kind": "option", "closes_position_id": 1,
+                "intent_payload_json": _exit_payload(" "),
+            },
+            "exit_reason",
+        ),
+        (
+            {
+                "order_role": "exit", "side": "sell",
+                "closes_position_kind": "option", "closes_position_id": 1,
+                "intent_payload_json": _exit_payload(),
+                "intent_payload_version": 2,
+            },
+            "Unsupported",
+        ),
+    ],
+)
+def test_entry_exit_shapes_and_versioned_exit_payload_are_validated(
+    tmp_db: Path, overrides: dict[str, Any], match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        db.insert_pending_order(_pending_order(**overrides))
+
+
+def test_fill_time_provenance_and_unknown_fees_are_enforced(tmp_db: Path) -> None:
+    observed_at = datetime(2026, 7, 20, 15, 2, tzinfo=UTC)
+    observed = _pending_order(
+        client_order_id="bot-observed-fill",
+        broker_order_id="observed-fill",
+        lifecycle_status="partially_filled",
+        broker_status="partially_filled",
+        filled_qty=1.0,
+        filled_avg_price=4.2,
+        last_refreshed_at=observed_at,
+    )
+    pending_id = db.insert_pending_order(observed)
+    stored = db.get_pending_order("observed-fill")
+    assert stored is not None and stored.id == pending_id
+    assert stored.last_fill_at == observed_at
+    assert stored.last_fill_time_source == "observed"
+    assert stored.fees_dollars is None
+    broker_at = datetime(2026, 7, 20, 15, 1, 30, tzinfo=UTC)
+    broker_fill = _pending_order(
+        client_order_id="bot-broker-fill",
+        broker_order_id="broker-fill",
+        lifecycle_status="partially_filled",
+        broker_status="partially_filled",
+        filled_qty=1.0,
+        filled_avg_price=4.15,
+        last_fill_at=broker_at,
+        last_fill_time_source="broker",
+    )
+    db.insert_pending_order(broker_fill)
+    stored_broker = db.get_pending_order("broker-fill")
+    assert stored_broker is not None
+    assert stored_broker.last_fill_at == broker_at
+    assert stored_broker.last_fill_time_source == "broker"
+    assert stored_broker.fees_dollars is None
+    conn = db.get_connection()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="fill-time provenance"):
+            conn.execute(
+                "UPDATE pending_orders SET last_fill_at = NULL, "
+                "last_fill_time_source = NULL WHERE id = ?",
+                (pending_id,),
+            )
+    finally:
+        conn.close()
+
+    with pytest.raises(ValueError, match="requires last_fill_at"):
+        db.insert_pending_order(
+            _pending_order(
+                client_order_id="bot-missing-fill-time",
+                broker_order_id="missing-fill-time",
+                lifecycle_status="partially_filled",
+                broker_status="partially_filled",
+                filled_qty=1.0,
+                filled_avg_price=4.2,
+                last_fill_at=None,
+                last_fill_time_source=None,
+            )
+        )
+    with pytest.raises(ValueError, match="zero-fill"):
+        db.insert_pending_order(
+            _pending_order(
+                client_order_id="bot-zero-fill-time",
+                broker_order_id="zero-fill-time",
+                last_fill_at=observed_at,
+                last_fill_time_source="observed",
+            )
+        )
+    with pytest.raises(ValueError, match="zero-fill"):
+        db.insert_pending_order(
+            _pending_order(
+                client_order_id="bot-zero-fee",
+                broker_order_id="zero-fee",
+                fees_dollars=0.0,
+            )
+        )
+
+
+def test_exit_close_target_and_entry_position_link_are_immutable(tmp_db: Path) -> None:
+    exit_order = _pending_order(
+        client_order_id="bot-exit-immutable",
+        broker_order_id="exit-immutable",
+        order_role="exit",
+        side="sell",
+        closes_position_kind="option",
+        closes_position_id=41,
+        intent_payload_json=_exit_payload("stop_loss"),
+    )
+    pending_id = db.insert_pending_order(exit_order)
+    conn = db.get_connection()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="intent is immutable"):
+            conn.execute(
+                "UPDATE pending_orders SET closes_position_id = 42 WHERE id = ?",
+                (pending_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint"):
+            conn.execute(
+                "UPDATE pending_orders SET position_kind = 'option', "
+                "position_id = 41 WHERE id = ?",
+                (pending_id,),
+            )
+    finally:
+        conn.close()
+
+
+def test_option_position_round_trip_and_update_preserve_exit_reason(
+    tmp_db: Path,
+) -> None:
+    position = OptionPosition(
+        symbol="GOOGL260918C00190000",
+        underlying="GOOGL",
+        option_type="call",
+        strike=190.0,
+        expiry="2026-09-18",
+        contracts=1.0,
+        opened_at=datetime(2026, 7, 20, 15, 0, tzinfo=UTC),
+        exit_reason="take_profit",
+    )
+    position_id = db.insert_option_position(position)
+    assert db.get_option_position(position_id) == dataclasses.replace(
+        position, id=position_id
+    )
+
+    db.update_option_position(position_id, exit_reason="emergency_shutdown")
+    updated = db.get_option_position(position_id)
+    assert updated is not None
+    assert updated.exit_reason == "emergency_shutdown"
+
+
+def test_v28_option_position_migration_preserves_row_and_adds_null_exit_reason(
+    tmp_db: Path,
+) -> None:
+    position = OptionPosition(
+        symbol="GOOGL260918C00190000",
+        underlying="GOOGL",
+        option_type="call",
+        strike=190.0,
+        expiry="2026-09-18",
+        contracts=1.0,
+        opened_at=datetime(2026, 7, 20, 15, 0, tzinfo=UTC),
+        premium_entry=4.2,
+    )
+    position_id = db.insert_option_position(position)
+    conn = db.get_connection()
+    try:
+        conn.execute("ALTER TABLE option_positions DROP COLUMN exit_reason")
+        conn.execute("UPDATE schema_version SET version = 28")
+        conn.commit()
+    finally:
+        conn.close()
+
+    db.init_db()
+    db.init_db()
+
+    assert db.get_option_position(position_id) == dataclasses.replace(
+        position, id=position_id
+    )
+    assert db.schema_version() == 29
 
 
 def test_duplicate_broker_order_id_is_rejected(tmp_db: Path) -> None:
@@ -844,7 +1127,7 @@ def test_v23_database_migrates_without_rewriting_existing_rows(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 28
+    assert db.schema_version() == 29
     migrated = db.get_connection()
     try:
         sentinel = migrated.execute(
@@ -961,6 +1244,68 @@ def _create_v24_pending_orders(conn: sqlite3.Connection) -> None:
     )
 
 
+def test_v28_to_v29_migration_preserves_every_legacy_ledger_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy_path = tmp_path / "legacy-v28.db"
+    conn = sqlite3.connect(legacy_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (28)")
+        _create_v24_pending_orders(conn)
+        db._migrate_to_v25(conn)
+        conn.execute(
+            """
+            INSERT INTO pending_orders (
+                id, client_order_id, broker_order_id, ticker, broker_symbol,
+                asset_class, vehicle, target_position_kind, side, requested_qty,
+                requested_limit_price, submitted_at, signal_id,
+                intent_payload_version, intent_payload_json, lifecycle_status,
+                broker_status, filled_qty, filled_avg_price, last_refreshed_at,
+                terminal_reason, terminal_at, position_kind, position_id
+            ) VALUES (
+                5, 'v28-client-5', 'v28-broker-5', 'GOOGL',
+                'GOOGL260918C00190000', 'stock', 'option_full', 'option',
+                'buy', 2.0, 4.25, '2026-07-20T15:00:00+00:00', 17, 1, ?,
+                'partially_filled', 'partially_filled', 1.0, 4.2, NULL,
+                NULL, NULL, 'option', 88
+            )
+            """,
+            (_option_payload(),),
+        )
+        before_row = conn.execute(
+            "SELECT * FROM pending_orders WHERE id = 5"
+        ).fetchone()
+        assert before_row is not None
+        legacy_columns = before_row.keys()
+        legacy_values = {key: before_row[key] for key in legacy_columns}
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr("trading_bot.config.DB_PATH", legacy_path)
+
+    db.init_db()
+    db.init_db()
+
+    migrated = db.get_connection()
+    try:
+        after_row = migrated.execute(
+            "SELECT * FROM pending_orders WHERE id = 5"
+        ).fetchone()
+    finally:
+        migrated.close()
+    assert after_row is not None
+    assert {key: after_row[key] for key in legacy_values} == legacy_values
+    assert after_row["order_role"] == "entry"
+    assert after_row["closes_position_kind"] is None
+    assert after_row["closes_position_id"] is None
+    assert after_row["last_fill_at"] == "2026-07-20T15:00:00+00:00"
+    assert after_row["last_fill_time_source"] == "observed"
+    assert after_row["fees_dollars"] is None
+    assert db.schema_version() == 29
+
+
 def test_v24_pending_order_rows_migrate_collision_free_and_preserve_data(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -984,6 +1329,13 @@ def test_v24_pending_order_rows_migrate_collision_free_and_preserve_data(
                 "canceled", "canceled", 1.0, 4.2,
                 "2026-07-20T15:04:00+00:00", "canceled",
                 "2026-07-20T15:04:00+00:00", "option", 88,
+            ),
+            (
+                15, "legacy-bound-15", "GOOGL", "GOOGL260918C00190000",
+                "stock", "option_full", "option", "buy", 2.0, 4.25,
+                "2026-07-20T15:10:00+00:00", 17, 1, _option_payload(),
+                "partially_filled", "partially_filled", 0.5, 4.1,
+                None, None, None, None, None,
             ),
         )
         conn.executemany(
@@ -1010,17 +1362,33 @@ def test_v24_pending_order_rows_migrate_collision_free_and_preserve_data(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 28
+    assert db.schema_version() == 29
     first = db.get_pending_order("legacy-bound-7")
     second = db.get_pending_order("legacy-bound-11")
-    assert first is not None and second is not None
+    third = db.get_pending_order("legacy-bound-15")
+    assert first is not None and second is not None and third is not None
     assert first.client_order_id == "legacy-v24-7"
     assert second.client_order_id == "legacy-v24-11"
     assert first.id == 7 and second.id == 11
     assert first.broker_status == "accepted" and first.filled_qty == 0
+    assert first.order_role == "entry"
+    assert first.closes_position_kind is None and first.closes_position_id is None
+    assert first.last_fill_at is None and first.last_fill_time_source is None
+    assert first.fees_dollars is None
     assert second.lifecycle_status == "canceled"
     assert second.filled_qty == 1.0 and second.filled_avg_price == 4.2
     assert second.position_kind == "option" and second.position_id == 88
+    assert second.order_role == "entry"
+    assert second.last_fill_at == datetime(
+        2026, 7, 20, 15, 4, tzinfo=UTC
+    )
+    assert second.last_fill_time_source == "observed"
+    assert second.fees_dollars is None
+    assert third.last_fill_at == datetime(
+        2026, 7, 20, 15, 10, tzinfo=UTC
+    )
+    assert third.last_fill_time_source == "observed"
+    assert third.fees_dollars is None
     assert not is_recoverable_pending_order_client_id(first.client_order_id)
     assert not is_recoverable_pending_order_client_id(second.client_order_id)
     assert db.insert_pending_order(
@@ -1030,7 +1398,7 @@ def test_v24_pending_order_rows_migrate_collision_free_and_preserve_data(
             lifecycle_status="prepared",
             broker_status=None,
         )
-    ) == 12
+    ) == 16
 
     migrated = db.get_connection()
     try:
@@ -1050,9 +1418,12 @@ def test_v24_pending_order_rows_migrate_collision_free_and_preserve_data(
     finally:
         migrated.close()
     assert "idx_pending_orders_nonterminal" in indexes
+    assert "idx_pending_orders_exit_target" in indexes
     assert triggers == {
         "trg_pending_orders_immutable_intent",
         "trg_pending_orders_broker_id_bind_once",
         "trg_pending_orders_filled_qty_monotonic",
         "trg_pending_orders_position_link_once",
+        "trg_pending_orders_fill_time_on_insert",
+        "trg_pending_orders_fill_time_on_update",
     }
