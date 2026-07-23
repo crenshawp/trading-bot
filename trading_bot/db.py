@@ -59,6 +59,7 @@ from trading_bot.models import (
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
+# Version 28 (cross-cutting audit) — persists risk assessment status + reason.
 # Version 27 (cross-cutting audit) — persists indicator computation status.
 # Version 26 (cross-cutting audit) — persists sentiment success + rationale.
 # Version 25 (cross-cutting audit) — adds pre-submit pending-order identity.
@@ -77,7 +78,7 @@ from trading_bot.models import (
 # Version 13 (Phase 6) — adds trades.ind_* advisory indicator-family columns.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -1160,6 +1161,20 @@ def _migrate_to_v27(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_to_v28(conn: sqlite3.Connection) -> None:
+    """Persist risk provenance without rewriting legacy assessment rows."""
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(trades)")
+    }
+    if "risk_ok" not in columns:
+        conn.execute(
+            "ALTER TABLE trades ADD COLUMN risk_ok INTEGER "
+            "CHECK (risk_ok IN (0,1))"
+        )
+    if "risk_reason" not in columns:
+        conn.execute("ALTER TABLE trades ADD COLUMN risk_reason TEXT")
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -1191,6 +1206,7 @@ def init_db() -> None:
         _migrate_to_v25(conn)
         _migrate_to_v26(conn)
         _migrate_to_v27(conn)
+        _migrate_to_v28(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -1415,13 +1431,14 @@ def insert_trade(trade: Trade) -> int:
             sentiment_rationale, heavy_news, headline_count,
             ind_ok, ind_atr, ind_realized_vol, ind_vol_regime, ind_rsi, ind_adx,
             ind_obv, ind_correlation, ind_concentration,
-            risk_recommended_size, risk_stop_distance, risk_dollar_risk,
+            risk_ok, risk_reason, risk_recommended_size, risk_stop_distance,
+            risk_dollar_risk,
             risk_pct, risk_position_pct, risk_capped, risk_total_pct,
             risk_portfolio_verdict, risk_position_verdict, risk_cluster_pct,
             risk_cluster_verdict
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                   ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = (
         trade.signal_id,
@@ -1452,6 +1469,8 @@ def insert_trade(trade: Trade) -> int:
         trade.ind_obv,
         trade.ind_correlation,
         trade.ind_concentration,
+        int(trade.risk_ok) if trade.risk_ok is not None else None,
+        trade.risk_reason,
         trade.risk_recommended_size,
         trade.risk_stop_distance,
         trade.risk_dollar_risk,
@@ -1581,6 +1600,12 @@ def _row_to_trade(row: sqlite3.Row) -> Trade:
         ind_concentration=(
             row["ind_concentration"] if "ind_concentration" in keys else None
         ),
+        risk_ok=(
+            bool(row["risk_ok"])
+            if "risk_ok" in keys and row["risk_ok"] is not None
+            else None
+        ),
+        risk_reason=row["risk_reason"] if "risk_reason" in keys else None,
         risk_recommended_size=(
             row["risk_recommended_size"] if "risk_recommended_size" in keys else None
         ),
@@ -2620,11 +2645,8 @@ def get_recent_trade_indicators(limit: int = 20) -> list[dict[str, Any]]:
 def get_recent_trade_risk(limit: int = 20) -> list[dict[str, Any]]:
     """Recent fired signals that carry an advisory risk recommendation (Phase 7).
 
-    Joins trades -> signals, newest first, restricted to risk-assessed rows
-    (``risk_portfolio_verdict`` populated — the active alerting stock signals;
-    crypto/shadow leave it NULL). Each row carries the signal identity, the
-    sizing + portfolio verdicts, and the eventual outcome so the recommendation
-    sits next to the result — the per-signal risk report view.
+    Explicit success/failure is returned separately from the verdicts; legacy
+    rows with risk context but no provenance remain visible as unknown.
     """
     sql = (
         "SELECT signals.ticker AS ticker, "
@@ -2633,6 +2655,8 @@ def get_recent_trade_risk(limit: int = 20) -> list[dict[str, Any]]:
         "       trades.opened_at AS opened_at, "
         "       trades.outcome AS outcome, "
         "       trades.track_mode AS track_mode, "
+        "       trades.risk_ok AS risk_ok, "
+        "       trades.risk_reason AS risk_reason, "
         "       trades.risk_recommended_size AS risk_recommended_size, "
         "       trades.risk_pct AS risk_pct, "
         "       trades.risk_position_pct AS risk_position_pct, "
@@ -2643,7 +2667,8 @@ def get_recent_trade_risk(limit: int = 20) -> list[dict[str, Any]]:
         "       trades.risk_cluster_pct AS risk_cluster_pct, "
         "       trades.risk_cluster_verdict AS risk_cluster_verdict "
         "FROM trades JOIN signals ON signals.id = trades.signal_id "
-        "WHERE trades.risk_portfolio_verdict IS NOT NULL "
+        "WHERE trades.risk_ok IS NOT NULL "
+        "   OR trades.risk_portfolio_verdict IS NOT NULL "
         "ORDER BY trades.opened_at DESC LIMIT ?"
     )
     conn = get_connection()
@@ -2659,12 +2684,18 @@ def get_recent_trade_risk(limit: int = 20) -> list[dict[str, Any]]:
             "opened_at": str(r["opened_at"]),
             "outcome": r["outcome"],
             "track_mode": str(r["track_mode"]),
+            "risk_ok": (
+                bool(r["risk_ok"])
+                if r["risk_ok"] is not None
+                else None
+            ),
+            "risk_reason": r["risk_reason"],
             "risk_recommended_size": r["risk_recommended_size"],
             "risk_pct": r["risk_pct"],
             "risk_position_pct": r["risk_position_pct"],
             "risk_capped": bool(r["risk_capped"]),
             "risk_total_pct": r["risk_total_pct"],
-            "risk_portfolio_verdict": str(r["risk_portfolio_verdict"]),
+            "risk_portfolio_verdict": r["risk_portfolio_verdict"],
             "risk_position_verdict": (
                 str(r["risk_position_verdict"])
                 if r["risk_position_verdict"] is not None
@@ -2883,6 +2914,8 @@ def get_resolved_context_outcomes(
         "       trades.ind_rsi AS ind_rsi, trades.ind_adx AS ind_adx, "
         "       trades.ind_obv AS ind_obv, "
         "       trades.ind_concentration AS ind_concentration, "
+        "       trades.risk_ok AS risk_ok, "
+        "       trades.risk_reason AS risk_reason, "
         "       trades.risk_portfolio_verdict AS risk_portfolio_verdict "
         "FROM trades JOIN signals ON signals.id = trades.signal_id "
         "WHERE trades.track_mode = 'active' "
@@ -2920,6 +2953,12 @@ def get_resolved_context_outcomes(
             "ind_adx": r["ind_adx"],
             "ind_obv": r["ind_obv"],
             "ind_concentration": r["ind_concentration"],
+            "risk_ok": (
+                bool(r["risk_ok"])
+                if r["risk_ok"] is not None
+                else None
+            ),
+            "risk_reason": r["risk_reason"],
             "risk_portfolio_verdict": r["risk_portfolio_verdict"],
         }
         for r in rows

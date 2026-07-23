@@ -1323,19 +1323,22 @@ def test_risk_assessment_persisted_on_trade_row(
         recommended_size=20.0, stop_distance=3.0, dollar_risk=60.0, risk_pct=0.6,
         position_pct=20.0, capped=True, total_risk_pct=4.5,
         portfolio_verdict="ok", position_verdict="would-exceed-position",
-        cluster_risk_pct=3.0, cluster_verdict="ok", ok=False, reason="ok",
+        cluster_risk_pct=3.0, cluster_verdict="ok", ok=True, reason="ok",
     )
     scanner.send_notification(_stock_signal("GOOGL"), risk=assessment)
 
     conn = db.get_connection()
     try:
         row = conn.execute(
-            "SELECT risk_recommended_size, risk_pct, risk_position_pct, risk_capped, "
+            "SELECT risk_ok, risk_reason, risk_recommended_size, risk_pct, "
+            "risk_position_pct, risk_capped, "
             "risk_total_pct, risk_portfolio_verdict, risk_position_verdict, "
             "risk_cluster_pct, risk_cluster_verdict FROM trades"
         ).fetchone()
     finally:
         conn.close()
+    assert row["risk_ok"] == 1
+    assert row["risk_reason"] == "ok"
     assert row["risk_recommended_size"] == pytest.approx(20.0)
     assert row["risk_pct"] == pytest.approx(0.6)
     assert row["risk_capped"] == 1
@@ -1343,6 +1346,32 @@ def test_risk_assessment_persisted_on_trade_row(
     assert row["risk_portfolio_verdict"] == "ok"
     assert row["risk_position_verdict"] == "would-exceed-position"
     assert row["risk_cluster_verdict"] == "ok"
+
+
+def test_fail_soft_risk_reason_persisted_on_trade_row(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trading_bot.risk import RiskAssessment
+
+    _offline_context(monkeypatch)
+    monkeypatch.setattr("trading_bot.scanner.requests.post", lambda url, **_k: None)
+    monkeypatch.setattr(scanner, "DRY_RUN", False)
+    assessment = RiskAssessment(
+        ok=False, reason="size unavailable: missing/zero ATR",
+    )
+
+    scanner.send_notification(_stock_signal("GOOGL"), risk=assessment)
+
+    conn = db.get_connection()
+    try:
+        row = conn.execute(
+            "SELECT risk_ok, risk_reason, risk_portfolio_verdict FROM trades"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["risk_ok"] == 0
+    assert row["risk_reason"] == "size unavailable: missing/zero ATR"
+    assert row["risk_portfolio_verdict"] == "unknown"
 
 
 def test_risk_alert_includes_sizing_and_advisory(
@@ -1356,7 +1385,7 @@ def test_risk_alert_includes_sizing_and_advisory(
     monkeypatch.setattr(scanner, "DRY_RUN", True)
 
     assessment = RiskAssessment(
-        recommended_size=20.0, risk_pct=0.6, capped=True, ok=False,
+        recommended_size=20.0, risk_pct=0.6, capped=True, ok=True,
         portfolio_verdict="would-exceed-portfolio", position_verdict="ok",
         cluster_verdict="ok", reason="ok",
     )

@@ -854,6 +854,8 @@ def log_signal(
                 ind_obv=getattr(indicators, "obv", None),
                 ind_correlation=getattr(indicators, "correlation", None),
                 ind_concentration=getattr(indicators, "concentration", None),
+                risk_ok=getattr(risk, "ok", None),
+                risk_reason=getattr(risk, "reason", None),
                 risk_recommended_size=getattr(risk, "recommended_size", None),
                 risk_stop_distance=getattr(risk, "stop_distance", None),
                 risk_dollar_risk=getattr(risk, "dollar_risk", None),

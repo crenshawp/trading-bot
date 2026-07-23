@@ -30,11 +30,11 @@ def _make_signal(**overrides: Any) -> Signal:
 def test_init_db_is_idempotent(tmp_db: Path) -> None:
     db.init_db()  # tmp_db already called init_db once; second call must not error
     db.init_db()
-    assert db.schema_version() == 27
+    assert db.schema_version() == 28
 
 
 def test_schema_version_is_1_after_init(tmp_db: Path) -> None:
-    assert db.schema_version() == 27
+    assert db.schema_version() == 28
 
 
 # ---- signals ----
@@ -365,11 +365,64 @@ def test_get_recent_trade_indicators_newest_first_and_limit(tmp_db: Path) -> Non
 # ---- risk recommendation context (Phase 7) ----
 
 
+def test_risk_unknown_success_and_fail_soft_round_trip(tmp_db: Path) -> None:
+    successful_id = db.insert_signal(_make_signal(ticker="GOOGL"))
+    failed_id = db.insert_signal(_make_signal(ticker="META"))
+    db.insert_trade(Trade(
+        signal_id=successful_id,
+        opened_at=datetime(2026, 6, 1, 10, 0),
+        risk_ok=True,
+        risk_reason="ok",
+        risk_portfolio_verdict="unknown",
+        risk_position_verdict="unknown",
+        risk_cluster_verdict="unknown",
+    ))
+    db.insert_trade(Trade(
+        signal_id=failed_id,
+        opened_at=datetime(2026, 6, 1, 11, 0),
+        risk_ok=False,
+        risk_reason="size unavailable: missing/zero ATR",
+        risk_portfolio_verdict="unknown",
+        risk_position_verdict="unknown",
+        risk_cluster_verdict="unknown",
+    ))
+
+    successful = db.get_trade_by_signal_id(successful_id)
+    failed = db.get_trade_by_signal_id(failed_id)
+    assert successful is not None and failed is not None
+    assert successful.risk_ok is True and successful.risk_reason == "ok"
+    assert failed.risk_ok is False
+    assert failed.risk_reason == "size unavailable: missing/zero ATR"
+    recent = {row["ticker"]: row for row in db.get_recent_trade_risk()}
+    assert recent["GOOGL"]["risk_ok"] is True
+    assert recent["META"]["risk_ok"] is False
+    assert recent["META"]["risk_reason"] == "size unavailable: missing/zero ATR"
+
+
+def test_legacy_risk_context_keeps_unknown_provenance(tmp_db: Path) -> None:
+    signal_id = db.insert_signal(_make_signal())
+    db.insert_trade(Trade(
+        signal_id=signal_id,
+        opened_at=datetime(2026, 6, 1, 10, 0),
+        risk_portfolio_verdict="unknown",
+        risk_position_verdict="unknown",
+        risk_cluster_verdict="unknown",
+    ))
+
+    trade = db.get_trade_by_signal_id(signal_id)
+    assert trade is not None
+    assert trade.risk_ok is None and trade.risk_reason is None
+    rows = db.get_recent_trade_risk()
+    assert len(rows) == 1
+    assert rows[0]["risk_ok"] is None and rows[0]["risk_reason"] is None
+
+
 def test_get_recent_trade_risk_only_returns_assessed_rows(tmp_db: Path) -> None:
     # A risk-assessed (active stock) trade...
     sid = db.insert_signal(_make_signal(ticker="GOOGL"))
     db.insert_trade(Trade(
         signal_id=sid, opened_at=datetime(2026, 6, 1, 10, 0), outcome="win",
+        risk_ok=True, risk_reason="ok",
         risk_recommended_size=20.0, risk_pct=0.6, risk_position_pct=20.0,
         risk_capped=True, risk_total_pct=4.5, risk_portfolio_verdict="ok",
         risk_position_verdict="would-exceed-position",
@@ -387,6 +440,7 @@ def test_get_recent_trade_risk_only_returns_assessed_rows(tmp_db: Path) -> None:
     assert len(rows) == 1                       # NULL-verdict row excluded
     r = rows[0]
     assert r["ticker"] == "GOOGL"
+    assert r["risk_ok"] is True and r["risk_reason"] == "ok"
     assert r["risk_recommended_size"] == pytest.approx(20.0)
     assert r["risk_pct"] == pytest.approx(0.6)
     assert r["risk_capped"] is True

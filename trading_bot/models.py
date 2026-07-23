@@ -110,8 +110,11 @@ class Trade:
     ind_obv: float | None = None            # cumulative volume flow
     ind_correlation: float | None = None    # avg pairwise corr vs active set
     ind_concentration: str | None = None    # concentrated | moderate | diversified | unknown
-    # Phase 7 advisory risk recommendation, captured at fire time (NULL = not
-    # computed — shadow/crypto trades, or a fail-soft unavailable assessment).
+    # Phase 7 advisory risk recommendation, captured at fire time. ``risk_ok``
+    # is nullable: True = valid assessment, False = fail-soft failure, and
+    # None = legacy/not evaluated provenance.
+    risk_ok: bool | None = None
+    risk_reason: str | None = None
     risk_recommended_size: float | None = None  # units (shares/contracts)
     risk_stop_distance: float | None = None      # ATR * stop multiple
     risk_dollar_risk: float | None = None        # notional $ at risk

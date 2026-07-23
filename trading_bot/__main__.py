@@ -1196,16 +1196,24 @@ def cmd_risk_status(limit: int = 20) -> None:
         return format(value, spec) if isinstance(value, (int, float)) else "-"
 
     rows = db.get_recent_trade_risk(limit=limit)
-    print("RISK STATUS  (recent signals with advisory sizing + portfolio verdicts)")
-    print("-" * 112)
+    print("RISK STATUS  (recent advisory assessments)")
+    print("-" * 124)
     if not rows:
-        print("  (no risk-assessed signals yet)")
+        print("  (no risk assessment results yet)")
         return
     print(
-        f"  {'Opened':<20} {'Ticker':<7} {'Signal':<18} {'Size':>9} {'Risk%':>6}  "
+        f"  {'Opened':<20} {'Ticker':<7} {'Signal':<18} {'State':<9} "
+        f"{'Size':>9} {'Risk%':>6}  "
         f"{'Portfolio':<22} {'Position':<22} {'Cluster':<20} {'Outcome':<8}"
     )
     for r in rows:
+        ok = r["risk_ok"]
+        if ok is True:
+            state = "assessed"
+        elif ok is False:
+            state = "fail-soft"
+        else:
+            state = "unknown"
         size = r["risk_recommended_size"]
         size_txt = (
             f"{size:,.2f}" + ("*" if r["risk_capped"] else "")
@@ -1213,12 +1221,15 @@ def cmd_risk_status(limit: int = 20) -> None:
         )
         print(
             f"  {r['opened_at'][:19].replace('T', ' '):<20} {r['ticker']:<7} "
-            f"{r['signal_type']:<18} {size_txt:>9} {_n(r['risk_pct'], '.2f'):>6}  "
-            f"{r['risk_portfolio_verdict']:<22} "
+            f"{r['signal_type']:<18} {state:<9} {size_txt:>9} "
+            f"{_n(r['risk_pct'], '.2f'):>6}  "
+            f"{(r['risk_portfolio_verdict'] or '-'):<22} "
             f"{(r['risk_position_verdict'] or '-'):<22} "
             f"{(r['risk_cluster_verdict'] or '-'):<20} "
             f"{str(r['outcome'] or 'open'):<8}"
         )
+        reason = r["risk_reason"]
+        print(f"    Reason: {reason if reason is not None else '-'}")
     print("\n  * size capped at the per-position limit")
 
 
@@ -2385,7 +2396,7 @@ def main() -> None:
     risk_status_p = risk_sub.add_parser("status")
     risk_status_p.add_argument(
         "--limit", type=int, default=20,
-        help="How many recent risk-assessed signals to show (default 20)",
+        help="How many recent risk assessment results to show (default 20)",
     )
     risk_grades_p = risk_sub.add_parser("grades")
     risk_grades_p.add_argument(

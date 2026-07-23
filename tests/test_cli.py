@@ -22,13 +22,13 @@ def _run(argv: list[str]) -> None:
 def test_cli_db_init_prints_version(tmp_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _run(["db", "init"])
     out = capsys.readouterr().out
-    assert "Schema version: 27" in out
+    assert "Schema version: 28" in out
 
 
 def test_cli_db_status_shows_counts(tmp_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _run(["db", "status"])
     out = capsys.readouterr().out
-    assert "Schema version: 27" in out
+    assert "Schema version: 28" in out
     assert "signals" in out
     assert "trades" in out
     assert "daily_performance" in out
@@ -770,6 +770,7 @@ def test_cli_risk_status(
     rows = [{
         "ticker": "GOOGL", "signal_type": "ema21_pullback", "direction": "call",
         "opened_at": "2026-06-01T10:00:00", "outcome": "win", "track_mode": "active",
+        "risk_ok": True, "risk_reason": "ok",
         "risk_recommended_size": 20.0, "risk_pct": 0.6, "risk_position_pct": 20.0,
         "risk_capped": True, "risk_total_pct": 4.5,
         "risk_portfolio_verdict": "ok",
@@ -784,6 +785,39 @@ def test_cli_risk_status(
     assert "20.00*" in out                      # capped marker
     assert "0.60" in out                        # risk %
     assert "would-exceed-position" in out
+    assert "assessed" in out and "Reason: ok" in out
+
+
+def test_cli_risk_status_exposes_fail_soft_and_legacy_unknown(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    base = {
+        "signal_type": "ema21_pullback", "direction": "call", "outcome": "open",
+        "track_mode": "active", "risk_recommended_size": None, "risk_pct": None,
+        "risk_position_pct": None, "risk_capped": False, "risk_total_pct": None,
+        "risk_portfolio_verdict": "unknown", "risk_position_verdict": "unknown",
+        "risk_cluster_pct": None, "risk_cluster_verdict": "unknown",
+    }
+    rows = [
+        {
+            **base, "ticker": "META", "opened_at": "2026-06-01T11:00:00",
+            "risk_ok": False,
+            "risk_reason": "size unavailable: missing/zero ATR",
+        },
+        {
+            **base, "ticker": "GOOGL", "opened_at": "2026-06-01T10:00:00",
+            "risk_ok": None, "risk_reason": None,
+        },
+    ]
+    monkeypatch.setattr("trading_bot.db.get_recent_trade_risk", lambda **_kw: rows)
+
+    _run(["risk", "status"])
+
+    out = capsys.readouterr().out
+    assert "fail-soft" in out and "size unavailable: missing/zero ATR" in out
+    assert "unknown" in out and "GOOGL" in out
 
 
 def test_cli_risk_status_empty(
@@ -793,7 +827,7 @@ def test_cli_risk_status_empty(
 ) -> None:
     monkeypatch.setattr("trading_bot.db.get_recent_trade_risk", lambda **_kw: [])
     _run(["risk", "status"])
-    assert "no risk-assessed signals yet" in capsys.readouterr().out
+    assert "no risk assessment results yet" in capsys.readouterr().out
 
 
 def test_cli_risk_grades_surfaces_full_persisted_values(

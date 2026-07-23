@@ -183,7 +183,7 @@ def test_v25_sentiment_migration_preserves_pending_order_and_legacy_trade(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 27
+    assert db.schema_version() == 28
     assert db.get_pending_order("broker-order-1") == pending_before
     assert pending_before is not None and pending_before.id == pending_id
     legacy = db.get_trade_by_signal_id(signal_id)
@@ -224,13 +224,56 @@ def test_v26_indicator_migration_preserves_pending_order_and_legacy_trade(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 27
+    assert db.schema_version() == 28
     assert db.get_pending_order("broker-order-1") == pending_before
     assert pending_before is not None and pending_before.id == pending_id
     legacy = db.get_trade_by_signal_id(signal_id)
     assert legacy is not None and legacy.id == trade_id
     assert legacy.ind_vol_regime == "unknown"
     assert legacy.ind_ok is None
+
+
+def test_v27_risk_migration_preserves_pending_order_and_legacy_trade(
+    tmp_db: Path,
+) -> None:
+    pending_id = db.insert_pending_order(_pending_order())
+    pending_before = db.get_pending_order("broker-order-1")
+    signal_id = db.insert_signal(Signal(
+        timestamp=datetime(2026, 7, 20, 9, 31),
+        ticker="GOOGL",
+        asset_class="stock",
+        signal_type="ema21_pullback",
+        direction="call",
+        entry_price=180.0,
+    ))
+    trade_id = db.insert_trade(Trade(
+        signal_id=signal_id,
+        opened_at=datetime(2026, 7, 20, 9, 31),
+        risk_portfolio_verdict="unknown",
+        risk_position_verdict="unknown",
+        risk_cluster_verdict="unknown",
+    ))
+
+    conn = db.get_connection()
+    try:
+        conn.execute("ALTER TABLE trades DROP COLUMN risk_ok")
+        conn.execute("ALTER TABLE trades DROP COLUMN risk_reason")
+        conn.execute("UPDATE schema_version SET version = 27")
+        conn.commit()
+    finally:
+        conn.close()
+
+    db.init_db()
+    db.init_db()
+
+    assert db.schema_version() == 28
+    assert db.get_pending_order("broker-order-1") == pending_before
+    assert pending_before is not None and pending_before.id == pending_id
+    legacy = db.get_trade_by_signal_id(signal_id)
+    assert legacy is not None and legacy.id == trade_id
+    assert legacy.risk_portfolio_verdict == "unknown"
+    assert legacy.risk_ok is None
+    assert legacy.risk_reason is None
 
 
 def test_option_pending_order_round_trip_preserves_full_intent(tmp_db: Path) -> None:
@@ -801,7 +844,7 @@ def test_v23_database_migrates_without_rewriting_existing_rows(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 27
+    assert db.schema_version() == 28
     migrated = db.get_connection()
     try:
         sentinel = migrated.execute(
@@ -967,7 +1010,7 @@ def test_v24_pending_order_rows_migrate_collision_free_and_preserve_data(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 27
+    assert db.schema_version() == 28
     first = db.get_pending_order("legacy-bound-7")
     second = db.get_pending_order("legacy-bound-11")
     assert first is not None and second is not None

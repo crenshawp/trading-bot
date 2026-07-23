@@ -277,6 +277,8 @@ def _bucket_concentration(row: Mapping[str, Any]) -> str | None:
 
 
 def _bucket_portfolio_verdict(row: Mapping[str, Any]) -> str | None:
+    if row.get("risk_ok") is not True:
+        return None
     return _bucket_label(
         row, "risk_portfolio_verdict", {"ok", "would-exceed-portfolio"}
     )

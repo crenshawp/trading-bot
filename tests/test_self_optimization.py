@@ -144,6 +144,24 @@ def test_resolved_context_rows_carry_indicator_status(tmp_db: Path) -> None:
     assert rows["META"]["ind_ok"] is False
 
 
+def test_resolved_context_rows_carry_risk_provenance(tmp_db: Path) -> None:
+    _seed_resolved(
+        tmp_db, ticker="GOOGL", risk_ok=True, risk_reason="ok",
+        risk_portfolio_verdict="unknown",
+    )
+    _seed_resolved(
+        tmp_db, ticker="META", risk_ok=False,
+        risk_reason="size unavailable: missing/zero ATR",
+        risk_portfolio_verdict="unknown",
+    )
+
+    rows = {row["ticker"]: row for row in so.resolved_context_rows()}
+    assert rows["GOOGL"]["risk_ok"] is True
+    assert rows["GOOGL"]["risk_reason"] == "ok"
+    assert rows["META"]["risk_ok"] is False
+    assert rows["META"]["risk_reason"] == "size unavailable: missing/zero ATR"
+
+
 # ───────────────────────── degradation detection ────────────────────────────────
 
 
@@ -260,7 +278,7 @@ def _frow(**kw: object) -> dict[str, object]:
         "sentiment_label": None, "sentiment_ok": True,
         "ind_ok": True, "ind_vol_regime": None, "ind_rsi": None,
         "ind_adx": None, "ind_obv": None, "ind_concentration": None,
-        "risk_portfolio_verdict": None,
+        "risk_ok": True, "risk_portfolio_verdict": None,
     }
     base.update(kw)
     return base
@@ -373,6 +391,20 @@ def test_concentration_and_verdict_buckets_skip_unknown() -> None:
     verd = {b.label for b in _feature(evals, "portfolio_verdict").buckets}
     assert conc == {"concentrated", "diversified"}          # 'unknown' skipped
     assert verd == {"ok", "would-exceed-portfolio"}
+
+
+def test_portfolio_verdict_excludes_failed_and_legacy_assessments() -> None:
+    rows = [
+        _frow(risk_ok=True, risk_portfolio_verdict="ok"),
+        _frow(risk_ok=False, risk_portfolio_verdict="would-exceed-portfolio"),
+        _frow(risk_ok=None, risk_portfolio_verdict="would-exceed-portfolio"),
+    ]
+
+    verdict = _feature(
+        so.compute_feature_evaluations(rows, min_sample=1), "portfolio_verdict",
+    )
+
+    assert [(bucket.label, bucket.n) for bucket in verdict.buckets] == [("ok", 1)]
 
 
 def test_feature_under_min_sample_is_not_actionable() -> None:

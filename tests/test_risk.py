@@ -207,3 +207,37 @@ def test_portfolio_outer_guard_on_malformed_input(
     res = risk.portfolio_risk(_cand(), "moderate", object())  # type: ignore[arg-type]
     assert res.portfolio_verdict == "unknown"
     assert "portfolio verdicts failed" in capsys.readouterr().err
+
+
+# ───────────────────────── assessment provenance ─────────────────────────
+
+
+def test_assess_adverse_verdict_is_still_successful_computation() -> None:
+    assessment = risk.assess(
+        entry=100.0,
+        atr=2.0,
+        concentration="moderate",
+        open_positions=[risk.OpenPosition(6.0, "moderate")],
+    )
+
+    assert assessment.ok is True
+    assert assessment.reason == "ok"
+    assert assessment.recommended_size == pytest.approx(20.0)
+    assert assessment.risk_pct == pytest.approx(0.6)
+    assert assessment.portfolio_verdict == "would-exceed-portfolio"
+    assert assessment.position_verdict == "would-exceed-position"
+
+
+def test_assess_unknown_verdict_distinguishes_success_from_fail_soft() -> None:
+    successful = risk.assess(
+        entry=100.0, atr=2.0, concentration="unknown", open_positions=[],
+    )
+    failed = risk.assess(
+        entry=100.0, atr=None, concentration="unknown", open_positions=[],
+    )
+
+    assert successful.cluster_verdict == "unknown"
+    assert successful.ok is True and successful.reason == "ok"
+    assert failed.portfolio_verdict == "unknown"
+    assert failed.ok is False
+    assert "size unavailable" in failed.reason

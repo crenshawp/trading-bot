@@ -297,7 +297,9 @@ class RiskAssessment:
     """Flat sizing + portfolio bundle snapshotted for one fired signal.
 
     Combines :class:`SizeRecommendation` and :class:`PortfolioRisk` into one
-    object the scanner persists on the trade row. Advisory only.
+    object the scanner persists on the trade row. ``ok`` means the assessment
+    completed with usable inputs; adverse advisory verdicts do not make the
+    computation itself a failure. Advisory only.
     """
 
     recommended_size: float | None = None
@@ -352,6 +354,8 @@ def assess(
         position_verdict=pf.position_verdict,
         cluster_risk_pct=pf.cluster_risk_pct,
         cluster_verdict=pf.cluster_verdict,
-        ok=size.ok and pf.ok,
+        # ``ok`` records computation success, not whether the advisory verdicts
+        # approve the candidate. A valid would-exceed-* result is still valid.
+        ok=size.ok and pf.reason == "ok",
         reason=size.reason if not size.ok else pf.reason,
     )
