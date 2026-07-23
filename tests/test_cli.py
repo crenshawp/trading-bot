@@ -22,13 +22,13 @@ def _run(argv: list[str]) -> None:
 def test_cli_db_init_prints_version(tmp_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _run(["db", "init"])
     out = capsys.readouterr().out
-    assert "Schema version: 25" in out
+    assert "Schema version: 26" in out
 
 
 def test_cli_db_status_shows_counts(tmp_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _run(["db", "status"])
     out = capsys.readouterr().out
-    assert "Schema version: 25" in out
+    assert "Schema version: 26" in out
     assert "signals" in out
     assert "trades" in out
     assert "daily_performance" in out
@@ -609,6 +609,7 @@ def test_cli_sentiment_status(
         "ticker": "GOOGL", "signal_type": "ema21_pullback", "direction": "call",
         "opened_at": "2026-06-01T10:00:00", "outcome": "win", "track_mode": "active",
         "sentiment_score": 0.6, "sentiment_label": "bullish",
+        "sentiment_ok": True, "sentiment_rationale": "Strong earnings beat.",
         "heavy_news": True, "headline_count": 9,
     }]
     monkeypatch.setattr(
@@ -620,6 +621,39 @@ def test_cli_sentiment_status(
     assert "GOOGL" in out
     assert "bullish" in out
     assert "+0.60" in out
+    assert "scored" in out
+    assert "Strong earnings beat." in out
+
+
+def test_cli_sentiment_status_exposes_fail_soft_and_unknown(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    base = {
+        "signal_type": "ema21_pullback", "direction": "call",
+        "outcome": "open", "track_mode": "active", "sentiment_score": 0.0,
+        "sentiment_label": "neutral", "heavy_news": False, "headline_count": 0,
+    }
+    rows = [
+        {
+            **base, "ticker": "META", "opened_at": "2026-06-01T11:00:00",
+            "sentiment_ok": False, "sentiment_rationale": "no news data",
+        },
+        {
+            **base, "ticker": "GOOGL", "opened_at": "2026-06-01T10:00:00",
+            "sentiment_ok": None, "sentiment_rationale": None,
+        },
+    ]
+    monkeypatch.setattr(
+        "trading_bot.db.get_recent_trade_sentiment", lambda **_kw: rows,
+    )
+
+    _run(["sentiment", "status"])
+
+    out = capsys.readouterr().out
+    assert "fail-soft" in out and "no news data" in out
+    assert "unknown" in out and "GOOGL" in out
 
 
 def test_cli_sentiment_status_empty(
@@ -631,7 +665,7 @@ def test_cli_sentiment_status_empty(
         "trading_bot.db.get_recent_trade_sentiment", lambda **_kw: [],
     )
     _run(["sentiment", "status"])
-    assert "no sentiment-scored signals yet" in capsys.readouterr().out
+    assert "no sentiment results yet" in capsys.readouterr().out
 
 
 # ───────────────────── Phase 6 indicators subcommand ─────────────────────

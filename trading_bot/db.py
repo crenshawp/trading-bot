@@ -59,6 +59,7 @@ from trading_bot.models import (
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
+# Version 26 (cross-cutting audit) — persists sentiment success + rationale.
 # Version 25 (cross-cutting audit) — adds pre-submit pending-order identity.
 # Version 24 (cross-cutting audit) — adds the durable pending_orders ledger.
 # Version 23 (Phase 24) — signals earnings/news risk store full text grades.
@@ -75,7 +76,7 @@ from trading_bot.models import (
 # Version 13 (Phase 6) — adds trades.ind_* advisory indicator-family columns.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -1127,6 +1128,25 @@ def _migrate_to_v25(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_to_v26(conn: sqlite3.Connection) -> None:
+    """Persist advisory sentiment provenance without rewriting legacy rows.
+
+    Both columns are nullable by design. Existing sentiment labels cannot tell
+    us whether neutral was a real score or a fail-soft fallback, so migration
+    leaves their provenance unknown rather than inventing success or failure.
+    """
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(trades)")
+    }
+    if "sentiment_ok" not in columns:
+        conn.execute(
+            "ALTER TABLE trades ADD COLUMN sentiment_ok INTEGER "
+            "CHECK (sentiment_ok IN (0,1))"
+        )
+    if "sentiment_rationale" not in columns:
+        conn.execute("ALTER TABLE trades ADD COLUMN sentiment_rationale TEXT")
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -1156,6 +1176,7 @@ def init_db() -> None:
         _migrate_to_v23(conn)
         _migrate_to_v24(conn)
         _migrate_to_v25(conn)
+        _migrate_to_v26(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -1376,14 +1397,15 @@ def insert_trade(trade: Trade) -> int:
             signal_id, opened_at, closed_at, exit_price,
             outcome, pnl_pct, pnl_dollars, notes, market_regime,
             vix_level, vix_band, context_score, track_mode,
-            sentiment_score, sentiment_label, heavy_news, headline_count,
+            sentiment_score, sentiment_label, sentiment_ok,
+            sentiment_rationale, heavy_news, headline_count,
             ind_atr, ind_realized_vol, ind_vol_regime, ind_rsi, ind_adx,
             ind_obv, ind_correlation, ind_concentration,
             risk_recommended_size, risk_stop_distance, risk_dollar_risk,
             risk_pct, risk_position_pct, risk_capped, risk_total_pct,
             risk_portfolio_verdict, risk_position_verdict, risk_cluster_pct,
             risk_cluster_verdict
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                   ?, ?, ?, ?, ?, ?, ?, ?,
                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
@@ -1403,6 +1425,8 @@ def insert_trade(trade: Trade) -> int:
         trade.track_mode,
         trade.sentiment_score,
         trade.sentiment_label,
+        int(trade.sentiment_ok) if trade.sentiment_ok is not None else None,
+        trade.sentiment_rationale,
         int(trade.heavy_news),
         trade.headline_count,
         trade.ind_atr,
@@ -1517,6 +1541,14 @@ def _row_to_trade(row: sqlite3.Row) -> Trade:
         track_mode=row["track_mode"] if "track_mode" in keys else "active",
         sentiment_score=row["sentiment_score"] if "sentiment_score" in keys else None,
         sentiment_label=row["sentiment_label"] if "sentiment_label" in keys else None,
+        sentiment_ok=(
+            bool(row["sentiment_ok"])
+            if "sentiment_ok" in keys and row["sentiment_ok"] is not None
+            else None
+        ),
+        sentiment_rationale=(
+            row["sentiment_rationale"] if "sentiment_rationale" in keys else None
+        ),
         heavy_news=bool(row["heavy_news"]) if "heavy_news" in keys else False,
         headline_count=row["headline_count"] if "headline_count" in keys else None,
         ind_atr=row["ind_atr"] if "ind_atr" in keys else None,
@@ -2453,10 +2485,9 @@ def get_signal_pair_transitions(limit: int = 100) -> list[dict[str, Any]]:
 def get_recent_trade_sentiment(limit: int = 20) -> list[dict[str, Any]]:
     """Recent fired signals that carry advisory sentiment context (Phase 5).
 
-    Joins trades -> signals, newest first, restricted to trades that were
-    sentiment-scored (``sentiment_label`` populated — i.e. the active alerting
-    signals). Each row carries the signal identity, the sentiment fields, and
-    the eventual outcome so sentiment sits next to results.
+    Joins trades -> signals, newest first, including explicit success/failure
+    and legacy labels whose provenance is unknown. Each row carries the signal
+    identity, sentiment rationale, and eventual outcome beside the result.
     """
     sql = (
         "SELECT signals.ticker AS ticker, "
@@ -2467,10 +2498,13 @@ def get_recent_trade_sentiment(limit: int = 20) -> list[dict[str, Any]]:
         "       trades.track_mode AS track_mode, "
         "       trades.sentiment_score AS sentiment_score, "
         "       trades.sentiment_label AS sentiment_label, "
+        "       trades.sentiment_ok AS sentiment_ok, "
+        "       trades.sentiment_rationale AS sentiment_rationale, "
         "       trades.heavy_news AS heavy_news, "
         "       trades.headline_count AS headline_count "
         "FROM trades JOIN signals ON signals.id = trades.signal_id "
-        "WHERE trades.sentiment_label IS NOT NULL "
+        "WHERE trades.sentiment_ok IS NOT NULL "
+        "   OR trades.sentiment_label IS NOT NULL "
         "ORDER BY trades.opened_at DESC LIMIT ?"
     )
     conn = get_connection()
@@ -2487,7 +2521,13 @@ def get_recent_trade_sentiment(limit: int = 20) -> list[dict[str, Any]]:
             "outcome": r["outcome"],
             "track_mode": str(r["track_mode"]),
             "sentiment_score": r["sentiment_score"],
-            "sentiment_label": str(r["sentiment_label"]),
+            "sentiment_label": r["sentiment_label"],
+            "sentiment_ok": (
+                bool(r["sentiment_ok"])
+                if r["sentiment_ok"] is not None
+                else None
+            ),
+            "sentiment_rationale": r["sentiment_rationale"],
             "heavy_news": bool(r["heavy_news"]),
             "headline_count": r["headline_count"],
         }
@@ -2812,6 +2852,8 @@ def get_resolved_context_outcomes(
         "       trades.closed_at AS closed_at, "
         "       signals.ticker AS ticker, signals.signal_type AS signal_type, "
         "       trades.sentiment_label AS sentiment_label, "
+        "       trades.sentiment_ok AS sentiment_ok, "
+        "       trades.sentiment_rationale AS sentiment_rationale, "
         "       trades.ind_vol_regime AS ind_vol_regime, "
         "       trades.ind_rsi AS ind_rsi, trades.ind_adx AS ind_adx, "
         "       trades.ind_obv AS ind_obv, "
@@ -2837,6 +2879,12 @@ def get_resolved_context_outcomes(
             "ticker": str(r["ticker"]),
             "signal_type": str(r["signal_type"]),
             "sentiment_label": r["sentiment_label"],
+            "sentiment_ok": (
+                bool(r["sentiment_ok"])
+                if r["sentiment_ok"] is not None
+                else None
+            ),
+            "sentiment_rationale": r["sentiment_rationale"],
             "ind_vol_regime": r["ind_vol_regime"],
             "ind_rsi": r["ind_rsi"],
             "ind_adx": r["ind_adx"],

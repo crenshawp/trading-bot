@@ -30,11 +30,11 @@ def _make_signal(**overrides: Any) -> Signal:
 def test_init_db_is_idempotent(tmp_db: Path) -> None:
     db.init_db()  # tmp_db already called init_db once; second call must not error
     db.init_db()
-    assert db.schema_version() == 25
+    assert db.schema_version() == 26
 
 
 def test_schema_version_is_1_after_init(tmp_db: Path) -> None:
-    assert db.schema_version() == 25
+    assert db.schema_version() == 26
 
 
 # ---- signals ----
@@ -203,6 +203,63 @@ def test_get_table_counts_zero_on_fresh_db(tmp_db: Path) -> None:
         "equity_snapshots": 0, "plan_executions": 0,
         "pending_orders": 0,
     }
+
+
+# ---- sentiment provenance (cross-cutting audit) ----
+
+
+def test_sentiment_neutral_success_and_fail_soft_round_trip(tmp_db: Path) -> None:
+    successful_id = db.insert_signal(_make_signal(ticker="GOOGL"))
+    failed_id = db.insert_signal(_make_signal(ticker="META"))
+    db.insert_trade(Trade(
+        signal_id=successful_id,
+        opened_at=datetime(2026, 6, 1, 10, 0),
+        sentiment_score=0.0,
+        sentiment_label="neutral",
+        sentiment_ok=True,
+        sentiment_rationale="Mixed headlines balanced out.",
+    ))
+    db.insert_trade(Trade(
+        signal_id=failed_id,
+        opened_at=datetime(2026, 6, 1, 11, 0),
+        sentiment_score=0.0,
+        sentiment_label="neutral",
+        sentiment_ok=False,
+        sentiment_rationale="no news data",
+    ))
+
+    successful = db.get_trade_by_signal_id(successful_id)
+    failed = db.get_trade_by_signal_id(failed_id)
+    assert successful is not None and failed is not None
+    assert successful.sentiment_ok is True
+    assert successful.sentiment_rationale == "Mixed headlines balanced out."
+    assert failed.sentiment_ok is False
+    assert failed.sentiment_rationale == "no news data"
+
+    recent = {row["ticker"]: row for row in db.get_recent_trade_sentiment()}
+    assert recent["GOOGL"]["sentiment_ok"] is True
+    assert recent["GOOGL"]["sentiment_rationale"] == "Mixed headlines balanced out."
+    assert recent["META"]["sentiment_ok"] is False
+    assert recent["META"]["sentiment_rationale"] == "no news data"
+
+
+def test_legacy_sentiment_label_keeps_unknown_provenance(tmp_db: Path) -> None:
+    signal_id = db.insert_signal(_make_signal())
+    db.insert_trade(Trade(
+        signal_id=signal_id,
+        opened_at=datetime(2026, 6, 1, 10, 0),
+        sentiment_score=0.0,
+        sentiment_label="neutral",
+    ))
+
+    trade = db.get_trade_by_signal_id(signal_id)
+    assert trade is not None
+    assert trade.sentiment_ok is None
+    assert trade.sentiment_rationale is None
+    rows = db.get_recent_trade_sentiment()
+    assert len(rows) == 1
+    assert rows[0]["sentiment_ok"] is None
+    assert rows[0]["sentiment_rationale"] is None
 
 
 def test_schema_version_returns_zero_on_uninitialized_db(

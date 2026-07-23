@@ -251,6 +251,10 @@ def _bucket_label(row: Mapping[str, Any], column: str, allowed: set[str]) -> str
 
 
 def _bucket_sentiment(row: Mapping[str, Any]) -> str | None:
+    # Neutral is meaningful only when it came from a successful LLM score.
+    # Fail-soft neutral and provenance-unknown legacy rows are not evidence.
+    if row.get("sentiment_ok") is not True:
+        return None
     return _bucket_label(row, "sentiment_label", {"bearish", "neutral", "bullish"})
 
 

@@ -1101,28 +1101,39 @@ def cmd_pairs_status() -> None:
 def cmd_sentiment_status(limit: int = 20) -> None:
     """Recent fired signals with their advisory sentiment context."""
     rows = db.get_recent_trade_sentiment(limit=limit)
-    print("SENTIMENT STATUS  (recent scored signals)")
-    print("-" * 86)
+    print("SENTIMENT STATUS  (recent advisory results)")
+    print("-" * 100)
     if not rows:
-        print("  (no sentiment-scored signals yet)")
+        print("  (no sentiment results yet)")
         return
     print(
-        f"  {'Opened':<20} {'Ticker':<8} {'Signal':<20} {'Score':>6}  "
+        f"  {'Opened':<20} {'Ticker':<8} {'Signal':<20} {'State':<9} {'Score':>6}  "
         f"{'Label':<8} {'News':>4}  {'Heavy':<5} {'Outcome':<8}"
     )
     for r in rows:
+        ok = r["sentiment_ok"]
+        if ok is True:
+            state = "scored"
+        elif ok is False:
+            state = "fail-soft"
+        else:
+            state = "unknown"
         score = r["sentiment_score"]
         score_txt = (
             f"{score:+.2f}" if isinstance(score, (int, float)) else "   -"
         )
+        label = r["sentiment_label"]
+        label_txt = label if isinstance(label, str) else "-"
         opened = r["opened_at"][:19].replace("T", " ")
         headlines = r["headline_count"] if r["headline_count"] is not None else "-"
         print(
             f"  {opened:<20} {r['ticker']:<8} {r['signal_type']:<20} "
-            f"{score_txt:>6}  {r['sentiment_label']:<8} {str(headlines):>4}  "
+            f"{state:<9} {score_txt:>6}  {label_txt:<8} {str(headlines):>4}  "
             f"{('yes' if r['heavy_news'] else 'no'):<5} "
             f"{str(r['outcome'] or 'open'):<8}"
         )
+        rationale = r["sentiment_rationale"]
+        print(f"    Rationale: {rationale if rationale is not None else '-'}")
 
 
 # ---- indicators CLI (Phase 6) ----

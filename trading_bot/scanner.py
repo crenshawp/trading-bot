@@ -841,6 +841,8 @@ def log_signal(
                 track_mode=track_mode,
                 sentiment_score=getattr(sentiment, "score", None),
                 sentiment_label=getattr(sentiment, "label", None),
+                sentiment_ok=getattr(sentiment, "ok", None),
+                sentiment_rationale=getattr(sentiment, "rationale", None),
                 heavy_news=bool(getattr(sentiment, "heavy_news", False)),
                 headline_count=getattr(sentiment, "headline_count", None),
                 ind_atr=getattr(indicators, "atr", None),

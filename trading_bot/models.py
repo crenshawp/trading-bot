@@ -89,9 +89,13 @@ class Trade:
     vix_band: str | None = None       # "low" | "elevated" | "high" | "extreme" | "unknown"
     context_score: int | None = None  # 0-5 composite (Phase 2.3); NULL = un-backfilled
     track_mode: str = "active"        # "active" | "shadow" (Phase 3.1-LIVE)
-    # Phase 5 advisory sentiment, captured at fire time (NULL = not scored).
+    # Phase 5 advisory sentiment, captured at fire time. ``sentiment_ok`` is
+    # deliberately nullable: True = a genuine LLM result, False = fail-soft
+    # neutral, and None = legacy/not evaluated provenance.
     sentiment_score: float | None = None   # -1.0..+1.0
     sentiment_label: str | None = None      # bullish | neutral | bearish
+    sentiment_ok: bool | None = None
+    sentiment_rationale: str | None = None
     heavy_news: bool = False                # headline volume above threshold
     headline_count: int | None = None       # headlines the score was based on
     # Phase 6 advisory indicator families, captured at fire time (NULL = not

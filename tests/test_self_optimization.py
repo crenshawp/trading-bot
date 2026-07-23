@@ -108,6 +108,29 @@ def test_resolved_context_rows_window_filters_by_closed_at(tmp_db: Path) -> None
     assert {r["ticker"] for r in rows} == {"NEW"}
 
 
+def test_resolved_context_rows_carry_sentiment_provenance(tmp_db: Path) -> None:
+    _seed_resolved(
+        tmp_db,
+        ticker="GOOGL",
+        sentiment_label="neutral",
+        sentiment_ok=True,
+        sentiment_rationale="Balanced coverage.",
+    )
+    _seed_resolved(
+        tmp_db,
+        ticker="META",
+        sentiment_label="neutral",
+        sentiment_ok=False,
+        sentiment_rationale="no news data",
+    )
+
+    rows = {row["ticker"]: row for row in so.resolved_context_rows()}
+    assert rows["GOOGL"]["sentiment_ok"] is True
+    assert rows["GOOGL"]["sentiment_rationale"] == "Balanced coverage."
+    assert rows["META"]["sentiment_ok"] is False
+    assert rows["META"]["sentiment_rationale"] == "no news data"
+
+
 # ───────────────────────── degradation detection ────────────────────────────────
 
 
@@ -221,7 +244,8 @@ def test_detect_degradation_splits_recent_and_baseline_windows(tmp_db: Path) -> 
 def _frow(**kw: object) -> dict[str, object]:
     base: dict[str, object] = {
         "outcome": "win", "pnl_pct": 1.0, "signal_type": "s", "ticker": "T",
-        "sentiment_label": None, "ind_vol_regime": None, "ind_rsi": None,
+        "sentiment_label": None, "sentiment_ok": True,
+        "ind_vol_regime": None, "ind_rsi": None,
         "ind_adx": None, "ind_obv": None, "ind_concentration": None,
         "risk_portfolio_verdict": None,
     }
@@ -258,6 +282,18 @@ def test_sentiment_buckets_hand_computed() -> None:
     assert buckets["bullish"].expectancy == pytest.approx(1.0)        # mean(2,2,-1)
     assert sent.actionable is True                       # both buckets n>=3
     assert "bullish 67% (n=3) vs bearish 33% (n=3)" in sent.note
+
+
+def test_sentiment_buckets_exclude_fail_soft_and_unknown_neutral() -> None:
+    rows = [
+        _frow(sentiment_label="neutral", sentiment_ok=True),
+        _frow(sentiment_label="neutral", sentiment_ok=False),
+        _frow(sentiment_label="neutral", sentiment_ok=None),
+    ]
+
+    sent = _feature(so.compute_feature_evaluations(rows, min_sample=1), "sentiment")
+
+    assert [(bucket.label, bucket.n) for bucket in sent.buckets] == [("neutral", 1)]
 
 
 def test_rsi_bands_assign_correctly_incl_boundaries() -> None:
@@ -337,9 +373,9 @@ def test_multiple_comparisons_small_sample_makes_all_features_not_actionable() -
 
 def test_evaluate_features_reads_from_db(tmp_db: Path) -> None:
     _seed_resolved(tmp_db, ticker="GOOGL", outcome="win", pnl=2.0,
-                   sentiment_label="bullish")
+                   sentiment_label="bullish", sentiment_ok=True)
     _seed_resolved(tmp_db, ticker="META", outcome="loss", pnl=-1.0,
-                   sentiment_label="bearish")
+                   sentiment_label="bearish", sentiment_ok=True)
     sent = _feature(so.evaluate_features(), "sentiment")
     assert {b.label for b in sent.buckets} == {"bullish", "bearish"}
 
@@ -387,7 +423,8 @@ def test_render_report_handles_empty_findings() -> None:
 
 def test_run_optimization_builds_payload_from_db(tmp_db: Path) -> None:
     _seed_resolved(tmp_db, ticker="GOOGL", outcome="win", pnl=2.0,
-                   sentiment_label="bullish", closed_at=datetime(2026, 6, 20, 16, 0))
+                   sentiment_label="bullish", sentiment_ok=True,
+                   closed_at=datetime(2026, 6, 20, 16, 0))
     payload = so.run_optimization(
         now=datetime(2026, 7, 1), degrade_window_days=30, baseline_window_days=90,
     )

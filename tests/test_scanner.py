@@ -1060,13 +1060,16 @@ def test_sentiment_persisted_on_trade_row(
     conn = db.get_connection()
     try:
         row = conn.execute(
-            "SELECT sentiment_score, sentiment_label, heavy_news, headline_count "
+            "SELECT sentiment_score, sentiment_label, sentiment_ok, "
+            "sentiment_rationale, heavy_news, headline_count "
             "FROM trades"
         ).fetchone()
     finally:
         conn.close()
     assert row["sentiment_score"] == pytest.approx(0.6)
     assert row["sentiment_label"] == "bullish"
+    assert row["sentiment_ok"] == 1
+    assert row["sentiment_rationale"] == "Beat."
     assert row["heavy_news"] == 1
     assert row["headline_count"] == 9
 
