@@ -36,14 +36,16 @@ positions".
 
 from __future__ import annotations
 
+import re
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 from trading_bot import db
 from trading_bot.broker.base import Broker
 
 _QTY_TOLERANCE = 1e-9
+_ALPACA_CRYPTO_SYMBOL_RE = re.compile(r"^(?P<base>[A-Z0-9]+)/USD$")
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,51 @@ def _qty_equal(a: float, b: float) -> bool:
     return abs(a - b) <= _QTY_TOLERANCE
 
 
+def _comparison_symbol(symbol: str) -> str:
+    """Return the existing internal form for exact Alpaca crypto wire symbols.
+
+    This adapter is deliberately local to reconciliation. It is not a general
+    symbol canonicalizer and leaves stocks, dual-class shares, OCC options, and
+    non-exact spellings unchanged.
+    """
+    match = _ALPACA_CRYPTO_SYMBOL_RE.match(symbol)
+    if match is None:
+        return symbol
+    return f"{match.group('base')}-USD"
+
+
+def _normalized_internal_positions(
+    positions: Mapping[str, float | None],
+) -> dict[str, float | None]:
+    """Normalize internal keys and merge aliases without inventing quantity.
+
+    Numeric aliases sum. If any alias has unknown quantity, the collapsed
+    quantity remains unknown so presence-only reconciliation semantics survive.
+    """
+    normalized: dict[str, float | None] = {}
+    for symbol, qty in positions.items():
+        key = _comparison_symbol(symbol)
+        if key not in normalized:
+            normalized[key] = qty
+            continue
+        current = normalized[key]
+        normalized[key] = (
+            None if current is None or qty is None else current + qty
+        )
+    return normalized
+
+
+def _normalized_broker_positions(
+    positions: Iterable[tuple[str, float]],
+) -> dict[str, float]:
+    """Normalize broker keys and sum every exact/alias collision safely."""
+    normalized: dict[str, float] = {}
+    for symbol, qty in positions:
+        key = _comparison_symbol(symbol)
+        normalized[key] = normalized.get(key, 0.0) + qty
+    return normalized
+
+
 def compare_positions(
     internal: Mapping[str, float | None], broker: Mapping[str, float],
 ) -> list[Divergence]:
@@ -86,27 +133,29 @@ def compare_positions(
     ``internal`` values may be ``None`` (presence known, quantity not) — in that
     case only presence is reconciled, never quantity.
     """
+    normalized_internal = _normalized_internal_positions(internal)
+    normalized_broker = _normalized_broker_positions(broker.items())
     divergences: list[Divergence] = []
-    for symbol in sorted(internal):
-        iqty = internal[symbol]
-        if symbol not in broker:
+    for symbol in sorted(normalized_internal):
+        iqty = normalized_internal[symbol]
+        if symbol not in normalized_broker:
             divergences.append(Divergence(
                 "internal_only", symbol,
                 "internal open trade but the broker holds no position",
                 internal_qty=iqty, broker_qty=None,
             ))
-        elif iqty is not None and not _qty_equal(iqty, broker[symbol]):
+        elif iqty is not None and not _qty_equal(iqty, normalized_broker[symbol]):
             divergences.append(Divergence(
                 "qty_mismatch", symbol,
-                f"internal qty {iqty} != broker qty {broker[symbol]}",
-                internal_qty=iqty, broker_qty=broker[symbol],
+                f"internal qty {iqty} != broker qty {normalized_broker[symbol]}",
+                internal_qty=iqty, broker_qty=normalized_broker[symbol],
             ))
-    for symbol in sorted(broker):
-        if symbol not in internal:
+    for symbol in sorted(normalized_broker):
+        if symbol not in normalized_internal:
             divergences.append(Divergence(
                 "broker_only", symbol,
                 "broker holds a position the bot does not track",
-                internal_qty=None, broker_qty=broker[symbol],
+                internal_qty=None, broker_qty=normalized_broker[symbol],
             ))
     return divergences
 
@@ -163,8 +212,10 @@ def reconcile(broker_client: Broker) -> ReconciliationReport:
             note=positions.reason,
         )
 
-    broker_map: dict[str, float] = {p.symbol: p.qty for p in positions.positions}
-    internal_map = internal_open_positions()
+    broker_map = _normalized_broker_positions(
+        (position.symbol, position.qty) for position in positions.positions
+    )
+    internal_map = _normalized_internal_positions(internal_open_positions())
     divergences = compare_positions(internal_map, broker_map)
 
     # Open broker orders are surfaced as context (a resting order is not a

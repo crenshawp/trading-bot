@@ -971,6 +971,59 @@ def test_compare_positions_clean_when_aligned() -> None:
 # ───────────────────────── reconciliation (broker-authoritative) ─────────────
 
 
+def test_compare_positions_aligns_internal_and_alpaca_crypto_symbols() -> None:
+    assert broker.compare_positions({"BTC-USD": 0.05}, {"BTC/USD": 0.05}) == []
+
+
+def test_compare_positions_reports_normalized_crypto_quantity_mismatch() -> None:
+    divergences = broker.compare_positions(
+        {"BTC-USD": 0.05}, {"BTC/USD": 0.04},
+    )
+
+    assert len(divergences) == 1
+    assert divergences[0].kind == "qty_mismatch"
+    assert divergences[0].symbol == "BTC-USD"
+    assert divergences[0].internal_qty == 0.05
+    assert divergences[0].broker_qty == 0.04
+
+
+def test_compare_positions_sums_alias_collisions_on_both_sides() -> None:
+    internal = {"BTC-USD": 1.0, "BTC/USD": 2.0}
+    broker_map = {"BTC-USD": 2.5, "BTC/USD": 0.5}
+
+    assert broker.compare_positions(internal, broker_map) == []
+
+
+def test_compare_positions_preserves_unknown_internal_quantity_on_collision() -> None:
+    internal = {"BTC-USD": None, "BTC/USD": 2.0}
+
+    assert broker.compare_positions(internal, {"BTC/USD": 99.0}) == []
+
+
+def test_compare_positions_normalizes_internal_only_and_broker_only_symbols() -> None:
+    divergences = broker.compare_positions(
+        {"BTC/USD": 1.0}, {"ETH/USD": 2.0},
+    )
+
+    assert [(item.kind, item.symbol) for item in divergences] == [
+        ("internal_only", "BTC-USD"),
+        ("broker_only", "ETH-USD"),
+    ]
+
+
+def test_compare_positions_leaves_stock_and_occ_symbols_unchanged() -> None:
+    occ_symbol = "AAPL260116C00190000"
+    internal = {"AAPL": 3.0, "BRK.B": 2.0, occ_symbol: 1.0}
+
+    assert broker.compare_positions(internal, dict(internal)) == []
+    divergences = broker.compare_positions(internal, {})
+    assert {(item.kind, item.symbol) for item in divergences} == {
+        ("internal_only", "AAPL"),
+        ("internal_only", "BRK.B"),
+        ("internal_only", occ_symbol),
+    }
+
+
 def test_reconcile_internal_only(tmp_db: Path) -> None:
     _seed_broker_tracked("AAPL")              # a real broker-routed position
     report = broker.reconcile(FakeBroker())   # broker holds nothing
@@ -999,6 +1052,23 @@ def test_reconcile_clean_when_aligned(tmp_db: Path) -> None:
     report = broker.reconcile(b)
     assert report.ok is True
     assert report.divergences == []          # presence AND quantity match
+
+
+def test_reconcile_normalizes_report_symbols_and_aggregates_aliases(
+    tmp_db: Path,
+) -> None:
+    _seed_broker_tracked("BTC/USD", qty=1.0)
+    _seed_broker_tracked("BTC-USD", qty=2.0)
+    client = FakeBroker()
+    client.set_position("BTC/USD", 0.5)
+    client.set_position("BTC-USD", 2.5)
+
+    report = broker.reconcile(client)
+
+    assert report.ok is True
+    assert report.divergences == []
+    assert report.internal_symbols == ["BTC-USD"]
+    assert report.broker_symbols == ["BTC-USD"]
 
 
 def test_reconcile_excludes_shadow_trades(tmp_db: Path) -> None:
