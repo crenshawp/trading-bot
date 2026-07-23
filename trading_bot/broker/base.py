@@ -137,6 +137,8 @@ class OrderResult:
     time_in_force: str | None = None
     limit_price: float | None = None
     submitted_at: str | None = None
+    filled_at: str | None = None
+    updated_at: str | None = None
     raw_status: str | None = None   # the broker's own status string, for audit
 
 

@@ -130,13 +130,16 @@ class FakeBroker(Broker):
         self._seq += 1
         order_id = f"fake-{self._seq}"
         status = STATUS_FILLED if self.auto_fill else STATUS_NEW
+        now = datetime.now(UTC).isoformat()
         order = OrderResult(
             ok=True, status=status, order_id=order_id,
             client_order_id=client_order_id, symbol=symbol, qty=qty,
             filled_qty=qty if self.auto_fill else 0.0,
             filled_avg_price=limit_price if self.auto_fill else None,
             side=side, order_type=order_type, time_in_force=time_in_force,
-            limit_price=limit_price, submitted_at=datetime.now(UTC).isoformat(),
+            limit_price=limit_price, submitted_at=now,
+            filled_at=now if self.auto_fill else None,
+            updated_at=now,
             raw_status=status,
         )
         self._orders[order_id] = order
@@ -204,6 +207,7 @@ class FakeBroker(Broker):
             filled_avg_price=order.filled_avg_price, side=order.side,
             order_type=order.order_type, time_in_force=order.time_in_force,
             limit_price=order.limit_price, submitted_at=order.submitted_at,
+            filled_at=order.filled_at, updated_at=datetime.now(UTC).isoformat(),
             raw_status=STATUS_CANCELED,
         )
         self._orders[order_id] = canceled

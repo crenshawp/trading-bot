@@ -156,6 +156,8 @@ def test_fake_submit_auto_fill_marks_filled_and_creates_position() -> None:
     res = b.submit_order("MSFT", 5, broker.SIDE_BUY, limit_price=400.0)
     assert res.status == broker.STATUS_FILLED
     assert res.filled_qty == 5
+    assert res.filled_at is not None
+    assert res.updated_at is not None
     assert b.get_positions().positions[0].symbol == "MSFT"
 
 
@@ -646,12 +648,16 @@ def test_alpaca_get_order_success(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_request(monkeypatch, _FakeResp(200, {
         "id": "o1", "status": "filled", "symbol": "BTC/USD",
         "filled_qty": "10", "filled_avg_price": "191.0",
+        "filled_at": "2026-01-01T00:01:00Z",
+        "updated_at": "2026-01-01T00:01:01Z",
     }))
     res = alpaca.AlpacaBroker().get_order("o1")
     assert res.ok is True
     assert res.status == broker.STATUS_FILLED
     assert res.filled_qty == 10.0
     assert res.symbol == "BTC-USD"
+    assert res.filled_at == "2026-01-01T00:01:00Z"
+    assert res.updated_at == "2026-01-01T00:01:01Z"
 
 
 def test_alpaca_get_order_fills_in_missing_id(

@@ -1,9 +1,9 @@
 """Restart-safe capture, refresh, and fill materialization for broker orders.
 
-Opening paths durably prepare intent before submission and only materialize
-broker-reported cumulative fills.  Scanner reconciliation refreshes existing
-orders lookup-only, then replays every durable positive fill so a process crash
-between either step is harmless and retryable.
+Entry and dormant exit paths durably prepare intent before submission and only
+materialize broker-reported cumulative fills.  Scanner reconciliation refreshes
+existing orders lookup-only, then replays every durable positive entry fill so
+a process crash between either step is harmless and retryable.
 """
 
 from __future__ import annotations
@@ -53,11 +53,14 @@ class OrderIntentCaptureError(RuntimeError):
 
 _IMMUTABLE_INTENT_FIELDS: tuple[str, ...] = (
     "broker_order_id",
+    "order_role",
     "ticker",
     "broker_symbol",
     "asset_class",
     "vehicle",
     "target_position_kind",
+    "closes_position_kind",
+    "closes_position_id",
     "side",
     "requested_qty",
     "requested_limit_price",
@@ -135,6 +138,8 @@ class _LifecycleSnapshot:
     broker_status: str | None
     filled_qty: float
     filled_avg_price: float | None
+    last_fill_at: datetime | None
+    last_fill_time_source: str | None
     terminal_reason: str | None
     terminal_at: datetime | None
 
@@ -213,14 +218,61 @@ def _positive_fill_state(order: OrderResult) -> tuple[float, float | None]:
     return filled_qty, filled_avg_price
 
 
+def _provider_fill_time(
+    order: OrderResult,
+    *,
+    filled_qty: float,
+    observed_at: datetime,
+) -> tuple[datetime | None, str | None]:
+    """Return usable provider fill/update time, else durable observation time."""
+    if filled_qty == 0:
+        return None, None
+    for field, raw_value in (
+        ("filled_at", order.filled_at),
+        ("updated_at", order.updated_at),
+    ):
+        if raw_value is None:
+            continue
+        if not isinstance(raw_value, str):
+            print(
+                f"  order lifecycle: malformed broker {field}; "
+                "using local observation time",
+                file=sys.stderr,
+            )
+            continue
+        try:
+            parsed = datetime.fromisoformat(raw_value)
+        except ValueError:
+            print(
+                f"  order lifecycle: malformed broker {field}; "
+                "using local observation time",
+                file=sys.stderr,
+            )
+            continue
+        if parsed.tzinfo is None:
+            print(
+                f"  order lifecycle: timezone-less broker {field}; "
+                "using local observation time",
+                file=sys.stderr,
+            )
+            continue
+        return parsed, "broker"
+    return observed_at, "observed"
+
+
 def _initial_lifecycle(
     order: OrderResult,
     *,
     requested_qty: float,
     observed_at: datetime,
-) -> tuple[str, str | None, float, float | None, str | None, datetime | None]:
+) -> _LifecycleSnapshot:
     """Normalize a usable submit response without inventing broker truth."""
     filled_qty, filled_avg_price = _positive_fill_state(order)
+    last_fill_at, last_fill_time_source = _provider_fill_time(
+        order,
+        filled_qty=filled_qty,
+        observed_at=observed_at,
+    )
     raw_status = order.raw_status.strip() if order.raw_status else None
     status = "expired" if raw_status and raw_status.lower() == "expired" else order.status
     if status == STATUS_ERROR:
@@ -247,15 +299,26 @@ def _initial_lifecycle(
     broker_status = raw_status or order.status or None
     if status in TERMINAL_PENDING_ORDER_STATUSES:
         terminal_reason = order.reason.strip() or broker_status or status
-        return (
-            status,
-            broker_status,
-            filled_qty,
-            filled_avg_price,
-            terminal_reason,
-            observed_at,
+        return _LifecycleSnapshot(
+            lifecycle_status=status,
+            broker_status=broker_status,
+            filled_qty=filled_qty,
+            filled_avg_price=filled_avg_price,
+            last_fill_at=last_fill_at,
+            last_fill_time_source=last_fill_time_source,
+            terminal_reason=terminal_reason,
+            terminal_at=observed_at,
         )
-    return status, broker_status, filled_qty, filled_avg_price, None, None
+    return _LifecycleSnapshot(
+        lifecycle_status=status,
+        broker_status=broker_status,
+        filled_qty=filled_qty,
+        filled_avg_price=filled_avg_price,
+        last_fill_at=last_fill_at,
+        last_fill_time_source=last_fill_time_source,
+        terminal_reason=None,
+        terminal_at=None,
+    )
 
 
 def _insert_idempotently(order: PendingOrder) -> int:
@@ -316,6 +379,9 @@ def prepare_order_intent(
     intent_payload: Mapping[str, Any],
     signal_id: int | None = None,
     client_order_id: str | None = None,
+    order_role: str = "entry",
+    closes_position_kind: str | None = None,
+    closes_position_id: int | None = None,
 ) -> PendingOrder:
     """Persist immutable intent before any broker submission can occur."""
     resolved_client_order_id = client_order_id or generate_client_order_id()
@@ -327,6 +393,9 @@ def prepare_order_intent(
         asset_class=asset_class,
         vehicle=vehicle,
         target_position_kind=target_position_kind,
+        order_role=order_role,
+        closes_position_kind=closes_position_kind,
+        closes_position_id=closes_position_id,
         side=side,
         requested_qty=requested_qty,
         requested_limit_price=requested_limit_price,
@@ -362,14 +431,7 @@ def _bind_prepared_snapshot(
         raise OrderIntentCaptureError(
             "broker response client order ID does not match prepared intent"
         )
-    (
-        lifecycle_status,
-        broker_status,
-        filled_qty,
-        filled_avg_price,
-        terminal_reason,
-        terminal_at,
-    ) = _initial_lifecycle(
+    snapshot = _initial_lifecycle(
         order,
         requested_qty=pending.requested_qty,
         observed_at=observed_at,
@@ -378,13 +440,15 @@ def _bind_prepared_snapshot(
         db.update_pending_order(
             pending.id,
             broker_order_id=order_id,
-            lifecycle_status=lifecycle_status,
-            broker_status=broker_status,
-            filled_qty=filled_qty,
-            filled_avg_price=filled_avg_price,
+            lifecycle_status=snapshot.lifecycle_status,
+            broker_status=snapshot.broker_status,
+            filled_qty=snapshot.filled_qty,
+            filled_avg_price=snapshot.filled_avg_price,
+            last_fill_at=snapshot.last_fill_at,
+            last_fill_time_source=snapshot.last_fill_time_source,
             last_refreshed_at=observed_at,
-            terminal_reason=terminal_reason,
-            terminal_at=terminal_at,
+            terminal_reason=snapshot.terminal_reason,
+            terminal_at=snapshot.terminal_at,
         )
     except Exception as exc:
         raise OrderIntentCaptureError(
@@ -435,6 +499,9 @@ def submit_prepared_order(
     signal_id: int | None = None,
     order_type: str = ORDER_TYPE_LIMIT,
     time_in_force: str = TIF_DAY,
+    order_role: str = "entry",
+    closes_position_kind: str | None = None,
+    closes_position_id: int | None = None,
 ) -> OrderResult:
     """Prepare, submit once with the same client ID, and bind a usable reply.
 
@@ -455,6 +522,9 @@ def submit_prepared_order(
         submitted_at=submitted_at,
         signal_id=signal_id,
         intent_payload=intent_payload,
+        order_role=order_role,
+        closes_position_kind=closes_position_kind,
+        closes_position_id=closes_position_id,
     )
     assert pending.client_order_id is not None
     try:
@@ -497,6 +567,155 @@ def submit_prepared_order(
         return order
     _bind_prepared_snapshot(pending, order, observed_at=submitted_at)
     return order
+
+
+@dataclass(frozen=True)
+class _PositionExitSubmission:
+    ticker: str
+    broker_symbol: str
+    asset_class: str
+    vehicle: str
+    side: str
+    held_qty: float
+
+
+def _terminal_linked_entry_qty(position_kind: str, position_id: int) -> float:
+    """Return terminal actual entry quantity for one broker-linked position."""
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT lifecycle_status, broker_order_id, filled_qty, "
+            "filled_avg_price, last_fill_at, last_fill_time_source "
+            "FROM pending_orders WHERE order_role = 'entry' "
+            "AND position_kind = ? AND position_id = ? ORDER BY id ASC",
+            (position_kind, position_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    if len(rows) != 1:
+        raise ValueError(
+            "exit target must link to exactly one broker-tracked entry order"
+        )
+    row = rows[0]
+    if row["lifecycle_status"] not in TERMINAL_PENDING_ORDER_STATUSES:
+        raise ValueError("exit target entry order must be terminal before exit")
+    filled_qty = float(row["filled_qty"])
+    if (
+        not row["broker_order_id"]
+        or not math.isfinite(filled_qty)
+        or filled_qty <= 0
+        or row["filled_avg_price"] is None
+        or float(row["filled_avg_price"]) <= 0
+        or row["last_fill_at"] is None
+        or row["last_fill_time_source"] not in {"broker", "observed"}
+    ):
+        raise ValueError("exit target entry order lacks usable broker fill truth")
+    return filled_qty
+
+
+def _position_exit_submission(
+    position_kind: str,
+    position_id: int,
+) -> _PositionExitSubmission:
+    """Validate one open typed position and derive its exact closing shape."""
+    if position_kind == "option":
+        option_position = db.get_option_position(position_id)
+        if option_position is None or option_position.outcome not in (None, "open"):
+            raise ValueError("exit target option position must exist and be open")
+        submission = _PositionExitSubmission(
+            ticker=option_position.underlying,
+            broker_symbol=option_position.symbol,
+            asset_class="stock",
+            vehicle=option_position.vehicle,
+            side="sell",
+            held_qty=float(option_position.contracts),
+        )
+    elif position_kind == "long_term":
+        long_position = db.get_long_term_position(position_id)
+        if long_position is None or long_position.status != "open":
+            raise ValueError("exit target long-term position must exist and be open")
+        submission = _PositionExitSubmission(
+            ticker=long_position.ticker,
+            broker_symbol=long_position.ticker,
+            asset_class=long_position.asset_class,
+            vehicle="shares",
+            side="buy" if long_position.direction == "short" else "sell",
+            held_qty=float(long_position.qty),
+        )
+    else:
+        raise ValueError(f"invalid exit target position kind {position_kind!r}")
+    if not math.isfinite(submission.held_qty) or submission.held_qty <= 0:
+        raise ValueError("exit target position must carry a positive holding")
+    linked_qty = _terminal_linked_entry_qty(position_kind, position_id)
+    if not _same_number(linked_qty, submission.held_qty):
+        raise ValueError(
+            "exit target position quantity does not match terminal entry truth"
+        )
+    return submission
+
+
+def submit_position_exit(
+    broker: Broker,
+    *,
+    position_kind: str,
+    position_id: int,
+    requested_qty: float,
+    requested_limit_price: float | None,
+    exit_reason: str,
+    submitted_at: datetime,
+    order_type: str = ORDER_TYPE_LIMIT,
+    time_in_force: str = TIF_DAY,
+) -> OrderResult:
+    """Dormantly prepare and submit one restart-safe typed position exit.
+
+    The typed open position and its terminal entry fill are validated before a
+    prepared ``order_role='exit'`` row is written.  Broker I/O occurs only after
+    that immutable row exists, always with its exact client order ID.  This
+    primitive is intentionally not called by any watcher or emergency path yet.
+    """
+    if position_id <= 0:
+        raise ValueError("exit target position_id must be positive")
+    if (
+        isinstance(requested_qty, bool)
+        or not math.isfinite(requested_qty)
+        or requested_qty <= 0
+    ):
+        raise ValueError("exit requested_qty must be positive and finite")
+    if not isinstance(exit_reason, str) or not exit_reason.strip():
+        raise ValueError("exit_reason must be a non-empty string")
+    if submitted_at.tzinfo is None:
+        raise ValueError("exit submitted_at must be timezone-aware")
+    submission = _position_exit_submission(position_kind, position_id)
+    if requested_qty > submission.held_qty and not _same_number(
+        requested_qty, submission.held_qty
+    ):
+        raise ValueError("exit requested_qty exceeds the linked open holding")
+    existing_attempts = db.get_pending_exit_orders_for_position(
+        position_kind, position_id
+    )
+    if any(attempt.terminal_at is None for attempt in existing_attempts):
+        raise ValueError("exit target already has a nonterminal exit attempt")
+    return submit_prepared_order(
+        broker,
+        ticker=submission.ticker,
+        broker_symbol=submission.broker_symbol,
+        asset_class=submission.asset_class,
+        vehicle=submission.vehicle,
+        target_position_kind=position_kind,
+        side=submission.side,
+        requested_qty=requested_qty,
+        requested_limit_price=requested_limit_price,
+        submitted_at=submitted_at,
+        intent_payload={
+            "intent_kind": "position_exit",
+            "exit_reason": exit_reason.strip(),
+        },
+        order_type=order_type,
+        time_in_force=time_in_force,
+        order_role="exit",
+        closes_position_kind=position_kind,
+        closes_position_id=position_id,
+    )
 
 
 def recover_prepared_order(
@@ -671,25 +890,10 @@ def _normalize_refresh_snapshot(
         raise OrderIntentCaptureError(
             "broker refresh returned neither a recognized nor raw lifecycle status"
         )
-    (
-        lifecycle_status,
-        broker_status,
-        filled_qty,
-        filled_avg_price,
-        terminal_reason,
-        terminal_at,
-    ) = _initial_lifecycle(
+    return _initial_lifecycle(
         order,
         requested_qty=pending.requested_qty,
         observed_at=observed_at,
-    )
-    return _LifecycleSnapshot(
-        lifecycle_status=lifecycle_status,
-        broker_status=broker_status,
-        filled_qty=filled_qty,
-        filled_avg_price=filled_avg_price,
-        terminal_reason=terminal_reason,
-        terminal_at=terminal_at,
     )
 
 
@@ -766,6 +970,14 @@ def _apply_bound_refresh(
     effective_avg_price = (
         pending.filled_avg_price if quantity_is_equal else snapshot.filled_avg_price
     )
+    effective_last_fill_at = (
+        pending.last_fill_at if quantity_is_equal else snapshot.last_fill_at
+    )
+    effective_last_fill_time_source = (
+        pending.last_fill_time_source
+        if quantity_is_equal
+        else snapshot.last_fill_time_source
+    )
     state_changed = (
         snapshot.lifecycle_status != pending.lifecycle_status
         or snapshot.broker_status != pending.broker_status
@@ -790,6 +1002,8 @@ def _apply_bound_refresh(
             broker_status=snapshot.broker_status,
             filled_qty=effective_filled_qty,
             filled_avg_price=effective_avg_price,
+            last_fill_at=effective_last_fill_at,
+            last_fill_time_source=effective_last_fill_time_source,
             last_refreshed_at=observed_at,
             terminal_reason=snapshot.terminal_reason,
             terminal_at=snapshot.terminal_at,
@@ -809,6 +1023,8 @@ def _apply_bound_refresh(
         broker_status=snapshot.broker_status,
         filled_qty=effective_filled_qty,
         filled_avg_price=effective_avg_price,
+        last_fill_at=effective_last_fill_at,
+        last_fill_time_source=effective_last_fill_time_source,
         last_refreshed_at=observed_at,
         terminal_reason=snapshot.terminal_reason,
         terminal_at=snapshot.terminal_at,
@@ -982,14 +1198,7 @@ def capture_accepted_order(
     if not order.ok:
         raise ValueError("only broker-accepted orders can be captured")
     order_id = _broker_order_id(order)
-    (
-        lifecycle_status,
-        broker_status,
-        filled_qty,
-        filled_avg_price,
-        terminal_reason,
-        terminal_at,
-    ) = _initial_lifecycle(
+    snapshot = _initial_lifecycle(
         order,
         requested_qty=requested_qty,
         observed_at=accepted_at,
@@ -1007,13 +1216,15 @@ def capture_accepted_order(
         submitted_at=_submitted_at(order, accepted_at),
         signal_id=signal_id,
         intent_payload_json=json.dumps(intent_payload, sort_keys=True),
-        lifecycle_status=lifecycle_status,
-        broker_status=broker_status,
-        filled_qty=filled_qty,
-        filled_avg_price=filled_avg_price,
+        lifecycle_status=snapshot.lifecycle_status,
+        broker_status=snapshot.broker_status,
+        filled_qty=snapshot.filled_qty,
+        filled_avg_price=snapshot.filled_avg_price,
+        last_fill_at=snapshot.last_fill_at,
+        last_fill_time_source=snapshot.last_fill_time_source,
         last_refreshed_at=accepted_at,
-        terminal_reason=terminal_reason,
-        terminal_at=terminal_at,
+        terminal_reason=snapshot.terminal_reason,
+        terminal_at=snapshot.terminal_at,
     )
     return _insert_idempotently(pending)
 

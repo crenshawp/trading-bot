@@ -330,6 +330,8 @@ def _parse_order(d: Mapping[str, Any]) -> OrderResult:
         time_in_force=_str_or_none(d.get("time_in_force")),
         limit_price=_to_float(d.get("limit_price")),
         submitted_at=_str_or_none(d.get("submitted_at")),
+        filled_at=_str_or_none(d.get("filled_at")),
+        updated_at=_str_or_none(d.get("updated_at")),
         raw_status=raw_status,
     )
 
