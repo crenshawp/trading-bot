@@ -1010,8 +1010,8 @@ def _check_pause_until(now: datetime) -> bool:
     return False
 
 
-def _warn_if_bad_status(resp: object, channel: str) -> None:
-    """Log a warning when an HTTP notification returned a non-2xx status.
+def _warn_if_bad_status(resp: object, channel: str) -> bool:
+    """Return delivery success and log an HTTP-status failure.
 
     ``requests.post`` does NOT raise on 4xx/5xx — only on connection errors.
     A Pushover 429 (rate limit) or 401 (bad token), or a Discord 401/404 on a
@@ -1020,16 +1020,24 @@ def _warn_if_bad_status(resp: object, channel: str) -> None:
     root cause of intermittent missing phone alerts.
     """
     status = getattr(resp, "status_code", None)
-    if status is not None and not (200 <= status < 300):
-        print(
-            f"  {channel} notification HTTP {status} "
-            f"(alert may not have been delivered)",
-            file=sys.stderr,
-        )
+    if isinstance(status, int) and 200 <= status < 300:
+        return True
+    status_text = str(status) if status is not None else "unknown"
+    print(
+        f"  {channel} notification HTTP {status_text} "
+        f"(alert may not have been delivered)",
+        file=sys.stderr,
+    )
+    return False
 
 
-def _send_prediction_notification(pred: object) -> None:
-    """Send the prediction alert via Discord + Pushover. Plain ASCII."""
+def _send_prediction_notification(pred: object) -> bool:
+    """Send via both required channels and return all-or-nothing success.
+
+    Discord and Pushover are one delivery contract. A partial success returns
+    False, leaving the prediction retryable. Because delivery state is not
+    tracked per channel, a later retry intentionally resends both channels.
+    """
     # ``pred`` typed as object to keep this function importable without the
     # Prediction class at module-load time; runtime asserts the shape.
     p = pred  # alias
@@ -1056,16 +1064,18 @@ def _send_prediction_notification(pred: object) -> None:
     if DRY_RUN:
         print("\n--- DRY-RUN prediction (no Discord/Pushover) ---")
         print(msg)
-        return
+        return False
 
+    discord_ok = False
     try:
         resp = requests.post(
             DISCORD_WEBHOOK_URL, json={"content": msg},
             timeout=_HTTP_TIMEOUT_SECONDS,
         )
-        _warn_if_bad_status(resp, "prediction Discord")
+        discord_ok = _warn_if_bad_status(resp, "prediction Discord")
     except Exception as exc:
         print(f"  prediction Discord error: {exc}", file=sys.stderr)
+    pushover_ok = False
     try:
         resp = requests.post("https://api.pushover.net/1/messages.json", data={
             "token": PUSHOVER_APP_TOKEN,
@@ -1073,9 +1083,18 @@ def _send_prediction_notification(pred: object) -> None:
             "title": f"Prediction: {ticker} {direction}",
             "message": msg,
         }, timeout=_HTTP_TIMEOUT_SECONDS)
-        _warn_if_bad_status(resp, "prediction Pushover")
+        pushover_ok = _warn_if_bad_status(resp, "prediction Pushover")
     except Exception as exc:
         print(f"  prediction Pushover error: {exc}", file=sys.stderr)
+    return discord_ok and pushover_ok
+
+
+def _record_prediction_delivery(prediction_id: int, pred: object) -> bool:
+    """Notify one persisted prediction and durably record only true success."""
+    if not _send_prediction_notification(pred):
+        return False
+    db.update_prediction(prediction_id, notified=True)
+    return True
 
 
 def _send_resolution_notification(
@@ -1182,8 +1201,13 @@ def _run_prediction_sweep() -> None:
         )
         try:
             pid = db.insert_prediction(pred)
-            _send_prediction_notification(pred)
-            db.update_prediction(pid, notified=True)
+            delivered = _record_prediction_delivery(pid, pred)
+            if not delivered:
+                print(
+                    f"  prediction notification incomplete for {ticker}; "
+                    "persisted as unnotified for retry",
+                    file=sys.stderr,
+                )
             print(
                 f"  {ticker}: {pred.direction} {pred.confidence:.0f}% "
                 f"(window ends {pred.target_window_end.strftime('%H:%M UTC')})"

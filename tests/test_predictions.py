@@ -857,7 +857,7 @@ def test_prediction_notification_is_plain_ascii(
         created_at=datetime(2026, 5, 26, 14, 30, tzinfo=UTC),
         market_regime="bull", vix_band="low", vix_level=18.0,
     )
-    scanner._send_prediction_notification(pred)
+    assert scanner._send_prediction_notification(pred) is False
     out = capsys.readouterr().out
     out.encode("cp1252")  # raises if any non-ASCII slipped in
     assert "[PREDICTION] BTC-USD -> HIGHER" in out
@@ -866,6 +866,73 @@ def test_prediction_notification_is_plain_ascii(
 class _FakeResp:
     def __init__(self, status_code: int) -> None:
         self.status_code = status_code
+
+
+def _delivery_prediction() -> Prediction:
+    return Prediction(
+        ticker="BTC-USD", direction="HIGHER", confidence=72.0,
+        entry_price=94000.0,
+        target_window_end=datetime(2026, 5, 26, 14, 45, tzinfo=UTC),
+        signals_used=json.dumps({"x": 1}),
+        created_at=datetime(2026, 5, 26, 14, 30, tzinfo=UTC),
+        market_regime="bull", vix_band="low", vix_level=18.0,
+    )
+
+
+@pytest.mark.parametrize("failed_channel", ["Discord", "Pushover"])
+def test_prediction_notification_non_2xx_fails_each_required_channel(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failed_channel: str,
+) -> None:
+    from trading_bot import scanner
+
+    monkeypatch.setattr(scanner, "DRY_RUN", False)
+    monkeypatch.setattr(scanner, "DISCORD_WEBHOOK_URL", "https://discord.test/hook")
+    calls: list[str] = []
+
+    def post(url: str, **_kwargs: object) -> _FakeResp:
+        calls.append(url)
+        is_discord = url == "https://discord.test/hook"
+        failed = is_discord if failed_channel == "Discord" else not is_discord
+        return _FakeResp(503 if failed else 204)
+
+    monkeypatch.setattr(scanner.requests, "post", post)
+
+    assert scanner._send_prediction_notification(_delivery_prediction()) is False
+    assert len(calls) == 2
+    err = capsys.readouterr().err
+    assert "HTTP 503" in err and failed_channel in err
+
+
+@pytest.mark.parametrize("failed_channel", ["Discord", "Pushover"])
+def test_prediction_notification_exception_fails_each_required_channel(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failed_channel: str,
+) -> None:
+    from trading_bot import scanner
+
+    monkeypatch.setattr(scanner, "DRY_RUN", False)
+    monkeypatch.setattr(scanner, "DISCORD_WEBHOOK_URL", "https://discord.test/hook")
+    calls: list[str] = []
+
+    def post(url: str, **_kwargs: object) -> _FakeResp:
+        calls.append(url)
+        is_discord = url == "https://discord.test/hook"
+        failed = is_discord if failed_channel == "Discord" else not is_discord
+        if failed:
+            raise RuntimeError("channel unavailable")
+        return _FakeResp(204)
+
+    monkeypatch.setattr(scanner.requests, "post", post)
+
+    assert scanner._send_prediction_notification(_delivery_prediction()) is False
+    assert len(calls) == 2
+    err = capsys.readouterr().err
+    assert "channel unavailable" in err and failed_channel in err
 
 
 def test_prediction_notification_warns_on_non_2xx(
@@ -892,7 +959,7 @@ def test_prediction_notification_warns_on_non_2xx(
         created_at=datetime(2026, 5, 26, 14, 30, tzinfo=UTC),
         market_regime="bull", vix_band="low", vix_level=18.0,
     )
-    scanner._send_prediction_notification(pred)
+    assert scanner._send_prediction_notification(pred) is False
     err = capsys.readouterr().err
     assert "HTTP 429" in err
     assert "Discord" in err
@@ -946,9 +1013,67 @@ def test_notification_2xx_does_not_warn(
         created_at=datetime(2026, 5, 26, 14, 30, tzinfo=UTC),
         market_regime="bear", vix_band="high", vix_level=32.0,
     )
-    scanner._send_prediction_notification(pred)
+    assert scanner._send_prediction_notification(pred) is True
     err = capsys.readouterr().err
     assert "HTTP" not in err
+
+
+def test_partial_delivery_stays_unnotified_then_retry_resends_both(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The current contract is all-or-nothing, not per-channel accounting."""
+    from trading_bot import scanner
+
+    monkeypatch.setattr(scanner, "DRY_RUN", False)
+    discord_url = "https://discord.test/hook"
+    pushover_url = "https://api.pushover.net/1/messages.json"
+    monkeypatch.setattr(scanner, "DISCORD_WEBHOOK_URL", discord_url)
+    calls: list[str] = []
+
+    def post(url: str, **_kwargs: object) -> _FakeResp:
+        calls.append(url)
+        # First attempt: Discord succeeds, Pushover fails. Retry: both succeed.
+        return _FakeResp(503 if len(calls) == 2 else 204)
+
+    monkeypatch.setattr(scanner.requests, "post", post)
+    pred = _delivery_prediction()
+    prediction_id = db.insert_prediction(pred)
+
+    assert scanner._record_prediction_delivery(prediction_id, pred) is False
+    first = db.get_prediction(prediction_id)
+    assert first is not None and first.notified is False
+
+    assert scanner._record_prediction_delivery(prediction_id, pred) is True
+    retried = db.get_prediction(prediction_id)
+    assert retried is not None and retried.notified is True
+    assert calls == [discord_url, pushover_url, discord_url, pushover_url]
+
+
+def test_prediction_sweep_broad_notification_error_is_not_durable_success(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot import scanner, settings
+
+    settings.set_bool("predictions.enabled", True)
+    settings.set("predictions.window_start", "00:00")
+    settings.set("predictions.window_end", "23:59")
+    settings.set("predictions.tickers", "BTC-USD")
+    monkeypatch.setattr(
+        scanner.predictions, "predict_direction", lambda _ticker, **_kw: _delivery_prediction(),
+    )
+
+    def fail_broadly(_pred: object) -> bool:
+        raise RuntimeError("notification helper regression")
+
+    monkeypatch.setattr(scanner, "_send_prediction_notification", fail_broadly)
+
+    scanner._run_prediction_sweep()
+
+    rows = db.get_predictions(limit=10)
+    assert len(rows) == 1 and rows[0].notified is False
+    assert "notification helper regression" in capsys.readouterr().err
 
 
 def test_resolution_notification_format(
