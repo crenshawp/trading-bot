@@ -59,6 +59,7 @@ from trading_bot.models import (
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
+# Version 27 (cross-cutting audit) — persists indicator computation status.
 # Version 26 (cross-cutting audit) — persists sentiment success + rationale.
 # Version 25 (cross-cutting audit) — adds pre-submit pending-order identity.
 # Version 24 (cross-cutting audit) — adds the durable pending_orders ledger.
@@ -76,7 +77,7 @@ from trading_bot.models import (
 # Version 13 (Phase 6) — adds trades.ind_* advisory indicator-family columns.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -1147,6 +1148,18 @@ def _migrate_to_v26(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE trades ADD COLUMN sentiment_rationale TEXT")
 
 
+def _migrate_to_v27(conn: sqlite3.Connection) -> None:
+    """Persist indicator success without inventing provenance for legacy rows."""
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(trades)")
+    }
+    if "ind_ok" not in columns:
+        conn.execute(
+            "ALTER TABLE trades ADD COLUMN ind_ok INTEGER "
+            "CHECK (ind_ok IN (0,1))"
+        )
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -1177,6 +1190,7 @@ def init_db() -> None:
         _migrate_to_v24(conn)
         _migrate_to_v25(conn)
         _migrate_to_v26(conn)
+        _migrate_to_v27(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -1399,14 +1413,14 @@ def insert_trade(trade: Trade) -> int:
             vix_level, vix_band, context_score, track_mode,
             sentiment_score, sentiment_label, sentiment_ok,
             sentiment_rationale, heavy_news, headline_count,
-            ind_atr, ind_realized_vol, ind_vol_regime, ind_rsi, ind_adx,
+            ind_ok, ind_atr, ind_realized_vol, ind_vol_regime, ind_rsi, ind_adx,
             ind_obv, ind_correlation, ind_concentration,
             risk_recommended_size, risk_stop_distance, risk_dollar_risk,
             risk_pct, risk_position_pct, risk_capped, risk_total_pct,
             risk_portfolio_verdict, risk_position_verdict, risk_cluster_pct,
             risk_cluster_verdict
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                  ?, ?, ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?, ?, ?, ?, ?,
                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = (
@@ -1429,6 +1443,7 @@ def insert_trade(trade: Trade) -> int:
         trade.sentiment_rationale,
         int(trade.heavy_news),
         trade.headline_count,
+        int(trade.ind_ok) if trade.ind_ok is not None else None,
         trade.ind_atr,
         trade.ind_realized_vol,
         trade.ind_vol_regime,
@@ -1551,6 +1566,11 @@ def _row_to_trade(row: sqlite3.Row) -> Trade:
         ),
         heavy_news=bool(row["heavy_news"]) if "heavy_news" in keys else False,
         headline_count=row["headline_count"] if "headline_count" in keys else None,
+        ind_ok=(
+            bool(row["ind_ok"])
+            if "ind_ok" in keys and row["ind_ok"] is not None
+            else None
+        ),
         ind_atr=row["ind_atr"] if "ind_atr" in keys else None,
         ind_realized_vol=row["ind_realized_vol"] if "ind_realized_vol" in keys else None,
         ind_vol_regime=row["ind_vol_regime"] if "ind_vol_regime" in keys else None,
@@ -2538,11 +2558,8 @@ def get_recent_trade_sentiment(limit: int = 20) -> list[dict[str, Any]]:
 def get_recent_trade_indicators(limit: int = 20) -> list[dict[str, Any]]:
     """Recent fired signals that carry advisory indicator-family context (Phase 6).
 
-    Joins trades -> signals, newest first, restricted to trades that were
-    indicator-scored (``ind_vol_regime`` populated — i.e. the active alerting
-    stock signals; crypto/shadow leave it NULL). Each row carries the signal
-    identity, the five families, and the eventual outcome so the indicators sit
-    next to results — the per-signal report view for Phase 6.
+    Explicit success/failure is returned separately from the family values;
+    legacy rows with context but no provenance remain visible as unknown.
     """
     sql = (
         "SELECT signals.ticker AS ticker, "
@@ -2551,6 +2568,7 @@ def get_recent_trade_indicators(limit: int = 20) -> list[dict[str, Any]]:
         "       trades.opened_at AS opened_at, "
         "       trades.outcome AS outcome, "
         "       trades.track_mode AS track_mode, "
+        "       trades.ind_ok AS ind_ok, "
         "       trades.ind_atr AS ind_atr, "
         "       trades.ind_realized_vol AS ind_realized_vol, "
         "       trades.ind_vol_regime AS ind_vol_regime, "
@@ -2560,7 +2578,8 @@ def get_recent_trade_indicators(limit: int = 20) -> list[dict[str, Any]]:
         "       trades.ind_correlation AS ind_correlation, "
         "       trades.ind_concentration AS ind_concentration "
         "FROM trades JOIN signals ON signals.id = trades.signal_id "
-        "WHERE trades.ind_vol_regime IS NOT NULL "
+        "WHERE trades.ind_ok IS NOT NULL "
+        "   OR trades.ind_vol_regime IS NOT NULL "
         "ORDER BY trades.opened_at DESC LIMIT ?"
     )
     conn = get_connection()
@@ -2576,9 +2595,14 @@ def get_recent_trade_indicators(limit: int = 20) -> list[dict[str, Any]]:
             "opened_at": str(r["opened_at"]),
             "outcome": r["outcome"],
             "track_mode": str(r["track_mode"]),
+            "ind_ok": (
+                bool(r["ind_ok"])
+                if r["ind_ok"] is not None
+                else None
+            ),
             "ind_atr": r["ind_atr"],
             "ind_realized_vol": r["ind_realized_vol"],
-            "ind_vol_regime": str(r["ind_vol_regime"]),
+            "ind_vol_regime": r["ind_vol_regime"],
             "ind_rsi": r["ind_rsi"],
             "ind_adx": r["ind_adx"],
             "ind_obv": r["ind_obv"],
@@ -2854,6 +2878,7 @@ def get_resolved_context_outcomes(
         "       trades.sentiment_label AS sentiment_label, "
         "       trades.sentiment_ok AS sentiment_ok, "
         "       trades.sentiment_rationale AS sentiment_rationale, "
+        "       trades.ind_ok AS ind_ok, "
         "       trades.ind_vol_regime AS ind_vol_regime, "
         "       trades.ind_rsi AS ind_rsi, trades.ind_adx AS ind_adx, "
         "       trades.ind_obv AS ind_obv, "
@@ -2885,6 +2910,11 @@ def get_resolved_context_outcomes(
                 else None
             ),
             "sentiment_rationale": r["sentiment_rationale"],
+            "ind_ok": (
+                bool(r["ind_ok"])
+                if r["ind_ok"] is not None
+                else None
+            ),
             "ind_vol_regime": r["ind_vol_regime"],
             "ind_rsi": r["ind_rsi"],
             "ind_adx": r["ind_adx"],

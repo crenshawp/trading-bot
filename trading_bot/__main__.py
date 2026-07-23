@@ -1150,21 +1150,30 @@ def cmd_indicators_status(limit: int = 20) -> None:
         return format(value, spec) if isinstance(value, (int, float)) else "-"
 
     rows = db.get_recent_trade_indicators(limit=limit)
-    print("INDICATOR STATUS  (recent signals with indicator-family context)")
-    print("-" * 104)
+    print("INDICATOR STATUS  (recent advisory results)")
+    print("-" * 115)
     if not rows:
-        print("  (no indicator-scored signals yet)")
+        print("  (no indicator results yet)")
         return
     print(
-        f"  {'Opened':<20} {'Ticker':<7} {'Signal':<20} {'Vol':<7} "
+        f"  {'Opened':<20} {'Ticker':<7} {'Signal':<20} {'State':<9} {'Vol':<7} "
         f"{'RSI':>5} {'ADX':>5} {'OBV':>13} {'Corr':>6} "
         f"{'Concentration':<13} {'Outcome':<8}"
     )
     for r in rows:
+        ok = r["ind_ok"]
+        if ok is True:
+            state = "scored"
+        elif ok is False:
+            state = "fail-soft"
+        else:
+            state = "unknown"
+        vol_regime = r["ind_vol_regime"]
+        vol_text = vol_regime if isinstance(vol_regime, str) else "-"
         opened = r["opened_at"][:19].replace("T", " ")
         print(
             f"  {opened:<20} {r['ticker']:<7} {r['signal_type']:<20} "
-            f"{r['ind_vol_regime']:<7} "
+            f"{state:<9} {vol_text:<7} "
             f"{_n(r['ind_rsi'], '.1f'):>5} {_n(r['ind_adx'], '.1f'):>5} "
             f"{_n(r['ind_obv'], ',.0f'):>13} "
             f"{_n(r['ind_correlation'], '+.2f'):>6} "
@@ -2367,7 +2376,7 @@ def main() -> None:
     ind_status_p = indicators_sub.add_parser("status")
     ind_status_p.add_argument(
         "--limit", type=int, default=20,
-        help="How many recent indicator-scored signals to show (default 20)",
+        help="How many recent indicator results to show (default 20)",
     )
 
     # risk (Phase 7)

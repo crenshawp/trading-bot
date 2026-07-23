@@ -22,13 +22,13 @@ def _run(argv: list[str]) -> None:
 def test_cli_db_init_prints_version(tmp_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _run(["db", "init"])
     out = capsys.readouterr().out
-    assert "Schema version: 26" in out
+    assert "Schema version: 27" in out
 
 
 def test_cli_db_status_shows_counts(tmp_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _run(["db", "status"])
     out = capsys.readouterr().out
-    assert "Schema version: 26" in out
+    assert "Schema version: 27" in out
     assert "signals" in out
     assert "trades" in out
     assert "daily_performance" in out
@@ -679,6 +679,7 @@ def test_cli_indicators_status(
     rows = [{
         "ticker": "GOOGL", "signal_type": "ema21_pullback", "direction": "call",
         "opened_at": "2026-06-01T10:00:00", "outcome": "win", "track_mode": "active",
+        "ind_ok": True,
         "ind_atr": 2.5, "ind_realized_vol": 0.018, "ind_vol_regime": "normal",
         "ind_rsi": 54.3, "ind_adx": 27.1, "ind_obv": 1234567.0,
         "ind_correlation": 0.42, "ind_concentration": "moderate",
@@ -696,6 +697,7 @@ def test_cli_indicators_status(
     assert "+0.42" in out       # correlation
     assert "moderate" in out    # concentration
     assert "1,234,567" in out   # OBV (volume flow)
+    assert "scored" in out
 
 
 def test_cli_indicators_status_handles_missing_values(
@@ -707,6 +709,7 @@ def test_cli_indicators_status_handles_missing_values(
     rows = [{
         "ticker": "TSLA", "signal_type": "trend_continuation", "direction": "call",
         "opened_at": "2026-06-02T09:31:00", "outcome": None, "track_mode": "active",
+        "ind_ok": False,
         "ind_atr": None, "ind_realized_vol": None, "ind_vol_regime": "unknown",
         "ind_rsi": None, "ind_adx": None, "ind_obv": None,
         "ind_correlation": None, "ind_concentration": "unknown",
@@ -719,6 +722,29 @@ def test_cli_indicators_status_handles_missing_values(
     assert "TSLA" in out
     assert "open" in out     # NULL outcome rendered as 'open'
     assert "-" in out        # None numeric fields rendered as '-'
+    assert "fail-soft" in out
+
+
+def test_cli_indicators_status_exposes_legacy_unknown(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rows = [{
+        "ticker": "META", "signal_type": "ema21_pullback", "direction": "call",
+        "opened_at": "2026-06-01T10:00:00", "outcome": "win", "track_mode": "active",
+        "ind_ok": None, "ind_atr": None, "ind_realized_vol": None,
+        "ind_vol_regime": "unknown", "ind_rsi": None, "ind_adx": None,
+        "ind_obv": None, "ind_correlation": None, "ind_concentration": "unknown",
+    }]
+    monkeypatch.setattr(
+        "trading_bot.db.get_recent_trade_indicators", lambda **_kw: rows,
+    )
+
+    _run(["indicators", "status"])
+
+    out = capsys.readouterr().out
+    assert "META" in out and "unknown" in out
 
 
 def test_cli_indicators_status_empty(
@@ -730,7 +756,7 @@ def test_cli_indicators_status_empty(
         "trading_bot.db.get_recent_trade_indicators", lambda **_kw: [],
     )
     _run(["indicators", "status"])
-    assert "no indicator-scored signals yet" in capsys.readouterr().out
+    assert "no indicator results yet" in capsys.readouterr().out
 
 
 # ───────────────────── Phase 7 risk subcommand ─────────────────────

@@ -1175,11 +1175,12 @@ def test_indicator_context_persisted_on_trade_row(
     conn = db.get_connection()
     try:
         row = conn.execute(
-            "SELECT ind_atr, ind_realized_vol, ind_vol_regime, ind_rsi, ind_adx, "
+            "SELECT ind_ok, ind_atr, ind_realized_vol, ind_vol_regime, ind_rsi, ind_adx, "
             "ind_obv, ind_correlation, ind_concentration FROM trades"
         ).fetchone()
     finally:
         conn.close()
+    assert row["ind_ok"] == 1
     assert row["ind_atr"] == pytest.approx(2.5)
     assert row["ind_realized_vol"] == pytest.approx(0.018)
     assert row["ind_vol_regime"] == "normal"
@@ -1228,12 +1229,13 @@ def test_scan_persists_real_indicator_values_end_to_end(
     conn = db.get_connection()
     try:
         row = conn.execute(
-            "SELECT track_mode, ind_vol_regime, ind_rsi, ind_adx, ind_obv, "
+            "SELECT track_mode, ind_ok, ind_vol_regime, ind_rsi, ind_adx, ind_obv, "
             "ind_concentration FROM trades"
         ).fetchone()
     finally:
         conn.close()
     assert row["track_mode"] == "active"
+    assert row["ind_ok"] == 1
     # Real families computed from the frame at the signal's reference candle.
     assert row["ind_vol_regime"] in {"low", "normal", "high"}
     assert row["ind_rsi"] is not None

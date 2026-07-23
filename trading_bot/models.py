@@ -98,8 +98,10 @@ class Trade:
     sentiment_rationale: str | None = None
     heavy_news: bool = False                # headline volume above threshold
     headline_count: int | None = None       # headlines the score was based on
-    # Phase 6 advisory indicator families, captured at fire time (NULL = not
-    # computed — shadow/crypto trades, or a fail-soft empty bundle).
+    # Phase 6 advisory indicator families, captured at fire time. ``ind_ok``
+    # is nullable: True = successful computation, False = fail-soft bundle,
+    # and None = legacy/not evaluated provenance.
+    ind_ok: bool | None = None
     ind_atr: float | None = None            # ATR (absolute price distance)
     ind_realized_vol: float | None = None   # realized vol (fractional)
     ind_vol_regime: str | None = None       # low | normal | high | unknown

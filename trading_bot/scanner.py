@@ -845,6 +845,7 @@ def log_signal(
                 sentiment_rationale=getattr(sentiment, "rationale", None),
                 heavy_news=bool(getattr(sentiment, "heavy_news", False)),
                 headline_count=getattr(sentiment, "headline_count", None),
+                ind_ok=getattr(indicators, "ok", None),
                 ind_atr=getattr(indicators, "atr", None),
                 ind_realized_vol=getattr(indicators, "realized_vol", None),
                 ind_vol_regime=getattr(indicators, "vol_regime", None),

@@ -30,11 +30,11 @@ def _make_signal(**overrides: Any) -> Signal:
 def test_init_db_is_idempotent(tmp_db: Path) -> None:
     db.init_db()  # tmp_db already called init_db once; second call must not error
     db.init_db()
-    assert db.schema_version() == 26
+    assert db.schema_version() == 27
 
 
 def test_schema_version_is_1_after_init(tmp_db: Path) -> None:
-    assert db.schema_version() == 26
+    assert db.schema_version() == 27
 
 
 # ---- signals ----
@@ -262,6 +262,52 @@ def test_legacy_sentiment_label_keeps_unknown_provenance(tmp_db: Path) -> None:
     assert rows[0]["sentiment_rationale"] is None
 
 
+def test_indicator_unknown_success_and_fail_soft_round_trip(tmp_db: Path) -> None:
+    successful_id = db.insert_signal(_make_signal(ticker="GOOGL"))
+    failed_id = db.insert_signal(_make_signal(ticker="META"))
+    db.insert_trade(Trade(
+        signal_id=successful_id,
+        opened_at=datetime(2026, 6, 1, 10, 0),
+        ind_ok=True,
+        ind_vol_regime="unknown",
+        ind_concentration="unknown",
+    ))
+    db.insert_trade(Trade(
+        signal_id=failed_id,
+        opened_at=datetime(2026, 6, 1, 11, 0),
+        ind_ok=False,
+        ind_vol_regime="unknown",
+        ind_concentration="unknown",
+    ))
+
+    successful = db.get_trade_by_signal_id(successful_id)
+    failed = db.get_trade_by_signal_id(failed_id)
+    assert successful is not None and failed is not None
+    assert successful.ind_ok is True
+    assert failed.ind_ok is False
+    recent = {row["ticker"]: row for row in db.get_recent_trade_indicators()}
+    assert recent["GOOGL"]["ind_ok"] is True
+    assert recent["META"]["ind_ok"] is False
+    assert recent["GOOGL"]["ind_vol_regime"] == "unknown"
+    assert recent["META"]["ind_vol_regime"] == "unknown"
+
+
+def test_legacy_indicator_context_keeps_unknown_provenance(tmp_db: Path) -> None:
+    signal_id = db.insert_signal(_make_signal())
+    db.insert_trade(Trade(
+        signal_id=signal_id,
+        opened_at=datetime(2026, 6, 1, 10, 0),
+        ind_vol_regime="unknown",
+        ind_concentration="unknown",
+    ))
+
+    trade = db.get_trade_by_signal_id(signal_id)
+    assert trade is not None and trade.ind_ok is None
+    rows = db.get_recent_trade_indicators()
+    assert len(rows) == 1
+    assert rows[0]["ind_ok"] is None
+
+
 def test_schema_version_returns_zero_on_uninitialized_db(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -278,6 +324,7 @@ def test_get_recent_trade_indicators_only_returns_scored_rows(tmp_db: Path) -> N
     sid_scored = db.insert_signal(_make_signal(ticker="GOOGL"))
     db.insert_trade(Trade(
         signal_id=sid_scored, opened_at=datetime(2026, 6, 1, 10, 0), outcome="win",
+        ind_ok=True,
         ind_atr=2.5, ind_realized_vol=0.018, ind_vol_regime="normal",
         ind_rsi=54.3, ind_adx=27.1, ind_obv=1_234_567.0,
         ind_correlation=0.42, ind_concentration="moderate",
@@ -294,6 +341,7 @@ def test_get_recent_trade_indicators_only_returns_scored_rows(tmp_db: Path) -> N
     assert len(rows) == 1                       # NULL-regime row excluded
     row = rows[0]
     assert row["ticker"] == "GOOGL"
+    assert row["ind_ok"] is True
     assert row["ind_vol_regime"] == "normal"
     assert row["ind_rsi"] == pytest.approx(54.3)
     assert row["ind_adx"] == pytest.approx(27.1)
@@ -308,7 +356,7 @@ def test_get_recent_trade_indicators_newest_first_and_limit(tmp_db: Path) -> Non
         sid = db.insert_signal(_make_signal(ticker=ticker, signal_type=f"s{i}"))
         db.insert_trade(Trade(
             signal_id=sid, opened_at=datetime(2026, 6, 1, 10 + i, 0),
-            outcome="open", ind_vol_regime="high",
+            outcome="open", ind_ok=True, ind_vol_regime="high",
         ))
     rows = db.get_recent_trade_indicators(limit=2)
     assert [r["ticker"] for r in rows] == ["CCC", "BBB"]   # newest first, capped at 2

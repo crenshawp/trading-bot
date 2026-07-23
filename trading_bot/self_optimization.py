@@ -258,11 +258,19 @@ def _bucket_sentiment(row: Mapping[str, Any]) -> str | None:
     return _bucket_label(row, "sentiment_label", {"bearish", "neutral", "bullish"})
 
 
+def _indicator_succeeded(row: Mapping[str, Any]) -> bool:
+    return row.get("ind_ok") is True
+
+
 def _bucket_vol_regime(row: Mapping[str, Any]) -> str | None:
+    if not _indicator_succeeded(row):
+        return None
     return _bucket_label(row, "ind_vol_regime", {"low", "normal", "high"})
 
 
 def _bucket_concentration(row: Mapping[str, Any]) -> str | None:
+    if not _indicator_succeeded(row):
+        return None
     return _bucket_label(
         row, "ind_concentration", {"concentrated", "moderate", "diversified"}
     )
@@ -275,6 +283,8 @@ def _bucket_portfolio_verdict(row: Mapping[str, Any]) -> str | None:
 
 
 def _bucket_rsi(row: Mapping[str, Any]) -> str | None:
+    if not _indicator_succeeded(row):
+        return None
     value = row.get("ind_rsi")
     if value is None:
         return None
@@ -286,6 +296,8 @@ def _bucket_rsi(row: Mapping[str, Any]) -> str | None:
 
 
 def _bucket_adx(row: Mapping[str, Any]) -> str | None:
+    if not _indicator_succeeded(row):
+        return None
     value = row.get("ind_adx")
     if value is None:
         return None
@@ -297,6 +309,8 @@ def _bucket_adx(row: Mapping[str, Any]) -> str | None:
 
 
 def _bucket_obv(row: Mapping[str, Any]) -> str | None:
+    if not _indicator_succeeded(row):
+        return None
     value = row.get("ind_obv")
     if value is None:
         return None

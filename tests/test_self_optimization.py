@@ -131,6 +131,19 @@ def test_resolved_context_rows_carry_sentiment_provenance(tmp_db: Path) -> None:
     assert rows["META"]["sentiment_rationale"] == "no news data"
 
 
+def test_resolved_context_rows_carry_indicator_status(tmp_db: Path) -> None:
+    _seed_resolved(
+        tmp_db, ticker="GOOGL", ind_ok=True, ind_vol_regime="unknown",
+    )
+    _seed_resolved(
+        tmp_db, ticker="META", ind_ok=False, ind_vol_regime="unknown",
+    )
+
+    rows = {row["ticker"]: row for row in so.resolved_context_rows()}
+    assert rows["GOOGL"]["ind_ok"] is True
+    assert rows["META"]["ind_ok"] is False
+
+
 # ───────────────────────── degradation detection ────────────────────────────────
 
 
@@ -245,7 +258,7 @@ def _frow(**kw: object) -> dict[str, object]:
     base: dict[str, object] = {
         "outcome": "win", "pnl_pct": 1.0, "signal_type": "s", "ticker": "T",
         "sentiment_label": None, "sentiment_ok": True,
-        "ind_vol_regime": None, "ind_rsi": None,
+        "ind_ok": True, "ind_vol_regime": None, "ind_rsi": None,
         "ind_adx": None, "ind_obv": None, "ind_concentration": None,
         "risk_portfolio_verdict": None,
     }
@@ -317,6 +330,35 @@ def test_adx_bands_and_obv_sign_buckets() -> None:
     obv = {b.label: b.n for b in _feature(evals, "obv").buckets}
     assert adx == {"weak(<20)": 1, "moderate(20-40)": 1, "strong(>40)": 1}
     assert obv == {"negative": 1, "zero": 1, "positive": 1}
+
+
+def test_indicator_buckets_exclude_failed_and_legacy_context() -> None:
+    rows = [
+        _frow(
+            ind_ok=True, ind_vol_regime="low", ind_rsi=30.0, ind_adx=10.0,
+            ind_obv=5.0, ind_concentration="moderate",
+        ),
+        _frow(
+            ind_ok=False, ind_vol_regime="high", ind_rsi=70.0, ind_adx=50.0,
+            ind_obv=-5.0, ind_concentration="concentrated",
+        ),
+        _frow(
+            ind_ok=None, ind_vol_regime="normal", ind_rsi=50.0, ind_adx=30.0,
+            ind_obv=0.0, ind_concentration="diversified",
+        ),
+    ]
+
+    evaluations = so.compute_feature_evaluations(rows, min_sample=1)
+
+    expected = {
+        "vol_regime": ["low"],
+        "rsi": ["low(<40)"],
+        "adx": ["weak(<20)"],
+        "obv": ["positive"],
+        "concentration": ["moderate"],
+    }
+    for feature, labels in expected.items():
+        assert [b.label for b in _feature(evaluations, feature).buckets] == labels
 
 
 def test_concentration_and_verdict_buckets_skip_unknown() -> None:
