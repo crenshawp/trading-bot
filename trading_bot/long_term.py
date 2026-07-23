@@ -487,9 +487,7 @@ def close_long_term_position(
     now: datetime,
     reason: str,
 ) -> OrderResult:
-    """THE lifecycle-book closing path — a closing LIMIT via the Phase 11
-    equity path. Used by the protective exit watcher AND the Phase 15 emergency
-    shutdown, so there is exactly one closer.
+    """Legacy direct share closer retained for Phase 15 emergency shutdown.
 
     Phase 19: the closing side follows the position's direction — a long
     closes with a SELL (every genuine long-term row); a short swing-fallback
@@ -512,6 +510,53 @@ def close_long_term_position(
             exit_date=now, exit_reason=reason,
         )
     return order
+
+
+def _submit_long_term_watcher_exit(
+    broker: Broker,
+    position: LongTermPosition,
+    *,
+    exit_price: float | None,
+    now: datetime,
+    reason: str,
+) -> tuple[OrderResult | None, order_lifecycle.ExitFillMaterializationResult]:
+    """Submit remaining broker-linked quantity and apply immediate actual fills.
+
+    The legacy direct closer above remains the Phase 15 emergency path until
+    17a5; this helper cuts over only the protective watcher.
+    """
+    if position.id is None:
+        raise ValueError("lifecycle exit refused: long-term position has no durable id")
+    state = order_lifecycle.materialize_position_exit_fills(
+        "long_term", position.id
+    )
+    if not state.integrity_ok or state.remaining_qty is None:
+        raise ValueError(
+            "lifecycle exit refused: long-term fill integrity is unknown"
+            + (f" ({state.reason})" if state.reason else "")
+        )
+    attempts = db.get_pending_exit_orders_for_position("long_term", position.id)
+    if any(attempt.terminal_at is None for attempt in attempts):
+        return None, state
+    if state.remaining_qty <= 0:
+        return None, state
+
+    limit_price = exit_price if exit_price is not None else position.entry_price
+    order = order_lifecycle.submit_position_exit(
+        broker,
+        position_kind="long_term",
+        position_id=position.id,
+        requested_qty=state.remaining_qty,
+        requested_limit_price=limit_price,
+        exit_reason=reason,
+        submitted_at=now,
+        broker_result_observer=risk_of_ruin.record_broker_result,
+    )
+    if not order.ok:
+        return order, state
+    return order, order_lifecycle.materialize_position_exit_fills(
+        "long_term", position.id
+    )
 
 
 def _consecutive_closes_below_trend(
@@ -573,11 +618,12 @@ def watch_long_term_positions(
     drawdown stop with no time limit would be silently mismanaged). Neither
     path affects the other.
 
-    For a closing position it submits a closing LIMIT via the Phase 11 equity
-    path (marketable at the latest close), records the ``exit_reason``, and
-    marks the row closed. FAIL-SOFT: an error on one position is logged and
-    NEVER blocks the others. ``price_fetch`` is injected (candles per ticker),
-    keeping this testable; ``positions`` defaults to the open book from the DB.
+    A triggered position submits durable exit intent for only its actual
+    remaining quantity. Accepted/unfilled and partial attempts remain open; a
+    terminal full fill is summarized from actual broker price and time.
+    FAIL-SOFT: an error on one position is logged and NEVER blocks the others.
+    ``price_fetch`` is injected (candles per ticker), keeping this testable;
+    ``positions`` defaults to the open book from the DB.
     """
     book = positions if positions is not None else db.get_open_long_term_positions()
     actions: list[ExitAction] = []
@@ -599,13 +645,25 @@ def watch_long_term_positions(
                 actions.append(ExitAction(pos, "hold", decision.reason))
                 continue
 
-            order = close_long_term_position(
+            order, fill = _submit_long_term_watcher_exit(
                 broker, pos, exit_price=current_price, now=now,
                 reason=decision.reason,
             )
+            if not fill.integrity_ok:
+                detail = fill.reason or "exit fill integrity is unknown"
+                print(
+                    f"  longterm watcher lifecycle refusal for {pos.ticker}: "
+                    f"{detail}",
+                    file=sys.stderr,
+                )
+                actions.append(ExitAction(pos, "error", detail, order=order))
+                continue
+            if order is None:
+                actions.append(ExitAction(pos, "hold", decision.reason))
+                continue
             if not order.ok:
-                # Close not accepted (e.g. market closed) — row stays open so the
-                # next cycle retries; never recorded closed without a real order.
+                # The row stays open; durable lifecycle state decides whether a
+                # later watcher may retry or must await lookup-only recovery.
                 actions.append(ExitAction(
                     pos, "error", f"close order failed: {order.reason}", order=order,
                 ))

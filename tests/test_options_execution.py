@@ -7,6 +7,7 @@ checked against hand-built contract fixtures.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -14,9 +15,16 @@ import pytest
 
 from trading_bot import config, db
 from trading_bot import options_execution as oe
+from trading_bot.broker.base import (
+    ORDER_TYPE_LIMIT,
+    STATUS_CANCELED,
+    STATUS_FILLED,
+    TIF_DAY,
+    OrderResult,
+)
 from trading_bot.broker.fake import FakeBroker
 from trading_bot.broker.options import OptionContract
-from trading_bot.models import OptionPosition
+from trading_bot.models import OptionPosition, PendingOrder
 
 _REF = date(2026, 1, 1)
 _OPENED = datetime(2026, 1, 1, tzinfo=UTC)
@@ -359,18 +367,57 @@ def test_evaluate_exit_missing_price_holds() -> None:
 
 
 def _open_position(symbol: str, underlying: str) -> int:
-    return db.insert_option_position(OptionPosition(
+    position_id = db.insert_option_position(OptionPosition(
         symbol=symbol, underlying=underlying, option_type="call", strike=150.0,
         expiry="2026-01-16", contracts=2.0, opened_at=_OPENED, premium_entry=5.0,
         tp=110.0, sl=95.0, deadline=_DEADLINE, multiplier=100, outcome="open",
     ))
+    db.insert_pending_order(PendingOrder(
+        client_order_id=f"entry-option-{position_id}",
+        broker_order_id=f"broker-entry-option-{position_id}",
+        ticker=underlying,
+        broker_symbol=symbol,
+        asset_class="stock",
+        vehicle="option_full",
+        target_position_kind="option",
+        side="buy",
+        requested_qty=2.0,
+        requested_limit_price=5.0,
+        submitted_at=_OPENED,
+        intent_payload_json=json.dumps({
+            "intent_kind": "option",
+            "option_type": "call",
+            "strike": 150.0,
+            "expiry": "2026-01-16",
+            "multiplier": 100,
+            "delta_entry": None,
+            "theta": None,
+            "vega": None,
+            "gamma": None,
+            "tp": 110.0,
+            "sl": 95.0,
+            "deadline": _DEADLINE.isoformat(),
+        }, sort_keys=True),
+        lifecycle_status=STATUS_FILLED,
+        broker_status=STATUS_FILLED,
+        filled_qty=2.0,
+        filled_avg_price=5.0,
+        last_fill_at=_OPENED,
+        last_fill_time_source="broker",
+        last_refreshed_at=_OPENED,
+        terminal_reason=STATUS_FILLED,
+        terminal_at=_OPENED,
+        position_kind="option",
+        position_id=position_id,
+    ))
+    return position_id
 
 
 def test_watcher_closes_on_take_profit_with_sell_no_bracket(
     tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _open_position("AAPL260116C00150000", "AAPL")
-    b = FakeBroker()
+    b = FakeBroker(auto_fill=True)
     calls: list[tuple[str, float, str, dict[str, object]]] = []
     original = b.submit_order
 
@@ -417,9 +464,206 @@ def test_watcher_one_error_does_not_block_others(tmp_db: Path) -> None:
         return 111.0                       # GOOD hits take-profit
 
     actions = oe.watch_open_option_positions(
-        FakeBroker(), underlying_price_fetch=fetch,
+        FakeBroker(auto_fill=True), underlying_price_fetch=fetch,
         option_price_fetch=lambda _s: 8.0, now=_OPENED,
     )
     by_symbol = {a.position.underlying: a.action for a in actions}
     assert by_symbol["GOOD"] == "close"    # processed despite the other's error
     assert by_symbol["BAD"] == "error"     # errored, but did not block GOOD
+
+
+def test_watcher_accepted_unfilled_stays_open_and_restart_does_not_resubmit(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    position_id = _open_position("AAPL260116C00150000", "AAPL")
+    results: list[bool] = []
+    monkeypatch.setattr(oe.risk_of_ruin, "record_broker_result", results.append)
+
+    first = oe.watch_open_option_positions(
+        FakeBroker(auto_fill=False),
+        underlying_price_fetch=lambda _u: 111.0,
+        option_price_fetch=lambda _s: 8.0,
+        now=_OPENED,
+    )
+    assert first[0].action == "close"
+    position = db.get_option_position(position_id)
+    assert position is not None
+    assert position.outcome == "open"
+    assert position.closed_at is None
+    assert position.exit_price is None
+    assert position.exit_reason is None
+    assert position.pnl_dollars is None
+
+    restart_calls: list[object] = []
+    restarted_broker = FakeBroker(auto_fill=True)
+    monkeypatch.setattr(
+        restarted_broker,
+        "submit_order",
+        lambda *args, **kwargs: restart_calls.append((args, kwargs)),
+    )
+    second = oe.watch_open_option_positions(
+        restarted_broker,
+        underlying_price_fetch=lambda _u: 111.0,
+        option_price_fetch=lambda _s: 9.0,
+        now=_OPENED + timedelta(minutes=5),
+    )
+    assert second[0].action == "hold"
+    assert restart_calls == []
+    exits = db.get_pending_exit_orders_for_position("option", position_id)
+    assert len(exits) == 1
+    assert exits[0].filled_qty == 0.0
+    assert exits[0].fees_dollars is None
+    assert results == [True]
+
+
+def test_watcher_terminal_partial_retries_only_remaining_and_uses_actual_vwap(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    position_id = _open_position("AAPL260116C00150000", "AAPL")
+    quantities: list[float] = []
+    snapshots = [
+        (STATUS_CANCELED, 1.0, 6.0, "2026-01-02T15:00:00+00:00"),
+        (STATUS_FILLED, 1.0, 8.0, "2026-01-03T16:00:00+00:00"),
+    ]
+    broker = FakeBroker()
+
+    def submit(
+        symbol: str,
+        qty: float,
+        side: str,
+        *,
+        order_type: str = ORDER_TYPE_LIMIT,
+        limit_price: float | None = None,
+        time_in_force: str = TIF_DAY,
+        client_order_id: str | None = None,
+    ) -> OrderResult:
+        status, filled_qty, fill_price, filled_at = snapshots.pop(0)
+        quantities.append(qty)
+        return OrderResult(
+            ok=True,
+            status=status,
+            order_id=f"exit-{len(quantities)}",
+            client_order_id=client_order_id,
+            symbol=symbol,
+            qty=qty,
+            filled_qty=filled_qty,
+            filled_avg_price=fill_price,
+            side=side,
+            order_type=order_type,
+            time_in_force=time_in_force,
+            limit_price=limit_price,
+            submitted_at=_OPENED.isoformat(),
+            filled_at=filled_at,
+            updated_at=filled_at,
+            raw_status=status,
+        )
+
+    monkeypatch.setattr(broker, "submit_order", submit)
+    first = oe.watch_open_option_positions(
+        broker,
+        underlying_price_fetch=lambda _u: 111.0,
+        option_price_fetch=lambda _s: 99.0,
+        now=_OPENED,
+    )
+    assert first[0].action == "close"
+    partial = db.get_option_position(position_id)
+    assert partial is not None and partial.outcome == "open"
+
+    second = oe.watch_open_option_positions(
+        broker,
+        underlying_price_fetch=lambda _u: 111.0,
+        option_price_fetch=lambda _s: 101.0,
+        now=_OPENED + timedelta(days=1),
+    )
+    assert second[0].action == "close"
+    assert quantities == [2.0, 1.0]
+    closed = db.get_option_position(position_id)
+    assert closed is not None
+    assert closed.outcome == "win"
+    assert closed.exit_reason == "take_profit"
+    assert closed.exit_price == 7.0
+    assert closed.closed_at == datetime(2026, 1, 3, 16, 0, tzinfo=UTC)
+    assert closed.pnl_dollars == 400.0
+
+
+def test_watcher_trigger_reason_does_not_override_actual_economic_outcome(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    position_id = _open_position("AAPL260116C00150000", "AAPL")
+    broker = FakeBroker()
+    fill_at = "2026-01-04T17:30:00+00:00"
+
+    def submit(
+        symbol: str,
+        qty: float,
+        side: str,
+        **kwargs: object,
+    ) -> OrderResult:
+        return OrderResult(
+            ok=True,
+            status=STATUS_FILLED,
+            order_id="actual-loss",
+            client_order_id=str(kwargs["client_order_id"]),
+            symbol=symbol,
+            qty=qty,
+            filled_qty=qty,
+            filled_avg_price=4.0,
+            side=side,
+            order_type=ORDER_TYPE_LIMIT,
+            time_in_force=TIF_DAY,
+            limit_price=float(kwargs["limit_price"]),
+            submitted_at=_OPENED.isoformat(),
+            filled_at=fill_at,
+            updated_at=fill_at,
+            raw_status=STATUS_FILLED,
+        )
+
+    monkeypatch.setattr(broker, "submit_order", submit)
+    oe.watch_open_option_positions(
+        broker,
+        underlying_price_fetch=lambda _u: 111.0,
+        option_price_fetch=lambda _s: 8.0,
+        now=_OPENED,
+    )
+
+    closed = db.get_option_position(position_id)
+    assert closed is not None
+    assert closed.exit_reason == "take_profit"
+    assert closed.outcome == "loss"
+    assert closed.exit_price == 4.0
+    assert closed.closed_at == datetime(2026, 1, 4, 17, 30, tzinfo=UTC)
+    assert closed.pnl_dollars == -200.0
+
+
+def test_watcher_refuses_legacy_row_but_continues_linked_positions(
+    tmp_db: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    legacy_id = db.insert_option_position(OptionPosition(
+        symbol="LEGACY260116C00150000",
+        underlying="LEGACY",
+        option_type="call",
+        strike=150.0,
+        expiry="2026-01-16",
+        contracts=2.0,
+        opened_at=_OPENED,
+        premium_entry=5.0,
+        tp=110.0,
+        sl=95.0,
+        outcome="open",
+    ))
+    linked_id = _open_position("GOOD260116C00150000", "GOOD")
+
+    actions = oe.watch_open_option_positions(
+        FakeBroker(auto_fill=True),
+        underlying_price_fetch=lambda _u: 111.0,
+        option_price_fetch=lambda _s: 8.0,
+        now=_OPENED,
+    )
+    by_underlying = {action.position.underlying: action for action in actions}
+    assert by_underlying["LEGACY"].action == "error"
+    assert by_underlying["GOOD"].action == "close"
+    legacy = db.get_option_position(legacy_id)
+    linked = db.get_option_position(linked_id)
+    assert legacy is not None and legacy.outcome == "open"
+    assert linked is not None and linked.outcome == "win"
+    assert "lifecycle exit refused" in capsys.readouterr().err

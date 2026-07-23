@@ -14,7 +14,7 @@ import math
 import sqlite3
 import sys
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -505,6 +505,7 @@ def submit_prepared_order(
     order_role: str = "entry",
     closes_position_kind: str | None = None,
     closes_position_id: int | None = None,
+    broker_result_observer: Callable[[bool], object] | None = None,
 ) -> OrderResult:
     """Prepare, submit once with the same client ID, and bind a usable reply.
 
@@ -542,13 +543,23 @@ def submit_prepared_order(
         )
     except Exception as exc:  # noqa: BLE001 - broker boundary remains fail-soft
         print(f"  order lifecycle: broker submit error ({exc})", file=sys.stderr)
-        return OrderResult(
+        order = OrderResult(
             ok=False,
             status=STATUS_ERROR,
             symbol=broker_symbol,
             client_order_id=pending.client_order_id,
             reason=str(exc),
         )
+        if broker_result_observer is not None:
+            try:
+                broker_result_observer(order.ok)
+            except Exception as observer_exc:  # noqa: BLE001 - audit is fail-soft
+                print(
+                    f"  order lifecycle: broker-result observer error "
+                    f"({observer_exc})",
+                    file=sys.stderr,
+                )
+        return order
 
     if order.client_order_id is None:
         # The submitted identity is locally certain even when a broker response
@@ -558,6 +569,14 @@ def submit_prepared_order(
             order,
             client_order_id=pending.client_order_id,
         )
+    if broker_result_observer is not None:
+        try:
+            broker_result_observer(order.ok)
+        except Exception as observer_exc:  # noqa: BLE001 - audit is fail-soft
+            print(
+                f"  order lifecycle: broker-result observer error ({observer_exc})",
+                file=sys.stderr,
+            )
     has_broker_order_id = bool(order.order_id and order.order_id.strip())
     if order.status == STATUS_REJECTED and not has_broker_order_id:
         _abandon_prepared_order(
@@ -668,6 +687,7 @@ def submit_position_exit(
     submitted_at: datetime,
     order_type: str = ORDER_TYPE_LIMIT,
     time_in_force: str = TIF_DAY,
+    broker_result_observer: Callable[[bool], object] | None = None,
 ) -> OrderResult:
     """Dormantly prepare and submit one restart-safe typed position exit.
 
@@ -718,6 +738,7 @@ def submit_position_exit(
         order_role="exit",
         closes_position_kind=position_kind,
         closes_position_id=position_id,
+        broker_result_observer=broker_result_observer,
     )
 
 

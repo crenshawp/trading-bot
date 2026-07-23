@@ -476,9 +476,7 @@ def close_option_position(
     now: datetime,
     outcome: str,
 ) -> tuple[OrderResult, float | None]:
-    """THE option-closing path — a single-leg SELL LIMIT via the Phase 11 order
-    path (no bracket attributes exist for options). Used by the exit watcher AND
-    the Phase 15 emergency shutdown, so there is exactly one closer.
+    """Legacy direct option closer retained for Phase 15 emergency shutdown.
 
     The position row is marked closed ONLY when the broker accepted the order —
     a rejected close (e.g. market closed) leaves the row open so the next cycle
@@ -501,6 +499,51 @@ def close_option_position(
     return order, pnl
 
 
+def _submit_option_watcher_exit(
+    broker: Broker,
+    position: OptionPosition,
+    *,
+    exit_price: float | None,
+    now: datetime,
+    reason: str,
+) -> tuple[OrderResult | None, order_lifecycle.ExitFillMaterializationResult]:
+    """Submit remaining broker-linked quantity and apply immediate actual fills.
+
+    The legacy direct closer above remains the Phase 15 emergency path until
+    17a5. Watchers use this lifecycle path so acceptance is never a close.
+    """
+    if position.id is None:
+        raise ValueError("lifecycle exit refused: option position has no durable id")
+    state = order_lifecycle.materialize_position_exit_fills("option", position.id)
+    if not state.integrity_ok or state.remaining_qty is None:
+        raise ValueError(
+            "lifecycle exit refused: option fill integrity is unknown"
+            + (f" ({state.reason})" if state.reason else "")
+        )
+    attempts = db.get_pending_exit_orders_for_position("option", position.id)
+    if any(attempt.terminal_at is None for attempt in attempts):
+        return None, state
+    if state.remaining_qty <= 0:
+        return None, state
+
+    limit_price = exit_price if exit_price is not None else position.premium_entry
+    order = order_lifecycle.submit_position_exit(
+        broker,
+        position_kind="option",
+        position_id=position.id,
+        requested_qty=state.remaining_qty,
+        requested_limit_price=limit_price,
+        exit_reason=reason,
+        submitted_at=now,
+        broker_result_observer=risk_of_ruin.record_broker_result,
+    )
+    if not order.ok:
+        return order, state
+    return order, order_lifecycle.materialize_position_exit_fills(
+        "option", position.id
+    )
+
+
 def watch_open_option_positions(
     broker: Broker,
     *,
@@ -511,11 +554,10 @@ def watch_open_option_positions(
 ) -> list[ExitAction]:
     """Check each open option position and close the ones that hit TP/SL/deadline.
 
-    For a closing position it submits a single-leg SELL LIMIT (marketable at the
-    current option price; falling back to the entry premium when the current
-    price is unavailable — the documented deadline fallback) with NO bracket
-    attributes, then records the outcome + contract-aware PnL. FAIL-SOFT: an
-    error on one position is logged and NEVER blocks the others.
+    For a triggered position, durable exit intent is submitted for only the
+    actual remaining quantity. Accepted/unfilled and partial attempts remain
+    open; a terminal full fill is summarized from actual broker price and time.
+    FAIL-SOFT: an error on one position is logged and NEVER blocks the others.
     """
     book = positions if positions is not None else db.get_open_option_positions()
     actions: list[ExitAction] = []
@@ -531,24 +573,33 @@ def watch_open_option_positions(
                 continue
 
             exit_price = option_price_fetch(pos.symbol)
-            outcome = (
-                "win" if decision.reason == EXIT_TAKE_PROFIT
-                else "loss" if decision.reason == EXIT_STOP_LOSS
-                else "expired"
+            order, fill = _submit_option_watcher_exit(
+                broker, pos, exit_price=exit_price, now=now,
+                reason=decision.reason,
             )
-            order, pnl = close_option_position(
-                broker, pos, exit_price=exit_price, now=now, outcome=outcome,
-            )
+            if not fill.integrity_ok:
+                detail = fill.reason or "exit fill integrity is unknown"
+                print(
+                    f"  options watcher lifecycle refusal for {pos.symbol}: "
+                    f"{detail}",
+                    file=sys.stderr,
+                )
+                actions.append(ExitAction(pos, "error", detail, order=order))
+                continue
+            if order is None:
+                actions.append(ExitAction(pos, "hold", decision.reason))
+                continue
             if not order.ok:
-                # Close not accepted (e.g. market closed) — row stays open so the
-                # next cycle retries; never recorded closed without a real order.
+                # The row stays open; durable lifecycle state decides whether a
+                # later watcher may retry or must await lookup-only recovery.
                 actions.append(ExitAction(
                     pos, "error", f"close order failed: {order.reason}", order=order,
                 ))
                 continue
-            actions.append(
-                ExitAction(pos, "close", decision.reason, order=order, pnl_dollars=pnl)
-            )
+            actions.append(ExitAction(
+                pos, "close", decision.reason, order=order,
+                pnl_dollars=fill.pnl_dollars,
+            ))
         except Exception as exc:  # noqa: BLE001 - one position must never block others
             print(
                 f"  options watcher error for {pos.symbol}: {exc}",

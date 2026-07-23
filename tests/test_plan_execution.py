@@ -435,8 +435,9 @@ def test_watcher_hold_deadline_fires_on_carried_value(tmp_db: Path) -> None:
     import pandas as pd
 
     deadline = _NOW + timedelta(days=2)
+    broker = SpyBroker()
     pe.execute_plan(
-        SpyBroker(),
+        broker,
         ExecutionPlan(orders=[_swing_order(hold_deadline=deadline)]),
         now=_NOW,
     )
@@ -445,7 +446,7 @@ def test_watcher_hold_deadline_fires_on_carried_value(tmp_db: Path) -> None:
         "Close": [480.0] * 5, "Volume": [1_000_000] * 5,   # between TP and SL
     })
     (action,) = long_term.watch_long_term_positions(
-        SpyBroker(), price_fetch=lambda _t: flat,
+        broker, price_fetch=lambda _t: flat,
         now=deadline + timedelta(hours=1),
     )
     assert action.action == "close" and action.reason == "hold_deadline"

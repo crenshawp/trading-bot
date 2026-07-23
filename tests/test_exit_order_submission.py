@@ -531,6 +531,7 @@ def test_bind_failure_recovers_same_exit_row_without_resubmit(
 ) -> None:
     position_id = _insert_linked_option()
     broker = CountingFakeBroker()
+    observed_results: list[bool] = []
     real_update = db.update_pending_order
 
     def fail_bind(pending_order_id: int, **fields: Any) -> None:
@@ -548,7 +549,9 @@ def test_bind_failure_recovers_same_exit_row_without_resubmit(
             requested_limit_price=4.5,
             exit_reason="take_profit",
             submitted_at=_EXIT_AT,
+            broker_result_observer=observed_results.append,
         )
+    assert observed_results == [True]
     (prepared,) = db.get_pending_exit_orders_for_position("option", position_id)
     assert prepared.lifecycle_status == "prepared"
     client_order_id = prepared.client_order_id
@@ -742,12 +745,12 @@ def test_second_call_is_blocked_while_exit_attempt_is_ambiguous(tmp_db: Path) ->
     assert broker.submit_calls == 1
 
 
-def test_current_close_paths_remain_unwired_from_dormant_exit_primitive(
+def test_emergency_direct_closers_remain_unwired_until_17a5(
     tmp_db: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def dormant_must_not_run(*_args: object, **_kwargs: object) -> OrderResult:
-        raise AssertionError("current close paths must remain unchanged")
+        raise AssertionError("emergency direct closers must remain unchanged")
 
     monkeypatch.setattr(order_lifecycle, "submit_position_exit", dormant_must_not_run)
     monkeypatch.setattr(

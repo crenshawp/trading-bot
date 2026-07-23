@@ -8,6 +8,7 @@ watcher are the core.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,9 +17,11 @@ import pandas as pd
 import pytest
 
 from trading_bot import config, db, indicators, long_term, risk
+from trading_bot.broker.base import STATUS_FILLED
 from trading_bot.broker.fake import FakeBroker
 from trading_bot.earnings import EarningsInfo
 from trading_bot.long_term import LongTermCandidate, LongTermPosition
+from trading_bot.models import PendingOrder
 
 # ───────────────────────── config sanity ────────────────────────────────────
 
@@ -376,11 +379,67 @@ def test_consecutive_closes_below_trend_counts_trailing_run(
 # ───────────────────────── exit watcher (auto-executing) ────────────────────
 
 
+def _seed_linked_entry(
+    position_id: int,
+    *,
+    ticker: str,
+    entry: float,
+    qty: float,
+    source: str,
+    direction: str,
+    tp: float | None = None,
+    sl: float | None = None,
+    deadline: datetime | None = None,
+) -> None:
+    intent_kind = "long_term" if source == "long_term" else "shares_fallback"
+    payload: dict[str, object] = {
+        "intent_kind": intent_kind,
+        "source": source,
+        "direction": direction,
+    }
+    if source == "swing_fallback":
+        payload.update({
+            "tp": tp,
+            "sl": sl,
+            "deadline": deadline.isoformat() if deadline is not None else None,
+        })
+    db.insert_pending_order(PendingOrder(
+        client_order_id=f"entry-shares-{position_id}",
+        broker_order_id=f"broker-entry-shares-{position_id}",
+        ticker=ticker,
+        broker_symbol=ticker,
+        asset_class="stock",
+        vehicle="shares",
+        target_position_kind="long_term",
+        side="sell" if direction == "short" else "buy",
+        requested_qty=qty,
+        requested_limit_price=entry,
+        submitted_at=datetime(2026, 1, 1, tzinfo=UTC),
+        intent_payload_json=json.dumps(payload, sort_keys=True),
+        lifecycle_status=STATUS_FILLED,
+        broker_status=STATUS_FILLED,
+        filled_qty=qty,
+        filled_avg_price=entry,
+        last_fill_at=datetime(2026, 1, 1, tzinfo=UTC),
+        last_fill_time_source="broker",
+        last_refreshed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        terminal_reason=STATUS_FILLED,
+        terminal_at=datetime(2026, 1, 1, tzinfo=UTC),
+        position_kind="long_term",
+        position_id=position_id,
+    ))
+
+
 def _seed_position(ticker: str, entry: float, qty: float = 10.0) -> int:
-    return db.insert_long_term_position(LongTermPosition(
+    position_id = db.insert_long_term_position(LongTermPosition(
         ticker=ticker, asset_class="stock", entry_price=entry,
         entry_date=datetime(2026, 1, 1, tzinfo=UTC), qty=qty, status="open",
     ))
+    _seed_linked_entry(
+        position_id, ticker=ticker, entry=entry, qty=qty,
+        source="long_term", direction="long",
+    )
+    return position_id
 
 
 def _flat_df(price: float, n: int = 5) -> pd.DataFrame:
@@ -394,7 +453,7 @@ def test_watcher_closes_on_drawdown_stop(
     tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _seed_position("AAPL", 100.0)
-    b = FakeBroker()
+    b = FakeBroker(auto_fill=True)
     calls: list[tuple[str, float, str, dict[str, object]]] = []
     original = b.submit_order
 
@@ -427,10 +486,37 @@ def test_watcher_closes_on_trend_breakdown(tmp_db: Path) -> None:
         "Volume": [1_000_000] * len(closes),
     })
     actions = long_term.watch_long_term_positions(
-        FakeBroker(), price_fetch=lambda _t: df, now=datetime(2026, 1, 5, tzinfo=UTC),
+        FakeBroker(auto_fill=True), price_fetch=lambda _t: df,
+        now=datetime(2026, 1, 5, tzinfo=UTC),
         trend_period=3,
     )
     assert actions[0].action == "close" and actions[0].reason == "trend_breakdown"
+
+
+def test_watcher_accepted_unfilled_keeps_long_term_row_open(
+    tmp_db: Path,
+) -> None:
+    position_id = _seed_position("AAPL", 100.0)
+    actions = long_term.watch_long_term_positions(
+        FakeBroker(auto_fill=False),
+        price_fetch=lambda _t: _flat_df(70.0),
+        now=datetime(2026, 1, 5, tzinfo=UTC),
+    )
+
+    assert actions[0].action == "close"
+    position = db.get_long_term_position(position_id)
+    assert position is not None
+    assert position.status == "open"
+    assert position.exit_price is None
+    assert position.exit_date is None
+    assert position.exit_reason is None
+    (exit_order,) = db.get_pending_exit_orders_for_position(
+        "long_term", position_id
+    )
+    assert exit_order.side == "sell"
+    assert exit_order.requested_qty == 10.0
+    assert exit_order.filled_qty == 0.0
+    assert exit_order.fees_dollars is None
 
 
 def test_watcher_holds_when_no_exit(tmp_db: Path) -> None:
@@ -453,7 +539,8 @@ def test_watcher_one_error_does_not_block_others(tmp_db: Path) -> None:
         return _flat_df(70.0)                # GOOD hits the drawdown stop
 
     actions = long_term.watch_long_term_positions(
-        FakeBroker(), price_fetch=fetch, now=datetime(2026, 1, 5, tzinfo=UTC),
+        FakeBroker(auto_fill=True), price_fetch=fetch,
+        now=datetime(2026, 1, 5, tzinfo=UTC),
     )
     by_ticker = {a.position.ticker: a.action for a in actions}
     assert by_ticker["GOOD"] == "close"     # processed despite the other's error
@@ -468,19 +555,25 @@ def _seed_swing_fallback(
     tp: float | None = 500.0, sl: float | None = 465.0,
     deadline: datetime | None = None, direction: str = "long",
 ) -> int:
-    return db.insert_long_term_position(LongTermPosition(
+    position_id = db.insert_long_term_position(LongTermPosition(
         ticker=ticker, asset_class="stock", entry_price=entry,
         entry_date=datetime(2026, 1, 1, tzinfo=UTC), qty=qty, status="open",
         source="swing_fallback", direction=direction, tp=tp, sl=sl,
         deadline=deadline,
     ))
+    _seed_linked_entry(
+        position_id, ticker=ticker, entry=entry, qty=qty,
+        source="swing_fallback", direction=direction, tp=tp, sl=sl,
+        deadline=deadline,
+    )
+    return position_id
 
 
 def test_swing_fallback_closes_on_its_own_take_profit(tmp_db: Path) -> None:
     """+4.4% would be a HOLD under long-term rules — the swing TP closes it."""
     _seed_swing_fallback(tp=500.0, sl=465.0)
     actions = long_term.watch_long_term_positions(
-        FakeBroker(), price_fetch=lambda _t: _flat_df(501.0),
+        FakeBroker(auto_fill=True), price_fetch=lambda _t: _flat_df(501.0),
         now=datetime(2026, 1, 3, tzinfo=UTC),
     )
     assert actions[0].action == "close" and actions[0].reason == "take_profit"
@@ -494,7 +587,7 @@ def test_swing_fallback_closes_on_its_own_stop_loss(
     """-3.3% is nowhere near the 25% long-term drawdown stop — the swing SL
     closes it anyway, with a SELL via the equity path."""
     _seed_swing_fallback(tp=500.0, sl=465.0)
-    b = FakeBroker()
+    b = FakeBroker(auto_fill=True)
     calls: list[str] = []
     original = b.submit_order
 
@@ -546,7 +639,8 @@ def test_swing_fallback_hold_deadline_closes_like_a_swing(tmp_db: Path) -> None:
         tp=500.0, sl=465.0, deadline=datetime(2026, 1, 4, tzinfo=UTC),
     )
     actions = long_term.watch_long_term_positions(
-        FakeBroker(), price_fetch=lambda _t: _flat_df(481.0),   # between TP/SL
+        FakeBroker(auto_fill=True),
+        price_fetch=lambda _t: _flat_df(481.0),   # between TP/SL
         now=datetime(2026, 1, 5, tzinfo=UTC),                   # past deadline
     )
     assert actions[0].action == "close" and actions[0].reason == "hold_deadline"
@@ -560,7 +654,7 @@ def test_swing_fallback_short_closes_with_buy(
     """A put-signal fallback SOLD shares; its stop sits ABOVE entry and the
     close must BUY the shares back."""
     _seed_swing_fallback(direction="short", tp=460.0, sl=495.0)
-    b = FakeBroker()
+    b = FakeBroker(auto_fill=True)
     calls: list[str] = []
     original = b.submit_order
 
@@ -597,7 +691,8 @@ def test_mixed_book_neither_path_affects_the_other(tmp_db: Path) -> None:
     _seed_swing_fallback(ticker="SWNG", entry=100.0, tp=200.0, sl=10.0)
 
     actions = long_term.watch_long_term_positions(
-        FakeBroker(), price_fetch=lambda _t: _flat_df(70.0),   # -30% for both
+        FakeBroker(auto_fill=True),
+        price_fetch=lambda _t: _flat_df(70.0),   # -30% for both
         now=datetime(2026, 1, 5, tzinfo=UTC),
     )
     by_ticker = {a.position.ticker: (a.action, a.reason) for a in actions}
