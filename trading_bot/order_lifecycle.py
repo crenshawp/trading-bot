@@ -15,9 +15,11 @@ import sqlite3
 import sys
 import uuid
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from typing import Any
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from typing import Any, cast
 
 from trading_bot import db
 from trading_bot.broker.base import (
@@ -37,6 +39,7 @@ from trading_bot.broker.base import (
 )
 from trading_bot.models import (
     PENDING_ORDER_INTENT_VERSION,
+    PENDING_ORDER_POSITION_EXIT_INTENT_VERSION,
     TERMINAL_PENDING_ORDER_STATUSES,
     VALID_PENDING_ORDER_INTENT_KINDS,
     VALID_PENDING_ORDER_STATUSES,
@@ -1684,6 +1687,662 @@ def materialize_pending_order_fills(
         materialize_pending_order_fill(pending, observed_at=moment)
         for pending in pending_orders
     ]
+
+
+# ── dormant exit-fill aggregation/materialization (17a3) ────────────────────
+
+EXIT_FILL_OPEN = "open"
+EXIT_FILL_PENDING = "pending"
+EXIT_FILL_READY = "ready"
+EXIT_FILL_CLOSED = "closed"
+EXIT_FILL_UNCHANGED = "unchanged"
+EXIT_FILL_INTEGRITY_UNKNOWN = "integrity_unknown"
+_MONEY_CENT = Decimal("0.01")
+
+
+class ExitFillIntegrityError(RuntimeError):
+    """Durable entry/exit/position truth is incomplete or contradictory."""
+
+
+@dataclass(frozen=True)
+class ExitFillMaterializationResult:
+    """Aggregate actual execution truth for one typed position exit."""
+
+    position_kind: str
+    position_id: int
+    action: str
+    integrity_ok: bool
+    entry_qty: float | None = None
+    exited_qty: float | None = None
+    remaining_qty: float | None = None
+    exit_vwap: float | None = None
+    final_fill_at: datetime | None = None
+    exit_reason: str | None = None
+    pnl_dollars: float | None = None
+    outcome: str | None = None
+    final_exit_pending_order_id: int | None = None
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class _TypedExitTruth:
+    row: sqlite3.Row
+    ticker: str
+    broker_symbol: str
+    asset_class: str
+    vehicle: str
+    exit_side: str
+    entry_qty: Decimal
+    entry_vwap: Decimal
+    multiplier: Decimal
+    direction: str
+    is_open: bool
+
+
+@dataclass(frozen=True)
+class _ExitAggregation:
+    typed: _TypedExitTruth
+    exited_qty: Decimal
+    remaining_qty: Decimal
+    exit_vwap: Decimal | None
+    all_attempts_terminal: bool
+    final_fill_at: datetime | None
+    exit_reason: str | None
+    pnl_dollars: Decimal | None
+    outcome: str | None
+    final_exit_pending_order_id: int | None
+
+
+def _truth_decimal(
+    value: object,
+    label: str,
+    *,
+    positive: bool = False,
+    nonnegative: bool = False,
+) -> Decimal:
+    if value is None or isinstance(value, bool):
+        raise ExitFillIntegrityError(f"{label} is missing or non-numeric")
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ExitFillIntegrityError(f"{label} is malformed") from exc
+    if not number.is_finite():
+        raise ExitFillIntegrityError(f"{label} is not finite")
+    if positive and number <= 0:
+        raise ExitFillIntegrityError(f"{label} must be positive")
+    if nonnegative and number < 0:
+        raise ExitFillIntegrityError(f"{label} must not be negative")
+    return number
+
+
+def _truth_time(value: object, label: str) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise ExitFillIntegrityError(f"{label} is missing")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ExitFillIntegrityError(f"{label} is malformed") from exc
+    if parsed.tzinfo is None:
+        raise ExitFillIntegrityError(f"{label} is timezone-less")
+    return parsed
+
+
+def _truth_payload(
+    row: sqlite3.Row,
+    *,
+    expected_version: int,
+) -> Mapping[str, Any]:
+    if int(row["intent_payload_version"]) != expected_version:
+        raise ExitFillIntegrityError(
+            f"unsupported intent payload version {row['intent_payload_version']}"
+        )
+    try:
+        payload = json.loads(row["intent_payload_json"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ExitFillIntegrityError("intent payload is not valid JSON") from exc
+    if not isinstance(payload, Mapping):
+        raise ExitFillIntegrityError("intent payload is not a JSON object")
+    return payload
+
+
+def _load_entry_truth(
+    conn: sqlite3.Connection,
+    position_kind: str,
+    position_id: int,
+) -> sqlite3.Row:
+    rows = conn.execute(
+        "SELECT * FROM pending_orders WHERE order_role = 'entry' "
+        "AND position_kind = ? AND position_id = ? ORDER BY id ASC",
+        (position_kind, position_id),
+    ).fetchall()
+    if len(rows) != 1:
+        raise ExitFillIntegrityError(
+            "position must link to exactly one entry-role pending order"
+        )
+    entry = rows[0]
+    if entry["lifecycle_status"] not in TERMINAL_PENDING_ORDER_STATUSES:
+        raise ExitFillIntegrityError("linked entry order is not terminal")
+    if not entry["broker_order_id"]:
+        raise ExitFillIntegrityError("linked entry order has no broker order ID")
+    entry_qty = _truth_decimal(
+        entry["filled_qty"], "entry filled_qty", positive=True
+    )
+    requested_qty = _truth_decimal(
+        entry["requested_qty"], "entry requested_qty", positive=True
+    )
+    if entry_qty > requested_qty:
+        raise ExitFillIntegrityError("entry filled_qty exceeds requested_qty")
+    _truth_decimal(entry["filled_avg_price"], "entry VWAP", positive=True)
+    _truth_time(entry["last_fill_at"], "entry last_fill_at")
+    if entry["last_fill_time_source"] not in {"broker", "observed"}:
+        raise ExitFillIntegrityError("entry fill-time provenance is invalid")
+    return cast(sqlite3.Row, entry)
+
+
+def _load_typed_exit_truth(
+    conn: sqlite3.Connection,
+    position_kind: str,
+    position_id: int,
+) -> _TypedExitTruth:
+    entry = _load_entry_truth(conn, position_kind, position_id)
+    entry_qty = _truth_decimal(
+        entry["filled_qty"], "entry filled_qty", positive=True
+    )
+    entry_vwap = _truth_decimal(
+        entry["filled_avg_price"], "entry VWAP", positive=True
+    )
+    payload = _truth_payload(
+        entry,
+        expected_version=PENDING_ORDER_INTENT_VERSION,
+    )
+    if position_kind == "option":
+        row = conn.execute(
+            "SELECT * FROM option_positions WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+        if row is None:
+            raise ExitFillIntegrityError("linked option position is missing")
+        if payload.get("intent_kind") != "option":
+            raise ExitFillIntegrityError("linked option entry payload is unsupported")
+        if (
+            entry["target_position_kind"] != "option"
+            or entry["ticker"] != row["underlying"]
+            or entry["broker_symbol"] != row["symbol"]
+            or entry["asset_class"] != "stock"
+            or entry["vehicle"] != row["vehicle"]
+            or entry["side"] != "buy"
+        ):
+            raise ExitFillIntegrityError("option entry link conflicts with typed position")
+        if payload.get("option_type") != row["option_type"]:
+            raise ExitFillIntegrityError("option entry payload type conflicts")
+        contracts = _truth_decimal(
+            row["contracts"], "option contracts", positive=True
+        )
+        premium_entry = _truth_decimal(
+            row["premium_entry"], "option premium_entry", positive=True
+        )
+        multiplier = _truth_decimal(
+            row["multiplier"], "option multiplier", positive=True
+        )
+        payload_strike = _truth_decimal(
+            payload.get("strike"), "option payload strike", positive=True
+        )
+        payload_multiplier = _truth_decimal(
+            payload.get("multiplier"),
+            "option payload multiplier",
+            positive=True,
+        )
+        strike = _truth_decimal(row["strike"], "option strike", positive=True)
+        if (
+            payload_strike != strike
+            or payload_multiplier != multiplier
+            or payload.get("expiry") != row["expiry"]
+        ):
+            raise ExitFillIntegrityError("option entry payload terms conflict")
+        if contracts != entry_qty or premium_entry != entry_vwap:
+            raise ExitFillIntegrityError(
+                "option position does not match terminal entry execution"
+            )
+        is_open = row["outcome"] in (None, "open")
+        return _TypedExitTruth(
+            row=row,
+            ticker=str(row["underlying"]),
+            broker_symbol=str(row["symbol"]),
+            asset_class="stock",
+            vehicle=str(row["vehicle"]),
+            exit_side="sell",
+            entry_qty=entry_qty,
+            entry_vwap=entry_vwap,
+            multiplier=multiplier,
+            direction="long",
+            is_open=is_open,
+        )
+    if position_kind != "long_term":
+        raise ExitFillIntegrityError(
+            f"unsupported position kind {position_kind!r}"
+        )
+    row = conn.execute(
+        "SELECT * FROM long_term_positions WHERE id = ?",
+        (position_id,),
+    ).fetchone()
+    if row is None:
+        raise ExitFillIntegrityError("linked long-term position is missing")
+    source = str(row["source"])
+    direction = str(row["direction"])
+    expected_kind = "long_term" if source == "long_term" else "shares_fallback"
+    if source not in {"long_term", "swing_fallback"}:
+        raise ExitFillIntegrityError("long-term position source is unsupported")
+    if direction not in {"long", "short"}:
+        raise ExitFillIntegrityError("long-term position direction is unsupported")
+    if payload.get("intent_kind") != expected_kind:
+        raise ExitFillIntegrityError("share entry payload kind conflicts")
+    if payload.get("source") != source or payload.get("direction") != direction:
+        raise ExitFillIntegrityError("share entry payload conflicts with typed position")
+    expected_entry_side = "sell" if direction == "short" else "buy"
+    if (
+        entry["target_position_kind"] != "long_term"
+        or entry["ticker"] != row["ticker"]
+        or entry["broker_symbol"] != row["ticker"]
+        or entry["asset_class"] != row["asset_class"]
+        or entry["vehicle"] != "shares"
+        or entry["side"] != expected_entry_side
+    ):
+        raise ExitFillIntegrityError("share entry link conflicts with typed position")
+    qty = _truth_decimal(row["qty"], "share position qty", positive=True)
+    entry_price = _truth_decimal(
+        row["entry_price"], "share position entry_price", positive=True
+    )
+    if qty != entry_qty or entry_price != entry_vwap:
+        raise ExitFillIntegrityError(
+            "share position does not match terminal entry execution"
+        )
+    return _TypedExitTruth(
+        row=row,
+        ticker=str(row["ticker"]),
+        broker_symbol=str(row["ticker"]),
+        asset_class=str(row["asset_class"]),
+        vehicle="shares",
+        exit_side="buy" if direction == "short" else "sell",
+        entry_qty=entry_qty,
+        entry_vwap=entry_vwap,
+        multiplier=Decimal("1"),
+        direction=direction,
+        is_open=row["status"] == "open",
+    )
+
+
+def _aggregate_exit_truth(
+    conn: sqlite3.Connection,
+    position_kind: str,
+    position_id: int,
+) -> _ExitAggregation:
+    typed = _load_typed_exit_truth(conn, position_kind, position_id)
+    exits = conn.execute(
+        "SELECT * FROM pending_orders WHERE order_role = 'exit' "
+        "AND closes_position_kind = ? AND closes_position_id = ? "
+        "ORDER BY submitted_at ASC, id ASC",
+        (position_kind, position_id),
+    ).fetchall()
+    total_qty = Decimal("0")
+    total_value = Decimal("0")
+    all_terminal = bool(exits)
+    final_time: datetime | None = None
+    final_reason: str | None = None
+    final_order_id: int | None = None
+    previous_fill_time: datetime | None = None
+    for exit_row in exits:
+        if (
+            exit_row["target_position_kind"] != position_kind
+            or exit_row["position_kind"] is not None
+            or exit_row["position_id"] is not None
+            or exit_row["ticker"] != typed.ticker
+            or exit_row["broker_symbol"] != typed.broker_symbol
+            or exit_row["asset_class"] != typed.asset_class
+            or exit_row["vehicle"] != typed.vehicle
+            or exit_row["side"] != typed.exit_side
+        ):
+            raise ExitFillIntegrityError(
+                "exit order intent conflicts with its typed close target"
+            )
+        payload = _truth_payload(
+            exit_row,
+            expected_version=PENDING_ORDER_POSITION_EXIT_INTENT_VERSION,
+        )
+        if payload.get("intent_kind") != "position_exit":
+            raise ExitFillIntegrityError("exit order payload kind is unsupported")
+        reason = payload.get("exit_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ExitFillIntegrityError("exit order payload has no exit_reason")
+        requested_qty = _truth_decimal(
+            exit_row["requested_qty"], "exit requested_qty", positive=True
+        )
+        filled_qty = _truth_decimal(
+            exit_row["filled_qty"], "exit filled_qty", nonnegative=True
+        )
+        if filled_qty > requested_qty:
+            raise ExitFillIntegrityError("exit filled_qty exceeds requested_qty")
+        is_terminal = exit_row["lifecycle_status"] in TERMINAL_PENDING_ORDER_STATUSES
+        all_terminal = all_terminal and is_terminal
+        if filled_qty == 0:
+            if (
+                exit_row["filled_avg_price"] is not None
+                or exit_row["last_fill_at"] is not None
+                or exit_row["last_fill_time_source"] is not None
+                or exit_row["fees_dollars"] is not None
+            ):
+                raise ExitFillIntegrityError(
+                    "zero-fill exit carries price, time, or fee data"
+                )
+            continue
+        if not exit_row["broker_order_id"]:
+            raise ExitFillIntegrityError("positive exit fill has no broker order ID")
+        fill_price = _truth_decimal(
+            exit_row["filled_avg_price"], "exit VWAP", positive=True
+        )
+        fill_time = _truth_time(exit_row["last_fill_at"], "exit last_fill_at")
+        if exit_row["last_fill_time_source"] not in {"broker", "observed"}:
+            raise ExitFillIntegrityError("exit fill-time provenance is invalid")
+        if exit_row["fees_dollars"] is not None:
+            _truth_decimal(
+                exit_row["fees_dollars"],
+                "exit fees_dollars",
+                nonnegative=True,
+            )
+        if previous_fill_time is not None and fill_time < previous_fill_time:
+            raise ExitFillIntegrityError("exit fill chronology is inconsistent")
+        previous_fill_time = fill_time
+        total_qty += filled_qty
+        total_value += filled_qty * fill_price
+        final_time = fill_time
+        final_reason = reason.strip()
+        final_order_id = int(exit_row["id"])
+    if total_qty > typed.entry_qty:
+        raise ExitFillIntegrityError("aggregate exit quantity oversells entry quantity")
+    remaining = typed.entry_qty - total_qty
+    exit_vwap = total_value / total_qty if total_qty > 0 else None
+    pnl: Decimal | None = None
+    outcome: str | None = None
+    if remaining == 0:
+        if exit_vwap is None or final_time is None or final_reason is None:
+            raise ExitFillIntegrityError("full exit lacks price, time, or reason")
+        delta = exit_vwap - typed.entry_vwap
+        if typed.direction == "short":
+            delta = -delta
+        pnl = (typed.entry_qty * typed.multiplier * delta).quantize(
+            _MONEY_CENT,
+            rounding=ROUND_HALF_UP,
+        )
+        outcome = "win" if pnl > 0 else "loss" if pnl < 0 else "breakeven"
+    return _ExitAggregation(
+        typed=typed,
+        exited_qty=total_qty,
+        remaining_qty=remaining,
+        exit_vwap=exit_vwap,
+        all_attempts_terminal=all_terminal,
+        final_fill_at=final_time,
+        exit_reason=final_reason,
+        pnl_dollars=pnl,
+        outcome=outcome,
+        final_exit_pending_order_id=final_order_id,
+    )
+
+
+def _open_summary_is_clean(position_kind: str, row: sqlite3.Row) -> bool:
+    if position_kind == "option":
+        return (
+            row["closed_at"] is None
+            and row["exit_price"] is None
+            and row["exit_reason"] is None
+            and row["pnl_dollars"] is None
+        )
+    return (
+        row["exit_price"] is None
+        and row["exit_date"] is None
+        and row["exit_reason"] is None
+    )
+
+
+def _closed_summary_matches(
+    position_kind: str,
+    aggregation: _ExitAggregation,
+) -> bool:
+    row = aggregation.typed.row
+    assert aggregation.exit_vwap is not None
+    assert aggregation.final_fill_at is not None
+    assert aggregation.exit_reason is not None
+    assert aggregation.pnl_dollars is not None
+    assert aggregation.outcome is not None
+    if row["exit_price"] is None or not _same_number(
+        float(row["exit_price"]), float(aggregation.exit_vwap)
+    ):
+        return False
+    if row["exit_reason"] != aggregation.exit_reason:
+        return False
+    if position_kind == "option":
+        if row["closed_at"] is None or row["pnl_dollars"] is None:
+            return False
+        return (
+            datetime.fromisoformat(row["closed_at"]) == aggregation.final_fill_at
+            and row["outcome"] == aggregation.outcome
+            and _same_number(
+                float(row["pnl_dollars"]), float(aggregation.pnl_dollars)
+            )
+        )
+    if row["exit_date"] is None:
+        return False
+    return (
+        row["status"] == "closed"
+        and datetime.fromisoformat(row["exit_date"]) == aggregation.final_fill_at
+    )
+
+
+def _exit_result(
+    position_kind: str,
+    position_id: int,
+    action: str,
+    *,
+    aggregation: _ExitAggregation | None = None,
+    reason: str = "",
+) -> ExitFillMaterializationResult:
+    if aggregation is None:
+        return ExitFillMaterializationResult(
+            position_kind=position_kind,
+            position_id=position_id,
+            action=action,
+            integrity_ok=False,
+            reason=reason,
+        )
+    return ExitFillMaterializationResult(
+        position_kind=position_kind,
+        position_id=position_id,
+        action=action,
+        integrity_ok=True,
+        entry_qty=float(aggregation.typed.entry_qty),
+        exited_qty=float(aggregation.exited_qty),
+        remaining_qty=float(aggregation.remaining_qty),
+        exit_vwap=(
+            float(aggregation.exit_vwap)
+            if aggregation.exit_vwap is not None else None
+        ),
+        final_fill_at=aggregation.final_fill_at,
+        exit_reason=aggregation.exit_reason,
+        pnl_dollars=(
+            float(aggregation.pnl_dollars)
+            if aggregation.pnl_dollars is not None else None
+        ),
+        outcome=aggregation.outcome,
+        final_exit_pending_order_id=aggregation.final_exit_pending_order_id,
+        reason=reason,
+    )
+
+
+def _log_exit_integrity_unknown(
+    position_kind: str,
+    position_id: int,
+    reason: str,
+) -> None:
+    print(
+        f"  order lifecycle: exit fill integrity unknown for "
+        f"{position_kind}:{position_id} ({reason})",
+        file=sys.stderr,
+    )
+
+
+def _evaluate_position_exit_fills(
+    position_kind: str,
+    position_id: int,
+    *,
+    close: bool,
+) -> ExitFillMaterializationResult:
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = db.get_connection()
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE" if close else "BEGIN")
+        aggregation = _aggregate_exit_truth(conn, position_kind, position_id)
+        typed = aggregation.typed
+        if typed.is_open and not _open_summary_is_clean(position_kind, typed.row):
+            raise ExitFillIntegrityError(
+                "open typed position already carries a close summary"
+            )
+        if aggregation.remaining_qty > 0:
+            if not typed.is_open:
+                raise ExitFillIntegrityError(
+                    "typed position is closed before actual exit quantity is complete"
+                )
+            conn.commit()
+            return _exit_result(
+                position_kind,
+                position_id,
+                EXIT_FILL_OPEN,
+                aggregation=aggregation,
+            )
+        if not aggregation.all_attempts_terminal:
+            if not typed.is_open:
+                raise ExitFillIntegrityError(
+                    "typed position is closed while an exit attempt is nonterminal"
+                )
+            conn.commit()
+            return _exit_result(
+                position_kind,
+                position_id,
+                EXIT_FILL_PENDING,
+                aggregation=aggregation,
+                reason="full quantity is filled but an exit attempt remains nonterminal",
+            )
+        if not typed.is_open:
+            if not _closed_summary_matches(position_kind, aggregation):
+                raise ExitFillIntegrityError(
+                    "closed typed summary conflicts with actual exit execution"
+                )
+            conn.commit()
+            return _exit_result(
+                position_kind,
+                position_id,
+                EXIT_FILL_UNCHANGED,
+                aggregation=aggregation,
+                reason="exact close-summary replay",
+            )
+        if not close:
+            conn.commit()
+            return _exit_result(
+                position_kind,
+                position_id,
+                EXIT_FILL_READY,
+                aggregation=aggregation,
+            )
+        assert aggregation.exit_vwap is not None
+        assert aggregation.final_fill_at is not None
+        assert aggregation.exit_reason is not None
+        assert aggregation.pnl_dollars is not None
+        assert aggregation.outcome is not None
+        if position_kind == "option":
+            cursor = conn.execute(
+                "UPDATE option_positions SET closed_at = ?, exit_price = ?, "
+                "exit_reason = ?, outcome = ?, pnl_dollars = ? WHERE id = ? "
+                "AND (outcome IS NULL OR outcome = 'open') "
+                "AND closed_at IS NULL AND exit_price IS NULL "
+                "AND exit_reason IS NULL AND pnl_dollars IS NULL",
+                (
+                    aggregation.final_fill_at.isoformat(),
+                    float(aggregation.exit_vwap),
+                    aggregation.exit_reason,
+                    aggregation.outcome,
+                    float(aggregation.pnl_dollars),
+                    position_id,
+                ),
+            )
+        else:
+            cursor = conn.execute(
+                "UPDATE long_term_positions SET status = 'closed', "
+                "exit_price = ?, exit_date = ?, exit_reason = ? WHERE id = ? "
+                "AND status = 'open' AND exit_price IS NULL "
+                "AND exit_date IS NULL AND exit_reason IS NULL",
+                (
+                    float(aggregation.exit_vwap),
+                    aggregation.final_fill_at.isoformat(),
+                    aggregation.exit_reason,
+                    position_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise ExitFillIntegrityError(
+                "typed position changed before atomic close materialization"
+            )
+        conn.commit()
+        return _exit_result(
+            position_kind,
+            position_id,
+            EXIT_FILL_CLOSED,
+            aggregation=aggregation,
+        )
+    except Exception as exc:  # noqa: BLE001 - integrity boundary must fail closed
+        if conn is not None:
+            with suppress(sqlite3.Error):
+                conn.rollback()
+        reason = str(exc) or exc.__class__.__name__
+        _log_exit_integrity_unknown(position_kind, position_id, reason)
+        return _exit_result(
+            position_kind,
+            position_id,
+            EXIT_FILL_INTEGRITY_UNKNOWN,
+            reason=reason,
+        )
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def position_exit_fill_state(
+    position_kind: str,
+    position_id: int,
+) -> ExitFillMaterializationResult:
+    """Inspect aggregate actual exit truth without mutating the typed position."""
+    return _evaluate_position_exit_fills(
+        position_kind,
+        position_id,
+        close=False,
+    )
+
+
+def remaining_position_quantity(
+    position_kind: str,
+    position_id: int,
+) -> float | None:
+    """Return actual unexited quantity, or ``None`` when integrity is unknown."""
+    return position_exit_fill_state(position_kind, position_id).remaining_qty
+
+
+def materialize_position_exit_fills(
+    position_kind: str,
+    position_id: int,
+) -> ExitFillMaterializationResult:
+    """Atomically apply a complete actual exit summary, otherwise leave open."""
+    return _evaluate_position_exit_fills(
+        position_kind,
+        position_id,
+        close=True,
+    )
 
 
 @dataclass(frozen=True)
