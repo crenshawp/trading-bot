@@ -7,6 +7,7 @@ core; equity snapshots drive the drawdown check so unrealized losses count.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -15,9 +16,15 @@ import pytest
 
 from trading_bot import allocation, config, db
 from trading_bot import risk_of_ruin as ror
-from trading_bot.broker.base import AccountInfo
+from trading_bot.broker.base import STATUS_FILLED, AccountInfo
 from trading_bot.broker.fake import FakeBroker
-from trading_bot.models import LongTermPosition, OptionPosition, Signal, Trade
+from trading_bot.models import (
+    LongTermPosition,
+    OptionPosition,
+    PendingOrder,
+    Signal,
+    Trade,
+)
 
 _TS = datetime(2026, 1, 1, 9, 0, tzinfo=UTC)
 
@@ -623,19 +630,88 @@ class _ClosingFakeBroker(FakeBroker):
         return order
 
 
-def _seed_open_option() -> None:
-    db.insert_option_position(OptionPosition(
+def _seed_open_option() -> int:
+    position_id = db.insert_option_position(OptionPosition(
         symbol="AAPL260116C00150000", underlying="AAPL", option_type="call",
         strike=150.0, expiry="2026-01-16", contracts=2.0, opened_at=_TS,
         premium_entry=5.0, outcome="open",
     ))
+    db.insert_pending_order(PendingOrder(
+        client_order_id=f"risk-entry-option-{position_id}",
+        broker_order_id=f"risk-broker-entry-option-{position_id}",
+        ticker="AAPL",
+        broker_symbol="AAPL260116C00150000",
+        asset_class="stock",
+        vehicle="option_full",
+        target_position_kind="option",
+        side="buy",
+        requested_qty=2.0,
+        requested_limit_price=5.0,
+        submitted_at=_TS,
+        intent_payload_json=json.dumps({
+            "intent_kind": "option",
+            "option_type": "call",
+            "strike": 150.0,
+            "expiry": "2026-01-16",
+            "multiplier": 100,
+            "delta_entry": None,
+            "theta": None,
+            "vega": None,
+            "gamma": None,
+            "tp": None,
+            "sl": None,
+            "deadline": None,
+        }, sort_keys=True),
+        lifecycle_status=STATUS_FILLED,
+        broker_status=STATUS_FILLED,
+        filled_qty=2.0,
+        filled_avg_price=5.0,
+        last_fill_at=_TS,
+        last_fill_time_source="broker",
+        last_refreshed_at=_TS,
+        terminal_reason=STATUS_FILLED,
+        terminal_at=_TS,
+        position_kind="option",
+        position_id=position_id,
+    ))
+    return position_id
 
 
-def _seed_open_long_term() -> None:
-    db.insert_long_term_position(LongTermPosition(
+def _seed_open_long_term() -> int:
+    position_id = db.insert_long_term_position(LongTermPosition(
         ticker="META", asset_class="stock", entry_price=480.0, entry_date=_TS,
         qty=5.0, status="open",
     ))
+    db.insert_pending_order(PendingOrder(
+        client_order_id=f"risk-entry-long-{position_id}",
+        broker_order_id=f"risk-broker-entry-long-{position_id}",
+        ticker="META",
+        broker_symbol="META",
+        asset_class="stock",
+        vehicle="shares",
+        target_position_kind="long_term",
+        side="buy",
+        requested_qty=5.0,
+        requested_limit_price=480.0,
+        submitted_at=_TS,
+        intent_payload_json=json.dumps({
+            "intent_kind": "long_term",
+            "source": "long_term",
+            "direction": "long",
+        }, sort_keys=True),
+        lifecycle_status=STATUS_FILLED,
+        broker_status=STATUS_FILLED,
+        filled_qty=5.0,
+        filled_avg_price=480.0,
+        last_fill_at=_TS,
+        last_fill_time_source="broker",
+        last_refreshed_at=_TS,
+        terminal_reason=STATUS_FILLED,
+        terminal_at=_TS,
+        position_kind="long_term",
+        position_id=position_id,
+    ))
+    return position_id
 
 
 def test_emergency_shutdown_calls_all_three_closers_then_halts(
@@ -643,7 +719,7 @@ def test_emergency_shutdown_calls_all_three_closers_then_halts(
 ) -> None:
     _seed_open_option()
     _seed_open_long_term()
-    b = _ClosingFakeBroker()
+    b = _ClosingFakeBroker(auto_fill=True)
     b.set_position("NVDA", 3.0, avg_entry_price=120.0)   # broker-side equity
     rec = _Recorder()
 
@@ -688,7 +764,7 @@ def test_emergency_shutdown_market_closed_defers_and_retries(
 
     # Next cycle, market open: the retry completes and halts.
     second = ror.emergency_shutdown(
-        FakeBroker(), trigger="test", notifier=rec, now=_TS,
+        _ClosingFakeBroker(auto_fill=True), trigger="test", notifier=rec, now=_TS,
         option_price_fetch=lambda _s: 6.0,
     )
     assert second.status == "halted"
@@ -708,7 +784,7 @@ def test_emergency_shutdown_reconcile_failure_never_claims_closure(
         lambda _b: ReconciliationReport(ok=False, note="broker down"),
     )
     result = ror.emergency_shutdown(
-        FakeBroker(), trigger="test", notifier=rec, now=_TS,
+        _ClosingFakeBroker(auto_fill=True), trigger="test", notifier=rec, now=_TS,
         option_price_fetch=lambda _s: 6.0,
     )
     assert result.status == "unconfirmed"               # no false "closed" claim
@@ -730,7 +806,58 @@ def test_emergency_shutdown_holds_while_broker_still_shows_positions(
     b.set_position("NVDA", 3.0, avg_entry_price=120.0)
     result = ror.emergency_shutdown(b, trigger="test", notifier=_Recorder(), now=_TS)
     assert result.status == "holding"
+    assert result.closed == []
     assert ror.get_state() == ror.STATE_HOLDING         # alive, not halted
+
+
+def test_generic_acceptance_is_not_reported_closed_while_order_is_open(
+    tmp_db: Path,
+) -> None:
+    broker = _ClosingFakeBroker(auto_fill=False)
+    broker.set_position("NVDA", 3.0, avg_entry_price=120.0)
+
+    result = ror.emergency_shutdown(
+        broker, trigger="test", notifier=_Recorder(), now=_TS
+    )
+
+    assert result.status == "holding"
+    assert result.closed == []
+    assert "open_orders=1" in result.note
+
+
+def test_emergency_restart_does_not_duplicate_nonterminal_typed_exit(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    position_id = _seed_open_option()
+    first = ror.emergency_shutdown(
+        FakeBroker(auto_fill=False),
+        trigger="test",
+        notifier=_Recorder(),
+        now=_TS,
+        option_price_fetch=lambda _s: 6.0,
+    )
+    assert first.status == "holding"
+
+    restart_calls: list[object] = []
+    restarted = FakeBroker(auto_fill=True)
+    monkeypatch.setattr(
+        restarted,
+        "submit_order",
+        lambda *args, **kwargs: restart_calls.append((args, kwargs)),
+    )
+    second = ror.emergency_shutdown(
+        restarted,
+        trigger="test",
+        notifier=_Recorder(),
+        now=_TS + timedelta(minutes=1),
+        option_price_fetch=lambda _s: 6.0,
+    )
+
+    assert second.status == "holding"
+    assert restart_calls == []
+    assert len(db.get_pending_exit_orders_for_position("option", position_id)) == 1
+    open_position = db.get_option_position(position_id)
+    assert open_position is not None and open_position.outcome == "open"
 
 
 # ───────────────────────── re-authorization (token-gated) ───────────────────
@@ -802,8 +929,9 @@ def test_kill_switch_and_auto_trigger_produce_identical_behavior(
     # same status, the same closed book, and the same persisted end state.
     _seed_open_option()
     rec_auto = _Recorder()
+    broker = _ClosingFakeBroker(auto_fill=True)
     auto = ror.emergency_shutdown(
-        FakeBroker(), trigger="3 consecutive broker errors", notifier=rec_auto,
+        broker, trigger="3 consecutive broker errors", notifier=rec_auto,
         now=_TS, option_price_fetch=lambda _s: 6.0,
     )
     auto_state = ror.get_state()
@@ -814,7 +942,7 @@ def test_kill_switch_and_auto_trigger_produce_identical_behavior(
     _seed_open_option()
     rec_manual = _Recorder()
     manual = ror.kill_switch(
-        config.ROR_KILLSWITCH_TOKEN, FakeBroker(), notifier=rec_manual, now=_TS,
+        config.ROR_KILLSWITCH_TOKEN, broker, notifier=rec_manual, now=_TS,
         option_price_fetch=lambda _s: 6.0,
     )
 

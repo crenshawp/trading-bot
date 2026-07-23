@@ -486,29 +486,40 @@ def close_long_term_position(
     exit_price: float | None,
     now: datetime,
     reason: str,
-) -> OrderResult:
-    """Legacy direct share closer retained for Phase 15 emergency shutdown.
+) -> OrderResult | None:
+    """Restart-safe emergency share close from durable execution truth.
 
     Phase 19: the closing side follows the position's direction — a long
     closes with a SELL (every genuine long-term row); a short swing-fallback
     (put-signal shares entry) closes with a BUY.
 
-    The position row is marked closed ONLY when the broker accepted the order —
-    a rejected close (e.g. market closed) leaves it open so the next cycle
-    retries; nothing is recorded closed without a real order.
+    A still-growing entry is canceled and materialized first. Acceptance and
+    partial fills leave the typed row open; only aggregate terminal actual
+    fills write the close summary.
     """
-    limit_price = exit_price if exit_price is not None else position.entry_price
-    side = "buy" if position.direction == "short" else "sell"
-    order = broker.submit_order(
-        position.ticker, position.qty, side, order_type=ORDER_TYPE_LIMIT,
-        limit_price=limit_price, time_in_force=TIF_DAY,
+    if position.id is None:
+        raise ValueError("lifecycle exit refused: long-term position has no durable id")
+    frozen = order_lifecycle.freeze_position_entry_intent(
+        broker,
+        position_kind="long_term",
+        position_id=position.id,
+        observed_at=now,
     )
-    risk_of_ruin.record_broker_result(order.ok)   # Phase 15 detector
-    if order.ok and position.id is not None:
-        db.update_long_term_position(
-            position.id, status="closed", exit_price=exit_price,
-            exit_date=now, exit_reason=reason,
+    if not frozen.frozen:
+        raise ValueError(
+            "lifecycle exit refused: entry quantity is not frozen"
+            + (f" ({frozen.reason})" if frozen.reason else "")
         )
+    current = db.get_long_term_position(position.id)
+    if current is None or current.status != "open":
+        raise ValueError("lifecycle exit refused: long-term position is no longer open")
+    order, _fill = _submit_long_term_watcher_exit(
+        broker,
+        current,
+        exit_price=exit_price,
+        now=now,
+        reason=reason,
+    )
     return order
 
 

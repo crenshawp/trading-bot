@@ -38,7 +38,6 @@ import requests
 from trading_bot import config, db, secrets, settings
 from trading_bot.broker.base import Broker
 from trading_bot.broker.reconcile import reconcile
-from trading_bot.models import OptionPosition
 
 # A notifier sends (title, message) and returns True on a confirmed send —
 # dependency-injected so tests capture it; the default posts to Pushover.
@@ -344,8 +343,8 @@ class ShutdownResult:
     """The outcome of one emergency-shutdown pass.
 
     ``status``:
-    * ``holding``     — closes submitted but not all accepted (e.g. market
-      closed) or the broker still shows positions: the bot stays ALIVE in a
+    * ``holding``     — typed actual fills are incomplete, the broker still
+      shows positions, or closing orders remain open: the bot stays ALIVE in a
       minimal holding state and retries next cycle. It never fully shuts down
       while a position remains open.
     * ``unconfirmed`` — the broker itself was unreachable at confirmation:
@@ -359,17 +358,6 @@ class ShutdownResult:
     closed: list[str]
     pending: list[str]
     note: str = ""
-
-
-def _emergency_option_outcome(pos: OptionPosition, exit_price: float | None) -> str:
-    """Outcome label for an emergency option close, from realized premium PnL."""
-    if exit_price is None or pos.premium_entry is None:
-        return "expired"
-    if exit_price > pos.premium_entry:
-        return "win"
-    if exit_price < pos.premium_entry:
-        return "loss"
-    return "breakeven"
 
 
 def emergency_shutdown(
@@ -387,12 +375,11 @@ def emergency_shutdown(
     catastrophic trigger run THIS function; there is no separate/weaker route.
 
     1. Hard-revoke all new-position entry immediately.
-    2. Close every open position via the EXISTING closers — the Phase 13 options
-       closer, the Phase 14 long-term closer, and the Phase 11 equity order path
-       for any remaining broker-side position. Closing logic is never
-       reimplemented here.
-    3. Market closed (a close is rejected): do NOT skip — return ``holding`` so
-       the still-alive loop retries automatically at the next cycle/open.
+    2. Freeze each typed entry quantity, then route option/long-term exits
+       through the durable lifecycle. Generic broker-only positions remain on
+       the direct broker close path and never acquire synthetic typed history.
+    3. Rejected, unfilled, partial, or duplicate-pending closes return
+       ``holding`` so the still-alive loop retries or reconciles safely.
     4. Confirm closure via broker reconciliation — a position is never claimed
        closed without broker confirmation.
     5. Broker unreachable at confirmation: log the unresolvable state, Pushover
@@ -415,50 +402,83 @@ def emergency_shutdown(
 
     closed: list[str] = []
     pending: list[str] = []
+    generic_submitted: list[str] = []
+    option_book = db.get_open_option_positions()
+    long_term_book = db.get_open_long_term_positions()
+    typed_broker_symbols = {
+        *(position.symbol for position in option_book),
+        *(position.ticker for position in long_term_book),
+    }
 
-    # 2a — options book, via the Phase 13 closer.
-    for pos in db.get_open_option_positions():
+    # 2a — typed options book, via restart-safe lifecycle exit truth.
+    for pos in option_book:
         try:
             price = option_price_fetch(pos.symbol) if option_price_fetch else None
-            exit_price = price if price is not None else pos.premium_entry
             order, _pnl = oe.close_option_position(
-                broker, pos, exit_price=exit_price, now=moment,
-                outcome=_emergency_option_outcome(pos, exit_price),
+                broker, pos, exit_price=price, now=moment,
+                reason="emergency_shutdown",
             )
-            if order.ok:
-                closed.append(f"option {pos.symbol} x{pos.contracts:g} @ {exit_price}")
-            else:
+            option_current = (
+                db.get_option_position(pos.id) if pos.id is not None else None
+            )
+            if (
+                option_current is not None
+                and option_current.outcome not in (None, "open")
+            ):
+                closed.append(
+                    f"option {pos.symbol} x{pos.contracts:g} "
+                    f"@ {option_current.exit_price}"
+                )
+            elif order is None:
+                pending.append(f"option {pos.symbol} (exit already pending)")
+            elif not order.ok:
                 pending.append(f"option {pos.symbol} ({order.reason})")
+            else:
+                pending.append(f"option {pos.symbol} (awaiting actual exit fills)")
         except Exception as exc:  # noqa: BLE001 - one position must never block the rest
             print(f"  risk: option close error for {pos.symbol}: {exc}",
                   file=sys.stderr)
             pending.append(f"option {pos.symbol} (error: {exc})")
 
-    # 2b — long-term book, via the Phase 14 closer.
-    for lt_pos in db.get_open_long_term_positions():
+    # 2b — typed long-term/share-fallback book through the same lifecycle.
+    for lt_pos in long_term_book:
         try:
             price = (
                 long_term_price_fetch(lt_pos.ticker)
                 if long_term_price_fetch else None
             )
-            exit_price = price if price is not None else lt_pos.entry_price
             order = lt.close_long_term_position(
-                broker, lt_pos, exit_price=exit_price, now=moment,
+                broker, lt_pos, exit_price=price, now=moment,
                 reason="emergency_shutdown",
             )
-            if order.ok:
-                closed.append(f"long-term {lt_pos.ticker} x{lt_pos.qty:g} @ {exit_price}")
-            else:
+            long_current = (
+                db.get_long_term_position(lt_pos.id)
+                if lt_pos.id is not None else None
+            )
+            if long_current is not None and long_current.status == "closed":
+                closed.append(
+                    f"long-term {lt_pos.ticker} x{lt_pos.qty:g} "
+                    f"@ {long_current.exit_price}"
+                )
+            elif order is None:
+                pending.append(f"long-term {lt_pos.ticker} (exit already pending)")
+            elif not order.ok:
                 pending.append(f"long-term {lt_pos.ticker} ({order.reason})")
+            else:
+                pending.append(
+                    f"long-term {lt_pos.ticker} (awaiting actual exit fills)"
+                )
         except Exception as exc:  # noqa: BLE001 - one position must never block the rest
             print(f"  risk: long-term close error for {lt_pos.ticker}: {exc}",
                   file=sys.stderr)
             pending.append(f"long-term {lt_pos.ticker} (error: {exc})")
 
-    # 2c — any remaining broker-side position, via the Phase 11 equity path.
+    # 2c — generic broker-only positions stay outside typed/Tier-1 history.
     positions = broker.get_positions()
     if positions.ok:
         for bpos in positions.positions:
+            if bpos.symbol in typed_broker_symbols:
+                continue
             try:
                 price = (
                     bpos.market_value / bpos.qty
@@ -472,7 +492,9 @@ def emergency_shutdown(
                 )
                 record_broker_result(order.ok)
                 if order.ok:
-                    closed.append(f"equity {bpos.symbol} x{bpos.qty:g}")
+                    generic_submitted.append(
+                        f"equity {bpos.symbol} x{bpos.qty:g}"
+                    )
                 else:
                     pending.append(f"equity {bpos.symbol} ({order.reason})")
             except Exception as exc:  # noqa: BLE001 - one position must never block the rest
@@ -482,7 +504,7 @@ def emergency_shutdown(
     else:
         pending.append(f"broker positions unreadable ({positions.reason})")
 
-    # 3 — anything not accepted (e.g. market closed): stay alive and retry.
+    # 3 — incomplete typed execution or a rejected close stays alive/retryable.
     if pending:
         note = (
             f"{len(pending)} close(s) pending - holding state, retrying next "
@@ -510,15 +532,23 @@ def emergency_shutdown(
         settings.set(_LAST_EVENT_KEY, f"tier2 UNCONFIRMED halt: {trigger}")
         return ShutdownResult("unconfirmed", trigger, closed, pending, note)
 
-    if report.broker_symbols:
+    if (
+        report.broker_symbols
+        or report.internal_symbols
+        or (report.broker_open_orders or 0) > 0
+    ):
         note = (
-            f"broker still holds {report.broker_symbols} - holding state, "
+            f"closure not yet flat (broker={report.broker_symbols}, "
+            f"typed={report.internal_symbols}, "
+            f"open_orders={report.broker_open_orders}) - holding state, "
             "retrying next cycle"
         )
         print(f"  risk: {note}", file=sys.stderr)
         return ShutdownResult("holding", trigger, closed, pending, note)
 
-    # 6 — every position broker-confirmed closed: full halt.
+    # 6 — every position broker-confirmed closed: full halt. Generic direct
+    # submissions are reported closed only after this authoritative flat read.
+    closed.extend(generic_submitted)
     _set_state(STATE_HALTED)
     settings.set(_LAST_EVENT_KEY, f"tier2 halt complete: {trigger}")
     _safe_send(

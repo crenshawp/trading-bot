@@ -601,6 +601,194 @@ class _PositionExitSubmission:
     held_qty: float
 
 
+@dataclass(frozen=True)
+class EntryIntentFreezeResult:
+    """Whether one typed position's entry quantity is durably final."""
+
+    position_kind: str
+    position_id: int
+    frozen: bool
+    action: str
+    pending_order_id: int | None = None
+    reason: str = ""
+
+
+def _entry_freeze_result(
+    position_kind: str,
+    position_id: int,
+    *,
+    frozen: bool,
+    action: str,
+    pending: PendingOrder | None = None,
+    reason: str = "",
+) -> EntryIntentFreezeResult:
+    return EntryIntentFreezeResult(
+        position_kind=position_kind,
+        position_id=position_id,
+        frozen=frozen,
+        action=action,
+        pending_order_id=pending.id if pending is not None else None,
+        reason=reason,
+    )
+
+
+def freeze_position_entry_intent(
+    broker: Broker,
+    *,
+    position_kind: str,
+    position_id: int,
+    observed_at: datetime | None = None,
+) -> EntryIntentFreezeResult:
+    """Terminalize and materialize a still-growing entry before emergency exit.
+
+    Prepared intent is recovered by client ID only. A bound nonterminal entry
+    is canceled once, then read back for its final cumulative fill snapshot and
+    persisted through the same monotonic refresh path. Failure leaves the entry
+    and typed position retryable and refuses the emergency exit.
+    """
+    moment = observed_at or datetime.now(UTC)
+    try:
+        entries = db.get_pending_entry_orders_for_position(
+            position_kind, position_id
+        )
+    except (sqlite3.Error, TypeError, ValueError) as exc:
+        return _entry_freeze_result(
+            position_kind,
+            position_id,
+            frozen=False,
+            action="integrity_unknown",
+            reason=f"entry-link lookup failed: {exc}",
+        )
+    if len(entries) != 1:
+        return _entry_freeze_result(
+            position_kind,
+            position_id,
+            frozen=False,
+            action="integrity_unknown",
+            reason="emergency exit requires exactly one linked entry intent",
+        )
+    entry = entries[0]
+    client_order_id = entry.client_order_id
+    if client_order_id is None:
+        return _entry_freeze_result(
+            position_kind,
+            position_id,
+            frozen=False,
+            action="integrity_unknown",
+            pending=entry,
+            reason="linked entry has no durable client-order identity",
+        )
+    if entry.lifecycle_status == "prepared":
+        refresh_pending_order(broker, entry, observed_at=moment)
+        refreshed = db.get_pending_order_by_client_order_id(client_order_id)
+        if refreshed is None:
+            return _entry_freeze_result(
+                position_kind,
+                position_id,
+                frozen=False,
+                action="integrity_unknown",
+                pending=entry,
+                reason="prepared entry disappeared during lookup-only recovery",
+            )
+        entry = refreshed
+    if entry.lifecycle_status not in TERMINAL_PENDING_ORDER_STATUSES:
+        broker_order_id = entry.broker_order_id
+        if broker_order_id is None:
+            return _entry_freeze_result(
+                position_kind,
+                position_id,
+                frozen=False,
+                action="pending",
+                pending=entry,
+                reason="entry intent is not bound and cannot be canceled safely",
+            )
+        try:
+            canceled = broker.cancel_order(broker_order_id)
+        except Exception as exc:  # noqa: BLE001 - broker cancel must fail soft
+            return _entry_freeze_result(
+                position_kind,
+                position_id,
+                frozen=False,
+                action="pending",
+                pending=entry,
+                reason=f"entry cancel raised: {exc}",
+            )
+        if not canceled.ok or canceled.status == STATUS_ERROR:
+            return _entry_freeze_result(
+                position_kind,
+                position_id,
+                frozen=False,
+                action="pending",
+                pending=entry,
+                reason=canceled.reason or "entry cancel was not accepted",
+            )
+        try:
+            final_snapshot = broker.get_order(broker_order_id)
+        except Exception as exc:  # noqa: BLE001 - final fill read must fail soft
+            return _entry_freeze_result(
+                position_kind,
+                position_id,
+                frozen=False,
+                action="pending",
+                pending=entry,
+                reason=f"canceled entry final snapshot raised: {exc}",
+            )
+        if not final_snapshot.ok or final_snapshot.status == STATUS_ERROR:
+            return _entry_freeze_result(
+                position_kind,
+                position_id,
+                frozen=False,
+                action="pending",
+                pending=entry,
+                reason=(
+                    final_snapshot.reason
+                    or "canceled entry final snapshot is unavailable"
+                ),
+            )
+        refresh = _apply_bound_refresh(entry, final_snapshot, observed_at=moment)
+        if refresh.lifecycle_status not in TERMINAL_PENDING_ORDER_STATUSES:
+            return _entry_freeze_result(
+                position_kind,
+                position_id,
+                frozen=False,
+                action="pending",
+                pending=entry,
+                reason=refresh.reason or "entry remains nonterminal after cancel",
+            )
+        refreshed = db.get_pending_order_by_client_order_id(client_order_id)
+        if refreshed is None:
+            return _entry_freeze_result(
+                position_kind,
+                position_id,
+                frozen=False,
+                action="integrity_unknown",
+                pending=entry,
+                reason="canceled entry disappeared before materialization",
+            )
+        entry = refreshed
+    materialized = materialize_pending_order_fill(entry, observed_at=moment)
+    if materialized.action == MATERIALIZE_FAILED:
+        return _entry_freeze_result(
+            position_kind,
+            position_id,
+            frozen=False,
+            action="integrity_unknown",
+            pending=entry,
+            reason=materialized.reason or "terminal entry fill could not be materialized",
+        )
+    return _entry_freeze_result(
+        position_kind,
+        position_id,
+        frozen=True,
+        action=(
+            "already_terminal"
+            if entries[0].lifecycle_status in TERMINAL_PENDING_ORDER_STATUSES
+            else "canceled"
+        ),
+        pending=entry,
+    )
+
+
 def _terminal_linked_entry_qty(position_kind: str, position_id: int) -> float:
     """Return terminal actual entry quantity for one broker-linked position."""
     conn = db.get_connection()
@@ -2366,12 +2554,34 @@ def materialize_position_exit_fills(
     )
 
 
+def materialize_pending_exit_order_fills() -> list[ExitFillMaterializationResult]:
+    """Replay every positive exit row, including terminal and lagging rows."""
+    try:
+        exit_orders = db.get_pending_exit_orders_with_fills()
+    except sqlite3.Error as exc:
+        print(
+            f"  order lifecycle: exit materialization query failed ({exc})",
+            file=sys.stderr,
+        )
+        return []
+    results: list[ExitFillMaterializationResult] = []
+    for pending in exit_orders:
+        position_kind = pending.closes_position_kind
+        position_id = pending.closes_position_id
+        if position_kind is None or position_id is None:
+            _log_materialize_issue(pending, "exit row has no immutable close target")
+            continue
+        results.append(materialize_position_exit_fills(position_kind, position_id))
+    return results
+
+
 @dataclass(frozen=True)
 class PendingOrderReconciliationResult:
     """One ordered refresh-then-materialize scanner pass."""
 
     refreshes: tuple[PendingOrderRefreshResult, ...]
     materializations: tuple[FillMaterializationResult, ...]
+    exit_materializations: tuple[ExitFillMaterializationResult, ...] = ()
 
 
 def reconcile_pending_orders(
@@ -2404,7 +2614,16 @@ def reconcile_pending_orders(
             file=sys.stderr,
         )
         materializations = []
+    try:
+        exit_materializations = materialize_pending_exit_order_fills()
+    except Exception as exc:  # noqa: BLE001 - exit rows remain durable and retryable
+        print(
+            f"  order lifecycle: exit materialization phase failed ({exc})",
+            file=sys.stderr,
+        )
+        exit_materializations = []
     return PendingOrderReconciliationResult(
         refreshes=tuple(refreshes),
         materializations=tuple(materializations),
+        exit_materializations=tuple(exit_materializations),
     )

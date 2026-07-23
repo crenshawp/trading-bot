@@ -745,48 +745,36 @@ def test_second_call_is_blocked_while_exit_attempt_is_ambiguous(tmp_db: Path) ->
     assert broker.submit_calls == 1
 
 
-def test_emergency_direct_closers_remain_unwired_until_17a5(
+def test_emergency_direct_closers_use_lifecycle_and_leave_unfilled_rows_open(
     tmp_db: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def dormant_must_not_run(*_args: object, **_kwargs: object) -> OrderResult:
-        raise AssertionError("emergency direct closers must remain unchanged")
+    option_id = _insert_linked_option(qty=1.0)
+    long_id = _insert_linked_shares(qty=1.0)
+    option_position = db.get_option_position(option_id)
+    long_position = db.get_long_term_position(long_id)
+    assert option_position is not None and long_position is not None
+    broker = FakeBroker(auto_fill=False)
 
-    monkeypatch.setattr(order_lifecycle, "submit_position_exit", dormant_must_not_run)
-    monkeypatch.setattr(
-        options_execution.risk_of_ruin,
-        "record_broker_result",
-        lambda _ok: None,
-    )
     option_order, _ = options_execution.close_option_position(
-        FakeBroker(),
-        OptionPosition(
-            symbol=_OPTION_SYMBOL,
-            underlying="GOOGL",
-            option_type="call",
-            strike=190.0,
-            expiry="2026-09-18",
-            contracts=1.0,
-            opened_at=_FILL_AT,
-            premium_entry=4.2,
-        ),
+        broker,
+        option_position,
         exit_price=4.5,
         now=_EXIT_AT,
-        outcome="win",
+        reason="emergency_shutdown",
     )
     long_order = long_term.close_long_term_position(
-        FakeBroker(),
-        LongTermPosition(
-            ticker="GOOGL",
-            asset_class="stock",
-            entry_price=174.5,
-            entry_date=_FILL_AT,
-            qty=1.0,
-        ),
+        broker,
+        long_position,
         exit_price=176.0,
         now=_EXIT_AT,
-        reason="trend_breakdown",
+        reason="emergency_shutdown",
     )
 
-    assert option_order.ok is True and long_order.ok is True
-    assert db.get_pending_orders() == []
+    assert option_order is not None and option_order.ok is True
+    assert long_order is not None and long_order.ok is True
+    open_option = db.get_option_position(option_id)
+    open_long = db.get_long_term_position(long_id)
+    assert open_option is not None and open_option.outcome == "open"
+    assert open_long is not None and open_long.status == "open"
+    assert len(db.get_pending_exit_orders_for_position("option", option_id)) == 1
+    assert len(db.get_pending_exit_orders_for_position("long_term", long_id)) == 1

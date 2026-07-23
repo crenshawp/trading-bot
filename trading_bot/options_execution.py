@@ -456,47 +456,44 @@ def evaluate_option_exit(
     return ExitDecision("hold", EXIT_HOLDING)
 
 
-def _option_pnl_dollars(
-    position: OptionPosition, exit_price: float | None,
-) -> float | None:
-    """Contract-aware realized PnL: ``(exit − entry) × multiplier × contracts``."""
-    if exit_price is None or position.premium_entry is None:
-        return None
-    return (
-        (exit_price - position.premium_entry)
-        * position.multiplier * position.contracts
-    )
-
-
 def close_option_position(
     broker: Broker,
     position: OptionPosition,
     *,
     exit_price: float | None,
     now: datetime,
-    outcome: str,
-) -> tuple[OrderResult, float | None]:
-    """Legacy direct option closer retained for Phase 15 emergency shutdown.
+    reason: str,
+) -> tuple[OrderResult | None, float | None]:
+    """Restart-safe emergency option close from durable execution truth.
 
-    The position row is marked closed ONLY when the broker accepted the order —
-    a rejected close (e.g. market closed) leaves the row open so the next cycle
-    retries; nothing is ever recorded closed that was not submitted.
-    Returns ``(order, realized_pnl_dollars)``.
+    A still-growing entry is canceled and materialized first. Acceptance and
+    partial fills leave the typed position open; only aggregate terminal actual
+    fills produce P/L and a close summary.
     """
-    limit_price = exit_price if exit_price is not None else position.premium_entry
-    order = broker.submit_order(
-        position.symbol, position.contracts, "sell",
-        order_type=ORDER_TYPE_LIMIT, limit_price=limit_price,
-        time_in_force=TIF_DAY,
+    if position.id is None:
+        raise ValueError("lifecycle exit refused: option position has no durable id")
+    frozen = order_lifecycle.freeze_position_entry_intent(
+        broker,
+        position_kind="option",
+        position_id=position.id,
+        observed_at=now,
     )
-    risk_of_ruin.record_broker_result(order.ok)   # Phase 15 detector
-    pnl = _option_pnl_dollars(position, exit_price)
-    if order.ok and position.id is not None:
-        db.update_option_position(
-            position.id, order_id=order.order_id, outcome=outcome,
-            closed_at=now, exit_price=exit_price, pnl_dollars=pnl,
+    if not frozen.frozen:
+        raise ValueError(
+            "lifecycle exit refused: entry quantity is not frozen"
+            + (f" ({frozen.reason})" if frozen.reason else "")
         )
-    return order, pnl
+    current = db.get_option_position(position.id)
+    if current is None or current.outcome not in (None, "open"):
+        raise ValueError("lifecycle exit refused: option position is no longer open")
+    order, fill = _submit_option_watcher_exit(
+        broker,
+        current,
+        exit_price=exit_price,
+        now=now,
+        reason=reason,
+    )
+    return order, fill.pnl_dollars
 
 
 def _submit_option_watcher_exit(

@@ -1319,10 +1319,15 @@ def _run_order_lifecycle_cycle() -> None:
             }
             for item in result.materializations
         )
-        if changed or materialized:
+        exits_closed = sum(
+            item.action == order_lifecycle.EXIT_FILL_CLOSED
+            for item in result.exit_materializations
+        )
+        if changed or materialized or exits_closed:
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] order lifecycle: "
-                f"{changed} refreshed, {materialized} materialized"
+                f"{changed} refreshed, {materialized} entries materialized, "
+                f"{exits_closed} exits closed"
             )
     except Exception as exc:  # noqa: BLE001 - scanner recovery must fail soft
         print(f"  order lifecycle cycle error: {exc}", file=sys.stderr)

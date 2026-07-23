@@ -4693,6 +4693,27 @@ def get_pending_exit_orders_for_position(
     return [_row_to_pending_order(row) for row in rows]
 
 
+def get_pending_entry_orders_for_position(
+    position_kind: str, position_id: int,
+) -> list[PendingOrder]:
+    """Return every entry row linked to one materialized typed position."""
+    if position_kind not in VALID_PENDING_ORDER_POSITION_KINDS:
+        raise ValueError(f"Invalid pending-order position kind '{position_kind}'")
+    if position_id <= 0:
+        raise ValueError("pending-order position_id must be positive")
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM pending_orders "
+            "WHERE order_role = 'entry' AND position_kind = ? "
+            "AND position_id = ? ORDER BY submitted_at ASC, id ASC",
+            (position_kind, position_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_pending_order(row) for row in rows]
+
+
 def update_pending_order(pending_order_id: int, **fields: Any) -> None:
     """Bind once, or update cumulative broker truth and the position link."""
     unknown = set(fields) - _PENDING_ORDER_UPDATABLE_FIELDS
@@ -4803,6 +4824,20 @@ def get_pending_orders_with_fills() -> list[PendingOrder]:
         rows = conn.execute(
             "SELECT * FROM pending_orders "
             "WHERE order_role = 'entry' AND filled_qty > 0 "
+            "ORDER BY submitted_at ASC, id ASC"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_pending_order(row) for row in rows]
+
+
+def get_pending_exit_orders_with_fills() -> list[PendingOrder]:
+    """Every exit row carrying cumulative execution truth, terminal or not."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM pending_orders "
+            "WHERE order_role = 'exit' AND filled_qty > 0 "
             "ORDER BY submitted_at ASC, id ASC"
         ).fetchall()
     finally:
