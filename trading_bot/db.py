@@ -17,6 +17,7 @@ from typing import Any
 from trading_bot import config
 from trading_bot.models import (
     LEGACY_PENDING_ORDER_CLIENT_ID_PREFIX,
+    PENDING_ORDER_GENERIC_EMERGENCY_INTENT_VERSION,
     PENDING_ORDER_INTENT_VERSION,
     PENDING_ORDER_POSITION_EXIT_INTENT_VERSION,
     TERMINAL_PENDING_ORDER_STATUSES,
@@ -63,6 +64,7 @@ from trading_bot.models import (
 # Version 6 (Phase 3.1) — adds the active_watchlist table (DB-driven watchlist).
 # Version 5 (Phase 2.3) — adds trades.context_score + predictions.context_score.
 # Version 4 (Phase 2.2b) — adds predictions + settings tables.
+# Version 30 (cross-cutting audit) — adds generic-emergency close outbox rows.
 # Version 29 (cross-cutting audit) — adds exit-role order lifecycle truth.
 # Version 28 (cross-cutting audit) — persists risk assessment status + reason.
 # Version 27 (cross-cutting audit) — persists indicator computation status.
@@ -83,7 +85,7 @@ from trading_bot.models import (
 # Version 13 (Phase 6) — adds trades.ind_* advisory indicator-family columns.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 30
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -418,7 +420,7 @@ CREATE TABLE IF NOT EXISTS pending_orders (
         broker_order_id IS NULL OR TRIM(broker_order_id) <> ''
     ),
     order_role TEXT NOT NULL DEFAULT 'entry'
-        CHECK (order_role IN ('entry','exit')),
+        CHECK (order_role IN ('entry','exit','generic_emergency')),
     ticker TEXT NOT NULL,
     broker_symbol TEXT NOT NULL,
     asset_class TEXT NOT NULL CHECK (asset_class IN ('stock','crypto')),
@@ -466,6 +468,10 @@ CREATE TABLE IF NOT EXISTS pending_orders (
             order_role = 'exit'
             AND closes_position_kind = target_position_kind
             AND closes_position_id > 0
+        )
+        OR (
+            order_role = 'generic_emergency'
+            AND closes_position_kind IS NULL AND closes_position_id IS NULL
         )
     ),
     CHECK (
@@ -527,6 +533,13 @@ CREATE TABLE IF NOT EXISTS pending_orders (
     CHECK (
         order_role = 'entry'
         OR (position_kind IS NULL AND position_id IS NULL)
+    ),
+    CHECK (
+        order_role <> 'generic_emergency'
+        OR (
+            target_position_kind = 'long_term' AND vehicle = 'shares'
+            AND signal_id IS NULL
+        )
     ),
     CHECK (position_kind IS NULL OR position_kind = target_position_kind),
     CHECK (
@@ -1323,6 +1336,17 @@ def _create_v29_pending_order_objects(conn: sqlite3.Connection) -> None:
     )
 
 
+def _create_v30_pending_order_objects(conn: sqlite3.Connection) -> None:
+    """Create v30 objects while retaining every typed v29 invariant."""
+    _create_v29_pending_order_objects(conn)
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "idx_pending_orders_generic_nonterminal "
+        "ON pending_orders(broker_symbol) "
+        "WHERE order_role = 'generic_emergency' AND terminal_at IS NULL"
+    )
+
+
 def _migrate_to_v29(conn: sqlite3.Connection) -> None:
     """Add dormant exit-role lifecycle truth without rewriting legacy intent.
 
@@ -1551,6 +1575,209 @@ def _migrate_to_v29(conn: sqlite3.Connection) -> None:
     _create_v29_pending_order_objects(conn)
 
 
+def _migrate_to_v30(conn: sqlite3.Connection) -> None:
+    """Add generic-emergency outbox intent without weakening typed roles."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'pending_orders'"
+    ).fetchone()
+    table_sql = str(row["sql"] or "") if row is not None else ""
+    if "generic_emergency" in table_sql:
+        _create_v30_pending_order_objects(conn)
+        return
+
+    conn.execute(
+        """
+        CREATE TABLE pending_orders_v30 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_order_id TEXT NOT NULL UNIQUE
+                CHECK (TRIM(client_order_id) <> ''),
+            broker_order_id TEXT UNIQUE CHECK (
+                broker_order_id IS NULL OR TRIM(broker_order_id) <> ''
+            ),
+            order_role TEXT NOT NULL DEFAULT 'entry' CHECK (
+                order_role IN ('entry','exit','generic_emergency')
+            ),
+            ticker TEXT NOT NULL,
+            broker_symbol TEXT NOT NULL,
+            asset_class TEXT NOT NULL CHECK (asset_class IN ('stock','crypto')),
+            vehicle TEXT NOT NULL CHECK (
+                vehicle IN ('option_full','option_undersized','shares')
+            ),
+            target_position_kind TEXT NOT NULL CHECK (
+                target_position_kind IN ('option','long_term')
+            ),
+            closes_position_kind TEXT CHECK (
+                closes_position_kind IN ('option','long_term')
+            ),
+            closes_position_id INTEGER,
+            side TEXT NOT NULL CHECK (side IN ('buy','sell')),
+            requested_qty REAL NOT NULL CHECK (requested_qty > 0),
+            requested_limit_price REAL CHECK (
+                requested_limit_price IS NULL OR requested_limit_price > 0
+            ),
+            submitted_at TEXT NOT NULL,
+            signal_id INTEGER,
+            intent_payload_version INTEGER NOT NULL DEFAULT 1 CHECK (
+                intent_payload_version >= 1
+            ),
+            intent_payload_json TEXT NOT NULL,
+            lifecycle_status TEXT NOT NULL DEFAULT 'new' CHECK (
+                lifecycle_status IN (
+                    'prepared','new','partially_filled','filled','canceled',
+                    'rejected','expired','unknown','abandoned'
+                )
+            ),
+            broker_status TEXT,
+            filled_qty REAL NOT NULL DEFAULT 0 CHECK (filled_qty >= 0),
+            filled_avg_price REAL,
+            last_fill_at TEXT,
+            last_fill_time_source TEXT CHECK (
+                last_fill_time_source IN ('broker','observed')
+            ),
+            fees_dollars REAL CHECK (
+                fees_dollars IS NULL OR fees_dollars >= 0
+            ),
+            last_refreshed_at TEXT,
+            terminal_reason TEXT,
+            terminal_at TEXT,
+            position_kind TEXT CHECK (position_kind IN ('option','long_term')),
+            position_id INTEGER,
+            CHECK (
+                (order_role = 'entry'
+                 AND closes_position_kind IS NULL
+                 AND closes_position_id IS NULL)
+                OR (
+                    order_role = 'exit'
+                    AND closes_position_kind = target_position_kind
+                    AND closes_position_id > 0
+                )
+                OR (
+                    order_role = 'generic_emergency'
+                    AND closes_position_kind IS NULL
+                    AND closes_position_id IS NULL
+                )
+            ),
+            CHECK (
+                (target_position_kind = 'option'
+                 AND vehicle IN ('option_full','option_undersized')
+                 AND (
+                     (order_role = 'entry' AND side = 'buy')
+                     OR (order_role = 'exit' AND side = 'sell')
+                 ))
+                OR (
+                    target_position_kind = 'long_term'
+                    AND vehicle = 'shares'
+                )
+            ),
+            CHECK (
+                (filled_qty = 0 AND filled_avg_price IS NULL
+                 AND last_fill_at IS NULL AND last_fill_time_source IS NULL
+                 AND fees_dollars IS NULL)
+                OR (
+                    filled_qty > 0 AND filled_avg_price > 0
+                    AND (
+                        (last_fill_at IS NULL
+                         AND last_fill_time_source IS NULL)
+                        OR (
+                            TRIM(COALESCE(last_fill_at, '')) <> ''
+                            AND last_fill_time_source IN ('broker','observed')
+                        )
+                    )
+                )
+            ),
+            CHECK (
+                (lifecycle_status IN (
+                    'filled','canceled','rejected','expired','abandoned'
+                 )
+                 AND terminal_at IS NOT NULL
+                 AND TRIM(COALESCE(terminal_reason, '')) <> '')
+                OR (
+                    lifecycle_status IN (
+                        'prepared','new','partially_filled','unknown'
+                    )
+                    AND terminal_at IS NULL AND terminal_reason IS NULL
+                )
+            ),
+            CHECK (
+                (lifecycle_status IN ('prepared','abandoned')
+                 AND broker_order_id IS NULL)
+                OR (
+                    lifecycle_status NOT IN ('prepared','abandoned')
+                    AND broker_order_id IS NOT NULL
+                )
+            ),
+            CHECK (
+                lifecycle_status <> 'prepared'
+                OR (
+                    broker_status IS NULL AND filled_qty = 0
+                    AND filled_avg_price IS NULL AND last_refreshed_at IS NULL
+                    AND position_kind IS NULL AND position_id IS NULL
+                )
+            ),
+            CHECK (
+                lifecycle_status <> 'abandoned'
+                OR (
+                    broker_status IS NULL AND filled_qty = 0
+                    AND filled_avg_price IS NULL
+                    AND position_kind IS NULL AND position_id IS NULL
+                )
+            ),
+            CHECK (
+                (position_kind IS NULL AND position_id IS NULL)
+                OR (position_kind IS NOT NULL AND position_id > 0)
+            ),
+            CHECK (
+                order_role = 'entry'
+                OR (position_kind IS NULL AND position_id IS NULL)
+            ),
+            CHECK (
+                order_role <> 'generic_emergency'
+                OR (
+                    target_position_kind = 'long_term' AND vehicle = 'shares'
+                    AND signal_id IS NULL
+                )
+            ),
+            CHECK (
+                position_kind IS NULL
+                OR position_kind = target_position_kind
+            ),
+            CHECK (
+                position_id IS NULL
+                OR (filled_qty > 0 AND filled_avg_price > 0)
+            )
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO pending_orders_v30 (
+            id, client_order_id, broker_order_id, order_role, ticker,
+            broker_symbol, asset_class, vehicle, target_position_kind,
+            closes_position_kind, closes_position_id, side, requested_qty,
+            requested_limit_price, submitted_at, signal_id,
+            intent_payload_version, intent_payload_json, lifecycle_status,
+            broker_status, filled_qty, filled_avg_price, last_fill_at,
+            last_fill_time_source, fees_dollars, last_refreshed_at,
+            terminal_reason, terminal_at, position_kind, position_id
+        )
+        SELECT
+            id, client_order_id, broker_order_id, order_role, ticker,
+            broker_symbol, asset_class, vehicle, target_position_kind,
+            closes_position_kind, closes_position_id, side, requested_qty,
+            requested_limit_price, submitted_at, signal_id,
+            intent_payload_version, intent_payload_json, lifecycle_status,
+            broker_status, filled_qty, filled_avg_price, last_fill_at,
+            last_fill_time_source, fees_dollars, last_refreshed_at,
+            terminal_reason, terminal_at, position_kind, position_id
+        FROM pending_orders
+        """
+    )
+    conn.execute("DROP TABLE pending_orders")
+    conn.execute("ALTER TABLE pending_orders_v30 RENAME TO pending_orders")
+    _create_v30_pending_order_objects(conn)
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -1584,6 +1811,7 @@ def init_db() -> None:
         _migrate_to_v27(conn)
         _migrate_to_v28(conn)
         _migrate_to_v29(conn)
+        _migrate_to_v30(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -4243,11 +4471,12 @@ def _validate_optional_json_number(
 
 def _validate_pending_order_payload(order: PendingOrder) -> None:
     """Validate the supported immutable materialization-payload contract."""
-    expected_version = (
-        PENDING_ORDER_POSITION_EXIT_INTENT_VERSION
-        if order.order_role == "exit"
-        else PENDING_ORDER_INTENT_VERSION
-    )
+    if order.order_role == "exit":
+        expected_version = PENDING_ORDER_POSITION_EXIT_INTENT_VERSION
+    elif order.order_role == "generic_emergency":
+        expected_version = PENDING_ORDER_GENERIC_EMERGENCY_INTENT_VERSION
+    else:
+        expected_version = PENDING_ORDER_INTENT_VERSION
     if order.intent_payload_version != expected_version:
         raise ValueError(
             "Unsupported pending-order intent payload version "
@@ -4267,6 +4496,21 @@ def _validate_pending_order_payload(order: PendingOrder) -> None:
             f"(expected one of {sorted(VALID_PENDING_ORDER_INTENT_KINDS)})"
         )
 
+    if order.order_role == "generic_emergency":
+        if intent_kind != "generic_emergency":
+            raise ValueError(
+                "generic-emergency pending order requires generic_emergency intent"
+            )
+        reason = payload.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(
+                "generic_emergency intent requires a non-empty reason"
+            )
+        return
+    if intent_kind == "generic_emergency":
+        raise ValueError(
+            "generic_emergency intent requires a generic-emergency pending order"
+        )
     if order.order_role == "exit":
         if intent_kind != "position_exit":
             raise ValueError("exit-role pending order requires position_exit intent")
@@ -4389,7 +4633,7 @@ def _validate_pending_order(
             or order.closes_position_id is not None
         ):
             raise ValueError("entry pending order cannot carry a close target")
-    else:
+    elif order.order_role == "exit":
         if order.closes_position_kind not in VALID_PENDING_ORDER_POSITION_KINDS:
             raise ValueError("exit pending order requires a valid close target kind")
         if order.closes_position_id is None or order.closes_position_id <= 0:
@@ -4403,6 +4647,22 @@ def _validate_pending_order(
                 raise ValueError("option exit must be a sell order")
         elif order.vehicle != "shares":
             raise ValueError("long_term exit requires the shares vehicle")
+    else:
+        if (
+            order.closes_position_kind is not None
+            or order.closes_position_id is not None
+        ):
+            raise ValueError(
+                "generic-emergency pending order cannot carry a typed close target"
+            )
+        if order.target_position_kind != "long_term" or order.vehicle != "shares":
+            raise ValueError(
+                "generic-emergency pending order requires the shares vehicle"
+            )
+        if order.signal_id is not None:
+            raise ValueError(
+                "generic-emergency pending order cannot link a typed signal"
+            )
     if order.side not in VALID_PENDING_ORDER_SIDES:
         raise ValueError(f"Invalid pending-order side '{order.side}'")
     if order.requested_qty <= 0:
@@ -4709,6 +4969,25 @@ def get_pending_entry_orders_for_position(
             "WHERE order_role = 'entry' AND position_kind = ? "
             "AND position_id = ? ORDER BY submitted_at ASC, id ASC",
             (position_kind, position_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_pending_order(row) for row in rows]
+
+
+def get_generic_emergency_orders_for_symbol(
+    broker_symbol: str,
+) -> list[PendingOrder]:
+    """Return every untyped emergency-close attempt for one broker symbol."""
+    if not isinstance(broker_symbol, str) or not broker_symbol.strip():
+        raise ValueError("generic-emergency broker_symbol must not be empty")
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM pending_orders "
+            "WHERE order_role = 'generic_emergency' AND broker_symbol = ? "
+            "ORDER BY submitted_at ASC, id ASC",
+            (broker_symbol,),
         ).fetchall()
     finally:
         conn.close()

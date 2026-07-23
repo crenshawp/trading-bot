@@ -1,9 +1,10 @@
 """Restart-safe capture, refresh, and fill materialization for broker orders.
 
-Entry and dormant exit paths durably prepare intent before submission and only
-materialize broker-reported cumulative fills.  Scanner reconciliation refreshes
-existing orders lookup-only, then replays every durable positive entry fill so
-a process crash between either step is harmless and retryable.
+Entry, typed exit, and generic-emergency paths durably prepare intent before
+submission and only trust broker-reported cumulative fills. Scanner
+reconciliation refreshes every role lookup-only, while materialization remains
+restricted to typed entry/exit queries so a process crash is harmless and
+generic broker-only positions never acquire typed history.
 """
 
 from __future__ import annotations
@@ -930,6 +931,91 @@ def submit_position_exit(
     )
 
 
+def submit_generic_emergency_close(
+    broker: Broker,
+    *,
+    broker_symbol: str,
+    side: str,
+    broker_position_qty: float,
+    requested_limit_price: float | None,
+    reason: str,
+    submitted_at: datetime,
+    broker_result_observer: Callable[[bool], object] | None = None,
+) -> OrderResult | None:
+    """Submit one untyped emergency close through the durable outbox.
+
+    Any pre-existing nonterminal attempt is refreshed lookup-only and suppresses
+    submission for this pass, even if that refresh terminalizes it. Waiting for
+    the next pass guarantees the retry uses a fresh authoritative broker
+    position snapshot. A terminal partial caps the next request at both the
+    broker-reported holding and the prior attempt's unfilled remainder. Terminal
+    zero-fill/full-fill rows do not permanently block a genuinely later broker
+    position.
+
+    The role and payload are deliberately distinct from typed entry/exit intent;
+    no signal, close target, or materialization link is ever created.
+    """
+    if (
+        isinstance(broker_position_qty, bool)
+        or not math.isfinite(broker_position_qty)
+        or broker_position_qty <= 0
+    ):
+        raise ValueError("generic-emergency broker position qty must be positive")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("generic-emergency reason must be a non-empty string")
+    if submitted_at.tzinfo is None:
+        raise ValueError("generic-emergency submitted_at must be timezone-aware")
+
+    existing_attempts = db.get_generic_emergency_orders_for_symbol(broker_symbol)
+    nonterminal = [
+        attempt for attempt in existing_attempts if attempt.terminal_at is None
+    ]
+    if nonterminal:
+        for attempt in nonterminal:
+            refresh_pending_order(broker, attempt, observed_at=submitted_at)
+        return None
+
+    requested_qty = broker_position_qty
+    if existing_attempts:
+        latest = existing_attempts[-1]
+        if (
+            not math.isfinite(latest.requested_qty)
+            or not math.isfinite(latest.filled_qty)
+            or latest.filled_qty < 0
+        ):
+            raise ValueError(
+                "generic-emergency terminal attempt has invalid quantity truth"
+            )
+        if (
+            latest.filled_qty > 0
+            and latest.filled_qty < latest.requested_qty
+            and not _same_number(latest.filled_qty, latest.requested_qty)
+        ):
+            remaining = latest.requested_qty - latest.filled_qty
+            requested_qty = min(broker_position_qty, remaining)
+
+    if requested_qty <= 0 or not math.isfinite(requested_qty):
+        raise ValueError("generic-emergency remaining close qty is not positive")
+    return submit_prepared_order(
+        broker,
+        ticker=broker_symbol,
+        broker_symbol=broker_symbol,
+        asset_class="stock",
+        vehicle="shares",
+        target_position_kind="long_term",
+        side=side,
+        requested_qty=requested_qty,
+        requested_limit_price=requested_limit_price,
+        submitted_at=submitted_at,
+        intent_payload={
+            "intent_kind": "generic_emergency",
+            "reason": reason.strip(),
+        },
+        order_role="generic_emergency",
+        broker_result_observer=broker_result_observer,
+    )
+
+
 def recover_prepared_order(
     broker: Broker,
     client_order_id: str,
@@ -1777,6 +1863,12 @@ def _materialize_current(
     *,
     observed_at: datetime,
 ) -> FillMaterializationResult:
+    if pending.order_role != "entry":
+        return _materialize_result(
+            pending,
+            action=MATERIALIZE_SKIPPED,
+            reason=f"{pending.order_role} role is not an entry materialization",
+        )
     if pending.filled_qty == 0:
         return _materialize_result(
             pending,

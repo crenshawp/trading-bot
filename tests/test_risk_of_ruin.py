@@ -831,7 +831,7 @@ def test_generic_acceptance_is_not_reported_closed_while_order_is_open(
 
     assert result.status == "holding"
     assert result.closed == []
-    assert "open_orders=1" in result.note
+    assert "awaiting actual close fills" in result.pending[0]
 
 
 def test_emergency_restart_does_not_duplicate_nonterminal_typed_exit(

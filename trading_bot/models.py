@@ -267,10 +267,19 @@ class PlanExecution:
 # the raw broker status is retained alongside it for the lifecycle materializer.
 PENDING_ORDER_INTENT_VERSION = 1
 PENDING_ORDER_POSITION_EXIT_INTENT_VERSION = 1
+PENDING_ORDER_GENERIC_EMERGENCY_INTENT_VERSION = 1
 VALID_PENDING_ORDER_INTENT_KINDS: frozenset[str] = frozenset(
-    {"option", "long_term", "shares_fallback", "position_exit"}
+    {
+        "option",
+        "long_term",
+        "shares_fallback",
+        "position_exit",
+        "generic_emergency",
+    }
 )
-VALID_PENDING_ORDER_ROLES: frozenset[str] = frozenset({"entry", "exit"})
+VALID_PENDING_ORDER_ROLES: frozenset[str] = frozenset(
+    {"entry", "exit", "generic_emergency"}
+)
 VALID_PENDING_ORDER_FILL_TIME_SOURCES: frozenset[str] = frozenset(
     {"broker", "observed"}
 )
@@ -314,7 +323,8 @@ class PendingOrder:
     ``intent_payload_version`` selects its decoder.  Version 1 entry payloads
     use an ``intent_kind`` of ``option``, ``long_term``, or
     ``shares_fallback``.  Version 1 exit payloads use ``position_exit`` and
-    preserve the operator-facing ``exit_reason``.
+    preserve the operator-facing ``exit_reason``. Generic emergency rows use
+    ``generic_emergency`` and deliberately carry no typed position link.
 
     Lifecycle fields always represent the latest *usable* cumulative broker
     snapshot.  Broker read errors are not records and must leave these values

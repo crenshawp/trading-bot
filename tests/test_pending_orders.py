@@ -14,6 +14,7 @@ import pytest
 from trading_bot import db
 from trading_bot.models import (
     LEGACY_PENDING_ORDER_CLIENT_ID_PREFIX,
+    PENDING_ORDER_GENERIC_EMERGENCY_INTENT_VERSION,
     PENDING_ORDER_INTENT_VERSION,
     PENDING_ORDER_POSITION_EXIT_INTENT_VERSION,
     TERMINAL_PENDING_ORDER_STATUSES,
@@ -122,10 +123,12 @@ def test_pending_order_model_is_frozen_and_vocabularies_are_explicit() -> None:
 
     assert PENDING_ORDER_INTENT_VERSION == 1
     assert PENDING_ORDER_POSITION_EXIT_INTENT_VERSION == 1
+    assert PENDING_ORDER_GENERIC_EMERGENCY_INTENT_VERSION == 1
     assert {
         "option", "long_term", "shares_fallback", "position_exit",
+        "generic_emergency",
     } == VALID_PENDING_ORDER_INTENT_KINDS
-    assert {"entry", "exit"} == VALID_PENDING_ORDER_ROLES
+    assert {"entry", "exit", "generic_emergency"} == VALID_PENDING_ORDER_ROLES
     assert {"broker", "observed"} == VALID_PENDING_ORDER_FILL_TIME_SOURCES
     assert {
         "prepared", "new", "partially_filled", "filled", "canceled",
@@ -173,6 +176,7 @@ def test_pending_order_schema_has_exact_columns_and_constraints(tmp_db: Path) ->
     }
     assert "idx_pending_orders_nonterminal" in indexes
     assert "idx_pending_orders_exit_target" in indexes
+    assert "idx_pending_orders_generic_nonterminal" in indexes
     assert triggers == {
         "trg_pending_orders_immutable_intent",
         "trg_pending_orders_broker_id_bind_once",
@@ -215,7 +219,7 @@ def test_v25_sentiment_migration_preserves_pending_order_and_legacy_trade(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 29
+    assert db.schema_version() == 30
     assert db.get_pending_order("broker-order-1") == pending_before
     assert pending_before is not None and pending_before.id == pending_id
     legacy = db.get_trade_by_signal_id(signal_id)
@@ -256,7 +260,7 @@ def test_v26_indicator_migration_preserves_pending_order_and_legacy_trade(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 29
+    assert db.schema_version() == 30
     assert db.get_pending_order("broker-order-1") == pending_before
     assert pending_before is not None and pending_before.id == pending_id
     legacy = db.get_trade_by_signal_id(signal_id)
@@ -298,7 +302,7 @@ def test_v27_risk_migration_preserves_pending_order_and_legacy_trade(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 29
+    assert db.schema_version() == 30
     assert db.get_pending_order("broker-order-1") == pending_before
     assert pending_before is not None and pending_before.id == pending_id
     legacy = db.get_trade_by_signal_id(signal_id)
@@ -612,7 +616,7 @@ def test_v28_option_position_migration_preserves_row_and_adds_null_exit_reason(
     assert db.get_option_position(position_id) == dataclasses.replace(
         position, id=position_id
     )
-    assert db.schema_version() == 29
+    assert db.schema_version() == 30
 
 
 def test_duplicate_broker_order_id_is_rejected(tmp_db: Path) -> None:
@@ -1127,7 +1131,7 @@ def test_v23_database_migrates_without_rewriting_existing_rows(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 29
+    assert db.schema_version() == 30
     migrated = db.get_connection()
     try:
         sentinel = migrated.execute(
@@ -1244,7 +1248,7 @@ def _create_v24_pending_orders(conn: sqlite3.Connection) -> None:
     )
 
 
-def test_v28_to_v29_migration_preserves_every_legacy_ledger_value(
+def test_v28_to_v30_migration_preserves_every_legacy_ledger_value(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     legacy_path = tmp_path / "legacy-v28.db"
@@ -1303,7 +1307,7 @@ def test_v28_to_v29_migration_preserves_every_legacy_ledger_value(
     assert after_row["last_fill_at"] == "2026-07-20T15:00:00+00:00"
     assert after_row["last_fill_time_source"] == "observed"
     assert after_row["fees_dollars"] is None
-    assert db.schema_version() == 29
+    assert db.schema_version() == 30
 
 
 def test_v24_pending_order_rows_migrate_collision_free_and_preserve_data(
@@ -1362,7 +1366,7 @@ def test_v24_pending_order_rows_migrate_collision_free_and_preserve_data(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 29
+    assert db.schema_version() == 30
     first = db.get_pending_order("legacy-bound-7")
     second = db.get_pending_order("legacy-bound-11")
     third = db.get_pending_order("legacy-bound-15")

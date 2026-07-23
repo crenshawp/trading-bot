@@ -528,9 +528,9 @@ def emergency_shutdown(
     catastrophic trigger run THIS function; there is no separate/weaker route.
 
     1. Hard-revoke all new-position entry immediately.
-    2. Freeze each typed entry quantity, then route option/long-term exits
-       through the durable lifecycle. Generic broker-only positions remain on
-       the direct broker close path and never acquire synthetic typed history.
+    2. Freeze each typed entry quantity, then route every close through the
+       durable lifecycle. Generic broker-only positions use a distinct untyped
+       outbox role and never acquire synthetic typed history.
     3. Rejected, unfilled, partial, or duplicate-pending closes return
        ``holding`` so the still-alive loop retries or reconciles safely.
     4. Confirm closure via broker reconciliation — a position is never claimed
@@ -626,7 +626,7 @@ def emergency_shutdown(
                   file=sys.stderr)
             pending.append(f"long-term {lt_pos.ticker} (error: {exc})")
 
-    # 2c — generic broker-only positions stay outside typed/Tier-1 history.
+    # 2c — generic broker-only positions use untyped durable close intent.
     positions = broker.get_positions()
     if positions.ok:
         for bpos in positions.positions:
@@ -639,15 +639,40 @@ def emergency_shutdown(
                     else bpos.avg_entry_price
                 )
                 side = "sell" if bpos.side != "short" else "buy"
-                order = broker.submit_order(
-                    bpos.symbol, abs(bpos.qty), side,
-                    order_type="limit", limit_price=price, time_in_force="day",
+                order = order_lifecycle.submit_generic_emergency_close(
+                    broker,
+                    broker_symbol=bpos.symbol,
+                    side=side,
+                    broker_position_qty=abs(bpos.qty),
+                    requested_limit_price=price,
+                    reason="emergency_shutdown",
+                    submitted_at=moment,
+                    broker_result_observer=record_broker_result,
                 )
-                record_broker_result(order.ok)
-                if order.ok:
-                    generic_submitted.append(
-                        f"equity {bpos.symbol} x{bpos.qty:g}"
+                if order is None:
+                    pending.append(
+                        f"equity {bpos.symbol} (close already pending)"
                     )
+                elif order.ok:
+                    durable = (
+                        db.get_pending_order_by_client_order_id(
+                            order.client_order_id
+                        )
+                        if order.client_order_id is not None
+                        else None
+                    )
+                    if (
+                        durable is None
+                        or durable.terminal_at is None
+                        or durable.filled_qty < durable.requested_qty
+                    ):
+                        pending.append(
+                            f"equity {bpos.symbol} (awaiting actual close fills)"
+                        )
+                    else:
+                        generic_submitted.append(
+                            f"equity {bpos.symbol} x{bpos.qty:g}"
+                        )
                 else:
                     pending.append(f"equity {bpos.symbol} ({order.reason})")
             except Exception as exc:  # noqa: BLE001 - one position must never block the rest
