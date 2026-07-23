@@ -1328,6 +1328,54 @@ def _run_order_lifecycle_cycle() -> None:
         print(f"  order lifecycle cycle error: {exc}", file=sys.stderr)
 
 
+def _record_risk_cycle_reconciliation(broker: object) -> None:
+    """Record one conclusive broker-position comparison, or leave state alone.
+
+    Only the three real position divergence kinds count. Broker-unavailable,
+    exception, or malformed-report paths are inconclusive and deliberately
+    preserve the prior streak.
+    """
+    from trading_bot.broker import reconcile
+
+    try:
+        report = reconcile(broker)
+    except Exception as exc:  # noqa: BLE001 - unavailable is not a divergence
+        print(
+            f"  risk reconcile error: {exc}; divergence streak unchanged",
+            file=sys.stderr,
+        )
+        return
+
+    report_ok = getattr(report, "ok", None)
+    divergences = getattr(report, "divergences", None)
+    if not isinstance(report_ok, bool) or not isinstance(divergences, list):
+        print(
+            "  risk reconcile malformed report; divergence streak unchanged",
+            file=sys.stderr,
+        )
+        return
+
+    if not report_ok:
+        note = getattr(report, "note", "")
+        detail = note or "broker position read unavailable"
+        print(
+            f"  risk reconcile unavailable: {detail}; divergence streak unchanged",
+            file=sys.stderr,
+        )
+        return
+
+    real_kinds = {"internal_only", "broker_only", "qty_mismatch"}
+    kinds = [getattr(item, "kind", None) for item in divergences]
+    if any(kind not in real_kinds for kind in kinds):
+        print(
+            "  risk reconcile malformed report; divergence streak unchanged",
+            file=sys.stderr,
+        )
+        return
+
+    risk_of_ruin.record_reconcile_result(not divergences)
+
+
 def _run_risk_cycle() -> None:
     """Phase 15: one risk-of-ruin pass per scan cycle.
 
@@ -1343,6 +1391,11 @@ def _run_risk_cycle() -> None:
         account = broker.get_account()
         risk_of_ruin.record_equity_snapshot(account.equity)
         risk_of_ruin.evaluate_tier1()
+
+        # Reconciliation contributes exactly one conclusive result (clean or
+        # divergent) before Tier-2 evaluates the persisted streak. Provider
+        # outages and malformed reports preserve the last-known counter.
+        _record_risk_cycle_reconciliation(broker)
 
         reason = risk_of_ruin.check_catastrophic()
         if reason is not None:

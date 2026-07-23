@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from trading_bot import allocation, config, db
 from trading_bot import risk_of_ruin as ror
@@ -371,20 +374,195 @@ def test_order_paths_feed_the_broker_error_counter(tmp_db: Path) -> None:
 
 
 def test_reconcile_divergence_streak_trips_after_persistence(tmp_db: Path) -> None:
-    ror.record_reconcile_result(True)
-    ror.record_reconcile_result(True)
+    ror.record_reconcile_result(False)
+    ror.record_reconcile_result(False)
     assert ror.check_catastrophic() is None
-    ror.record_reconcile_result(True)
+    ror.record_reconcile_result(False)
     reason = ror.check_catastrophic()
     assert reason is not None and "unreconcilable" in reason
 
 
 def test_reconcile_divergence_streak_resets_on_clean_check(tmp_db: Path) -> None:
-    ror.record_reconcile_result(True)
-    ror.record_reconcile_result(True)
-    ror.record_reconcile_result(False)                 # clean reconcile resets
+    ror.record_reconcile_result(False)
+    ror.record_reconcile_result(False)
+    ror.record_reconcile_result(True)                  # clean reconcile resets
     assert ror.reconcile_divergence_streak() == 0
     assert ror.check_catastrophic() is None
+
+
+# ───────────────────────── scanner reconciliation wiring ────────────────────
+
+
+def _stub_scanner_risk_cycle(
+    monkeypatch: pytest.MonkeyPatch, reconcile_fn: Any,
+) -> tuple[Any, FakeBroker]:
+    from trading_bot import scanner
+
+    broker = FakeBroker()
+    monkeypatch.setattr("trading_bot.broker.AlpacaBroker", lambda: broker)
+    monkeypatch.setattr("trading_bot.broker.reconcile", reconcile_fn)
+    monkeypatch.setattr(ror, "record_equity_snapshot", lambda _equity: 1)
+    monkeypatch.setattr(ror, "evaluate_tier1", lambda: None)
+    return scanner, broker
+
+
+def test_risk_cycle_reconciles_once_and_counts_multiple_divergences_once(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trading_bot.broker.reconcile import Divergence, ReconciliationReport
+
+    calls = 0
+
+    def reconcile_once(_broker: object) -> ReconciliationReport:
+        nonlocal calls
+        calls += 1
+        return ReconciliationReport(ok=True, divergences=[
+            Divergence("internal_only", "AAPL", "missing at broker"),
+            Divergence("broker_only", "META", "missing internally"),
+        ])
+
+    scanner, _broker = _stub_scanner_risk_cycle(monkeypatch, reconcile_once)
+
+    scanner._run_risk_cycle()
+
+    assert calls == 1
+    assert ror.reconcile_divergence_streak() == 1
+
+
+def test_risk_cycle_clean_reconcile_resets_and_ignores_open_order_count(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trading_bot.broker.reconcile import ReconciliationReport
+
+    ror.record_reconcile_result(False)
+    ror.record_reconcile_result(False)
+    scanner, _broker = _stub_scanner_risk_cycle(
+        monkeypatch,
+        lambda _broker: ReconciliationReport(
+            ok=True, divergences=[], broker_open_orders=9,
+        ),
+    )
+
+    scanner._run_risk_cycle()
+
+    assert ror.reconcile_divergence_streak() == 0
+
+
+def test_risk_cycle_unavailable_reconcile_preserves_streak(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from trading_bot.broker.reconcile import ReconciliationReport
+
+    ror.record_reconcile_result(False)
+    ror.record_reconcile_result(False)
+    scanner, _broker = _stub_scanner_risk_cycle(
+        monkeypatch,
+        lambda _broker: ReconciliationReport(ok=False, note="broker down"),
+    )
+
+    scanner._run_risk_cycle()
+
+    assert ror.reconcile_divergence_streak() == 2
+    assert "risk reconcile unavailable" in capsys.readouterr().err
+
+
+def test_risk_cycle_reconcile_exception_preserves_streak(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ror.record_reconcile_result(False)
+
+    def unavailable(_broker: object) -> None:
+        raise RuntimeError("malformed broker response")
+
+    scanner, _broker = _stub_scanner_risk_cycle(monkeypatch, unavailable)
+
+    scanner._run_risk_cycle()
+
+    assert ror.reconcile_divergence_streak() == 1
+    assert "risk reconcile error" in capsys.readouterr().err
+
+
+def test_risk_cycle_malformed_report_preserves_streak(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ror.record_reconcile_result(False)
+    scanner, _broker = _stub_scanner_risk_cycle(
+        monkeypatch,
+        lambda _broker: object(),
+    )
+
+    scanner._run_risk_cycle()
+
+    assert ror.reconcile_divergence_streak() == 1
+    assert "malformed report" in capsys.readouterr().err
+
+
+def test_third_cycle_divergence_triggers_tier2_in_same_cycle(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trading_bot.broker.reconcile import Divergence, ReconciliationReport
+
+    ror.record_reconcile_result(False)
+    ror.record_reconcile_result(False)
+    scanner, broker = _stub_scanner_risk_cycle(
+        monkeypatch,
+        lambda _broker: ReconciliationReport(ok=True, divergences=[
+            Divergence("qty_mismatch", "AAPL", "quantity differs"),
+        ]),
+    )
+    triggered: list[tuple[object, str]] = []
+    monkeypatch.setattr(
+        ror, "emergency_shutdown",
+        lambda b, *, trigger: triggered.append((b, trigger)),
+    )
+
+    scanner._run_risk_cycle()
+
+    assert ror.reconcile_divergence_streak() == 3
+    assert len(triggered) == 1 and triggered[0][0] is broker
+    assert "3 consecutive checks" in triggered[0][1]
+
+
+def test_risk_cycle_reconciliation_ignores_signal_and_shadow_trades(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trading_bot import scanner
+    from trading_bot.broker import reconcile as real_reconcile
+
+    for index, track_mode in enumerate(("active", "shadow")):
+        timestamp = _TS + timedelta(minutes=index)
+        signal_id = db.insert_signal(Signal(
+            timestamp=timestamp, ticker=f"SIG{index}", asset_class="stock",
+            signal_type="ema21_pullback", direction="call", entry_price=100.0,
+        ))
+        db.insert_trade(Trade(
+            signal_id=signal_id, opened_at=timestamp, outcome="open",
+            track_mode=track_mode,
+        ))
+    ror.record_reconcile_result(False)
+    broker = FakeBroker()
+    calls = 0
+
+    def reconcile_once(b: object):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return real_reconcile(b)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("trading_bot.broker.AlpacaBroker", lambda: broker)
+    monkeypatch.setattr("trading_bot.broker.reconcile", reconcile_once)
+    monkeypatch.setattr(ror, "record_equity_snapshot", lambda _equity: 1)
+    monkeypatch.setattr(ror, "evaluate_tier1", lambda: None)
+
+    scanner._run_risk_cycle()
+
+    assert calls == 1
+    assert ror.reconcile_divergence_streak() == 0
 
 
 # ───────────────────────── top-level guard (unhandled exception) ─────────────

@@ -281,13 +281,17 @@ def broker_error_streak() -> int:
     return _get_streak(_BROKER_ERROR_STREAK_KEY)
 
 
-def record_reconcile_result(has_divergences: bool) -> int:
-    """Record one reconciliation outcome. Divergences present increments the
-    streak; a clean reconcile resets it. Returns the streak. Fail-soft."""
+def record_reconcile_result(ok: bool) -> int:
+    """Record one conclusive reconciliation result.
+
+    A clean success resets the streak; a real divergence (``ok=False``)
+    increments it once. Provider-unavailable or malformed checks must not call
+    this function at all. Returns the streak and remains fail-soft.
+    """
     try:
-        streak = 0 if not has_divergences else _get_streak(_RECONCILE_STREAK_KEY) + 1
+        streak = 0 if ok else _get_streak(_RECONCILE_STREAK_KEY) + 1
         settings.set(_RECONCILE_STREAK_KEY, str(streak))
-        if has_divergences:
+        if not ok:
             print(f"  risk: reconcile divergence streak {streak}", file=sys.stderr)
         return streak
     except Exception as exc:  # noqa: BLE001 - the counter must never break a check
