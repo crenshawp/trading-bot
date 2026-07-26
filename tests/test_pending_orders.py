@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -1557,3 +1558,190 @@ def test_v24_pending_order_rows_migrate_collision_free_and_preserve_data(
         "trg_pending_orders_fill_time_on_insert",
         "trg_pending_orders_fill_time_on_update",
     }
+
+
+def _build_supported_legacy_database(path: Path, version: int) -> None:
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+        _create_v24_pending_orders(conn)
+        conn.execute(
+            """
+            INSERT INTO pending_orders (
+                id, broker_order_id, ticker, broker_symbol, asset_class,
+                vehicle, target_position_kind, side, requested_qty,
+                requested_limit_price, submitted_at, signal_id,
+                intent_payload_version, intent_payload_json, lifecycle_status,
+                broker_status, filled_qty, filled_avg_price, last_refreshed_at,
+                terminal_reason, terminal_at, position_kind, position_id
+            ) VALUES (
+                7, 'legacy-atomic-7', 'GOOGL', 'GOOGL260918C00190000',
+                'stock', 'option_full', 'option', 'buy', 2.0, 4.25,
+                '2026-07-20T15:00:00+00:00', 17, 1, ?, 'new', 'accepted',
+                0.0, NULL, NULL, NULL, NULL, NULL, NULL
+            )
+            """,
+            (_option_payload(),),
+        )
+        if version >= 28:
+            db._migrate_to_v25(conn)
+        if version >= 29:
+            conn.executescript(db._SCHEMA_SQL)
+            db._migrate_to_v29(conn)
+        conn.execute("UPDATE schema_version SET version = ?", (version,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _pending_migration_snapshot(path: Path) -> dict[str, object]:
+    conn = sqlite3.connect(path)
+    try:
+        table_row = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'pending_orders'"
+        ).fetchone()
+        rows = conn.execute(
+            "SELECT * FROM pending_orders ORDER BY id"
+        ).fetchall()
+        version_row = conn.execute(
+            "SELECT version FROM schema_version LIMIT 1"
+        ).fetchone()
+        staging = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name LIKE 'pending_orders_v%' ORDER BY name"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert table_row is not None and version_row is not None
+    return {
+        "table_sql": table_row[0],
+        "rows": rows,
+        "version": version_row[0],
+        "staging": staging,
+    }
+
+
+@pytest.mark.parametrize(
+    ("version", "migration_name"),
+    [
+        (24, "_migrate_to_v25"),
+        (28, "_migrate_to_v29"),
+        (29, "_migrate_to_v30"),
+    ],
+)
+def test_rebuild_migration_failure_rolls_back_schema_rows_and_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version: int,
+    migration_name: str,
+) -> None:
+    legacy_path = tmp_path / f"atomic-failure-v{version}.db"
+    _build_supported_legacy_database(legacy_path, version)
+    before = _pending_migration_snapshot(legacy_path)
+    monkeypatch.setattr("trading_bot.config.DB_PATH", legacy_path)
+    real_migration = getattr(db, migration_name)
+
+    def fail_after_rebuild(conn: sqlite3.Connection) -> None:
+        real_migration(conn)
+        raise RuntimeError("simulated migration crash")
+
+    monkeypatch.setattr(db, migration_name, fail_after_rebuild)
+    with pytest.raises(RuntimeError, match="simulated migration crash"):
+        db.init_db()
+
+    assert _pending_migration_snapshot(legacy_path) == before
+
+
+@pytest.mark.parametrize("version", [24, 28, 29])
+def test_concurrent_supported_initialization_serializes_without_data_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version: int,
+) -> None:
+    legacy_path = tmp_path / f"concurrent-v{version}.db"
+    _build_supported_legacy_database(legacy_path, version)
+    monkeypatch.setattr("trading_bot.config.DB_PATH", legacy_path)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(lambda _: db.init_db(), range(2)))
+
+    assert db.schema_version() == 31
+    pending = db.get_pending_order("legacy-atomic-7")
+    assert pending is not None and pending.id == 7
+    assert len(db.get_pending_orders()) == 1
+
+
+@pytest.mark.parametrize(
+    ("version", "next_migration", "staging_table"),
+    [
+        (24, "_migrate_to_v25", "pending_orders_v25"),
+        (28, "_migrate_to_v29", "pending_orders_v29"),
+        (29, "_migrate_to_v30", "pending_orders_v30"),
+    ],
+)
+def test_orphan_rebuild_staging_ledger_recovers_after_drop_before_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version: int,
+    next_migration: str,
+    staging_table: str,
+) -> None:
+    legacy_path = tmp_path / f"orphan-v{version}.db"
+    _build_supported_legacy_database(legacy_path, version)
+    monkeypatch.setattr("trading_bot.config.DB_PATH", legacy_path)
+    conn = db.get_connection()
+    try:
+        if version == 28:
+            conn.executescript(db._SCHEMA_SQL)
+        getattr(db, next_migration)(conn)
+        conn.execute(f"ALTER TABLE pending_orders RENAME TO {staging_table}")
+        conn.execute("UPDATE schema_version SET version = ?", (version,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    db.init_db()
+
+    assert db.schema_version() == 31
+    pending = db.get_pending_order("legacy-atomic-7")
+    assert pending is not None and pending.id == 7
+    conn = db.get_connection()
+    try:
+        orphan = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (staging_table,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert orphan is None
+
+
+def test_stale_staging_table_is_discarded_when_canonical_has_rows(
+    tmp_db: Path,
+) -> None:
+    pending_id = db.insert_pending_order(_pending_order())
+    conn = db.get_connection()
+    try:
+        conn.execute(
+            "CREATE TABLE pending_orders_v29 AS SELECT * FROM pending_orders"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    db.init_db()
+
+    pending = db.get_pending_order("broker-order-1")
+    assert pending is not None and pending.id == pending_id
+    conn = db.get_connection()
+    try:
+        stale = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'pending_orders_v29'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert stale is None

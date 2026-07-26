@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -677,7 +678,17 @@ def get_connection() -> sqlite3.Connection:
     )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
+    for attempt in range(3):
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+            break
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc).lower() or attempt == 2:
+                conn.close()
+                raise
+            # A concurrent initializer may be making the same persistent WAL
+            # transition. It completes before migration work begins.
+            time.sleep(0.05)
     return conn
 
 
@@ -1021,6 +1032,7 @@ def _migrate_to_v25(conn: sqlite3.Connection) -> None:
     if "client_order_id" in columns:
         return
 
+    conn.execute("DROP TABLE IF EXISTS pending_orders_v25")
     conn.execute("DROP INDEX IF EXISTS idx_pending_orders_nonterminal")
     for trigger in (
         "trg_pending_orders_immutable_intent",
@@ -1398,6 +1410,7 @@ def _migrate_to_v29(conn: sqlite3.Connection) -> None:
         _create_v29_pending_order_objects(conn)
         return
 
+    conn.execute("DROP TABLE IF EXISTS pending_orders_v29")
     conn.execute("DROP INDEX IF EXISTS idx_pending_orders_nonterminal")
     conn.execute("DROP INDEX IF EXISTS idx_pending_orders_exit_target")
     for trigger in (
@@ -1605,6 +1618,7 @@ def _migrate_to_v30(conn: sqlite3.Connection) -> None:
         _create_v30_pending_order_objects(conn)
         return
 
+    conn.execute("DROP TABLE IF EXISTS pending_orders_v30")
     conn.execute(
         """
         CREATE TABLE pending_orders_v30 (
@@ -1851,52 +1865,123 @@ def _migrate_to_v31(conn: sqlite3.Connection) -> None:
     )
 
 
+_PENDING_ORDER_STAGING_TABLES: tuple[str, ...] = (
+    "pending_orders_v25",
+    "pending_orders_v29",
+    "pending_orders_v30",
+)
+
+
+def _recover_orphan_pending_order_staging_tables(
+    conn: sqlite3.Connection,
+) -> None:
+    """Recover or discard recognized rebuild staging tables safely.
+
+    Base schema creation guarantees an empty canonical table when a prior
+    process crashed after dropping it. A sole nonempty staging ledger is then
+    authoritative. If the canonical ledger has rows, it remains authoritative
+    and stale staging tables are discarded. Multiple nonempty staging ledgers
+    with an empty canonical table are ambiguous and must be reconciled by an
+    operator rather than guessed.
+    """
+    placeholders = ", ".join("?" for _ in _PENDING_ORDER_STAGING_TABLES)
+    staging_tables = [
+        str(row["name"])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            f"AND name IN ({placeholders}) ORDER BY name",
+            _PENDING_ORDER_STAGING_TABLES,
+        ).fetchall()
+    ]
+    if not staging_tables:
+        return
+
+    canonical_row = conn.execute(
+        "SELECT COUNT(*) AS n FROM pending_orders"
+    ).fetchone()
+    canonical_count = int(canonical_row["n"])
+    staging_counts: dict[str, int] = {}
+    for table in staging_tables:
+        row = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
+        staging_counts[table] = int(row["n"])
+    nonempty = [
+        table for table, count in staging_counts.items() if count > 0
+    ]
+
+    recovered: str | None = None
+    if canonical_count == 0 and len(nonempty) == 1:
+        recovered = nonempty[0]
+        conn.execute("DROP TABLE pending_orders")
+        conn.execute(f"ALTER TABLE {recovered} RENAME TO pending_orders")
+    elif canonical_count == 0 and len(nonempty) > 1:
+        detail = ", ".join(
+            f"{table}={staging_counts[table]} rows" for table in nonempty
+        )
+        raise RuntimeError(
+            "ambiguous orphan pending-order staging ledgers; "
+            f"operator reconciliation required: {detail}"
+        )
+
+    for table in staging_tables:
+        if table != recovered:
+            conn.execute(f"DROP TABLE {table}")
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
     try:
         conn.executescript(_SCHEMA_SQL)
-        _migrate_to_v2(conn)
-        _migrate_to_v3(conn)
-        _migrate_to_v4(conn)
-        _migrate_to_v5(conn)
-        _migrate_to_v6(conn)
-        _migrate_to_v7(conn)
-        _migrate_to_v8(conn)
-        _migrate_to_v9(conn)
-        _migrate_to_v10(conn)
-        _migrate_to_v11(conn)
-        _migrate_to_v12(conn)
-        _migrate_to_v13(conn)
-        _migrate_to_v14(conn)
-        _migrate_to_v15(conn)
-        _migrate_to_v16(conn)
-        _migrate_to_v17(conn)
-        _migrate_to_v18(conn)
-        _migrate_to_v19(conn)
-        _migrate_to_v20(conn)
-        _migrate_to_v21(conn)
-        _migrate_to_v22(conn)
-        _migrate_to_v23(conn)
-        _migrate_to_v24(conn)
-        _migrate_to_v25(conn)
-        _migrate_to_v26(conn)
-        _migrate_to_v27(conn)
-        _migrate_to_v28(conn)
-        _migrate_to_v29(conn)
-        _migrate_to_v30(conn)
-        _migrate_to_v31(conn)
-        cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
-        row = cur.fetchone()
-        if row is None:
-            conn.execute(
-                "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,)
-            )
-        elif int(row["version"]) < SCHEMA_VERSION:
-            conn.execute(
-                "UPDATE schema_version SET version = ?", (SCHEMA_VERSION,)
-            )
-        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            _recover_orphan_pending_order_staging_tables(conn)
+            _migrate_to_v2(conn)
+            _migrate_to_v3(conn)
+            _migrate_to_v4(conn)
+            _migrate_to_v5(conn)
+            _migrate_to_v6(conn)
+            _migrate_to_v7(conn)
+            _migrate_to_v8(conn)
+            _migrate_to_v9(conn)
+            _migrate_to_v10(conn)
+            _migrate_to_v11(conn)
+            _migrate_to_v12(conn)
+            _migrate_to_v13(conn)
+            _migrate_to_v14(conn)
+            _migrate_to_v15(conn)
+            _migrate_to_v16(conn)
+            _migrate_to_v17(conn)
+            _migrate_to_v18(conn)
+            _migrate_to_v19(conn)
+            _migrate_to_v20(conn)
+            _migrate_to_v21(conn)
+            _migrate_to_v22(conn)
+            _migrate_to_v23(conn)
+            _migrate_to_v24(conn)
+            _migrate_to_v25(conn)
+            _migrate_to_v26(conn)
+            _migrate_to_v27(conn)
+            _migrate_to_v28(conn)
+            _migrate_to_v29(conn)
+            _migrate_to_v30(conn)
+            _migrate_to_v31(conn)
+            cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
+            row = cur.fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO schema_version (version) VALUES (?)",
+                    (SCHEMA_VERSION,),
+                )
+            elif int(row["version"]) < SCHEMA_VERSION:
+                conn.execute(
+                    "UPDATE schema_version SET version = ?",
+                    (SCHEMA_VERSION,),
+                )
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
     finally:
         conn.close()
 
