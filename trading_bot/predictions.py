@@ -257,6 +257,22 @@ def _closed_15m_candles(
     return df.loc[bar_ends <= comparison_now]
 
 
+def _last_candle_close(df: pd.DataFrame, now: datetime) -> datetime:
+    """Return the close boundary of the last candle in ``df``.
+
+    A naive provider index is interpreted in the same wall-clock timezone as
+    ``now``, matching :func:`_closed_15m_candles`. Aware provider timestamps
+    retain their represented instant and are normalized to UTC for storage.
+    """
+    last_open = pd.Timestamp(df.index[-1])
+    if last_open.tzinfo is None:
+        last_open = last_open.tz_localize(now.tzinfo)
+    close_boundary = (
+        last_open.tz_convert("UTC") + pd.Timedelta(minutes=_WINDOW_MINUTES)
+    )
+    return datetime.fromtimestamp(close_boundary.timestamp(), tz=UTC)
+
+
 def _fetch_15m_candles(ticker: str) -> pd.DataFrame | None:
     """Pull recent 15-min candles. Returns None on any failure or empty."""
     try:
@@ -299,13 +315,13 @@ def predict_direction(
     Regime + VIX are tagged at call time; their fetch errors fall back to
     ``'unknown'`` rather than blocking the prediction.
     """
-    created_at = now if now is not None else datetime.now(UTC)
+    invocation_at = now if now is not None else datetime.now(UTC)
     df = _fetch_15m_candles(ticker)
     if df is None:
         return None
 
     try:
-        df = _closed_15m_candles(df, created_at)
+        df = _closed_15m_candles(df, invocation_at)
     except (TypeError, ValueError) as exc:
         print(
             f"  prediction candle timestamp error for {ticker}: {exc}",
@@ -331,6 +347,7 @@ def predict_direction(
         return None
 
     entry_price = float(df["Close"].iloc[-1])
+    created_at = _last_candle_close(df, invocation_at)
     target_window_end = created_at + timedelta(minutes=_WINDOW_MINUTES)
 
     # Context tags. Same fail-soft contract as the swing trade scanner.

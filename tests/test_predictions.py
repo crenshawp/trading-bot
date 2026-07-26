@@ -347,10 +347,11 @@ def test_predict_target_window_is_15_minutes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_fetch(monkeypatch, _strong_uptrend())
-    now = datetime(2026, 5, 27, 0, 0, tzinfo=UTC)
+    now = datetime(2026, 5, 27, 0, 0, 7, 123456, tzinfo=UTC)
     pred = predictions.predict_direction("BTC-USD", now=now)
     assert pred is not None
-    assert pred.target_window_end == now + timedelta(minutes=15)
+    assert pred.created_at == datetime(2026, 5, 27, 0, 0, tzinfo=UTC)
+    assert pred.target_window_end == datetime(2026, 5, 27, 0, 15, tzinfo=UTC)
 
 
 def test_predict_excludes_forming_row_from_votes_and_entry(
@@ -503,6 +504,40 @@ def _resolution_df(
         },
         index=pd.DatetimeIndex(index, tz="UTC"),
     )
+
+
+def test_forming_row_prediction_resolves_at_exact_target_boundary(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed = _strong_uptrend()
+    candles = _with_forming_reversal(closed)
+    invocation = candles.index[-1].to_pydatetime() + timedelta(
+        minutes=7, seconds=11, microseconds=654321,
+    )
+    _patch_fetch(monkeypatch, candles)
+
+    pred = predictions.predict_direction("BTC-USD", now=invocation)
+    assert pred is not None
+    assert pred.created_at == candles.index[-1].to_pydatetime()
+    assert pred.target_window_end == (
+        candles.index[-1].to_pydatetime() + timedelta(minutes=15)
+    )
+    pid = db.insert_prediction(pred)
+
+    _patch_fetch(
+        monkeypatch,
+        _resolution_df(
+            pred.target_window_end,
+            close_at_target=pred.entry_price + 5.0,
+            ticker_close_now=pred.entry_price + 5.0,
+        ),
+    )
+    result = predictions.resolve_prediction(
+        pid, now=pred.target_window_end + timedelta(seconds=30),
+    )
+
+    assert result.status == "resolved"
+    assert result.outcome == "correct"
 
 
 def test_resolve_higher_correct(
