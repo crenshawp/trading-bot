@@ -91,8 +91,11 @@ class AccountInfo:
 
 @dataclass(frozen=True)
 class Position:
-    """Neutral open-position record. ``qty`` is signed by ``side`` semantics:
-    a short position reports a positive ``qty`` with ``side='short'``."""
+    """Neutral open-position record.
+
+    ``qty`` is a non-negative magnitude; ``side`` is authoritative for whether
+    the holding is long or short.
+    """
 
     symbol: str
     qty: float

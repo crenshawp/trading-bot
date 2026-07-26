@@ -16,7 +16,7 @@ import pytest
 
 from trading_bot import allocation, config, db
 from trading_bot import risk_of_ruin as ror
-from trading_bot.broker.base import STATUS_FILLED, AccountInfo
+from trading_bot.broker.base import STATUS_FILLED, AccountInfo, Position
 from trading_bot.broker.fake import FakeBroker
 from trading_bot.models import (
     LongTermPosition,
@@ -464,6 +464,50 @@ def test_risk_cycle_clean_reconcile_resets_and_ignores_open_order_count(
     assert ror.reconcile_divergence_streak() == 0
 
 
+def test_risk_cycle_reconciles_alpaca_short_shares_fallback_without_tier2(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trading_bot import scanner
+    from trading_bot.broker import alpaca
+
+    db.insert_long_term_position(LongTermPosition(
+        ticker="TSLA", asset_class="stock", entry_price=240.0,
+        entry_date=_TS, qty=3.0, source="swing_fallback", direction="short",
+    ))
+    ror.record_reconcile_result(False)
+    ror.record_reconcile_result(False)
+
+    client = alpaca.AlpacaBroker()
+    monkeypatch.setattr(
+        client, "get_account",
+        lambda: AccountInfo(ok=True, equity=10_000.0),
+    )
+
+    def mocked_request(method: str, path: str, **_kwargs: Any) -> alpaca._Response:
+        assert method == "GET"
+        body: list[dict[str, str]] = (
+            [{"symbol": "TSLA", "qty": "-3", "side": "short"}]
+            if path == "/v2/positions" else []
+        )
+        return alpaca._Response(ok=True, status_code=200, body=body, error="")
+
+    monkeypatch.setattr(client, "_request", mocked_request)
+    monkeypatch.setattr("trading_bot.broker.AlpacaBroker", lambda: client)
+    monkeypatch.setattr(ror, "record_equity_snapshot", lambda _equity: 1)
+    monkeypatch.setattr(ror, "evaluate_tier1", lambda: None)
+    triggered: list[str] = []
+    monkeypatch.setattr(
+        ror, "emergency_shutdown",
+        lambda _broker, *, trigger: triggered.append(trigger),
+    )
+
+    scanner._run_risk_cycle()
+
+    assert client.get_positions().positions[0].qty == 3.0
+    assert ror.reconcile_divergence_streak() == 0
+    assert triggered == []
+
+
 def test_risk_cycle_unavailable_reconcile_preserves_streak(
     tmp_db: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -832,6 +876,24 @@ def test_generic_acceptance_is_not_reported_closed_while_order_is_open(
     assert result.status == "holding"
     assert result.closed == []
     assert "awaiting actual close fills" in result.pending[0]
+
+
+def test_generic_short_close_uses_positive_market_value_magnitude(
+    tmp_db: Path,
+) -> None:
+    broker = _ClosingFakeBroker(auto_fill=False)
+    broker._positions["TSLA"] = Position(
+        symbol="TSLA", qty=3.0, side="short", market_value=-720.0,
+    )
+
+    ror.emergency_shutdown(
+        broker, trigger="test", notifier=_Recorder(), now=_TS,
+    )
+
+    (order,) = db.get_generic_emergency_orders_for_symbol("TSLA")
+    assert order.side == "buy"
+    assert order.requested_qty == 3.0
+    assert order.requested_limit_price == 240.0
 
 
 def test_emergency_restart_does_not_duplicate_nonterminal_typed_exit(

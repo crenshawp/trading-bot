@@ -634,7 +634,7 @@ def emergency_shutdown(
                 continue
             try:
                 price = (
-                    bpos.market_value / bpos.qty
+                    abs(bpos.market_value) / bpos.qty
                     if bpos.market_value is not None and bpos.qty
                     else bpos.avg_entry_price
                 )

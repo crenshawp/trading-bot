@@ -303,7 +303,9 @@ def _orders_body_error(body: Any) -> str:
 def _parse_position(d: Mapping[str, Any]) -> Position:
     return Position(
         symbol=_from_alpaca_symbol(str(d.get("symbol", ""))),
-        qty=_to_float(d.get("qty")) or 0.0,
+        # Alpaca signs short quantities negative on the wire.  The broker-neutral
+        # contract keeps quantity as a magnitude and carries direction in side.
+        qty=abs(_to_float(d.get("qty")) or 0.0),
         side=str(d.get("side", "long")),
         avg_entry_price=_to_float(d.get("avg_entry_price")),
         market_value=_to_float(d.get("market_value")),

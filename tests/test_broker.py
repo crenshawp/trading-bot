@@ -361,6 +361,7 @@ def test_alpaca_get_positions_parses(monkeypatch: pytest.MonkeyPatch) -> None:
     assert res.ok is True
     assert [p.symbol for p in res.positions] == ["AAPL", "TSLA"]
     assert res.positions[0].qty == 10.0
+    assert res.positions[1].qty == 3.0
     assert res.positions[1].side == "short"
 
 
@@ -1058,6 +1059,34 @@ def test_reconcile_clean_when_aligned(tmp_db: Path) -> None:
     report = broker.reconcile(b)
     assert report.ok is True
     assert report.divergences == []          # presence AND quantity match
+
+
+def test_reconcile_detects_true_position_direction_mismatch(tmp_db: Path) -> None:
+    _seed_broker_tracked("AAPL", qty=3.0)
+    client = FakeBroker()
+    client.set_position("AAPL", 3.0, side="short")
+
+    (divergence,) = broker.reconcile(client).divergences
+
+    assert divergence.kind == "qty_mismatch"
+    assert (divergence.internal_qty, divergence.broker_qty) == (3.0, -3.0)
+
+
+def test_reconcile_detects_true_short_position_quantity_mismatch(
+    tmp_db: Path,
+) -> None:
+    db.insert_long_term_position(LongTermPosition(
+        ticker="AAPL", asset_class="stock", entry_price=100.0,
+        entry_date=datetime(2026, 1, 1, tzinfo=UTC), qty=3.0,
+        source="swing_fallback", direction="short",
+    ))
+    client = FakeBroker()
+    client.set_position("AAPL", 2.0, side="short")
+
+    (divergence,) = broker.reconcile(client).divergences
+
+    assert divergence.kind == "qty_mismatch"
+    assert (divergence.internal_qty, divergence.broker_qty) == (-3.0, -2.0)
 
 
 def test_reconcile_normalizes_report_symbols_and_aggregates_aliases(

@@ -183,7 +183,8 @@ def internal_open_positions() -> dict[str, float | None]:
         result[option.symbol] = current + option.contracts
     for position in db.get_open_long_term_positions():
         current = result.get(position.ticker) or 0.0
-        result[position.ticker] = current + position.qty
+        signed_qty = -position.qty if position.direction == "short" else position.qty
+        result[position.ticker] = current + signed_qty
     return result
 
 
@@ -213,7 +214,11 @@ def reconcile(broker_client: Broker) -> ReconciliationReport:
         )
 
     broker_map = _normalized_broker_positions(
-        (position.symbol, position.qty) for position in positions.positions
+        (
+            position.symbol,
+            -position.qty if position.side == "short" else position.qty,
+        )
+        for position in positions.positions
     )
     internal_map = _normalized_internal_positions(internal_open_positions())
     divergences = compare_positions(internal_map, broker_map)
