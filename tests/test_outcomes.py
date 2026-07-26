@@ -8,12 +8,15 @@ which are exercised here.
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
 
 from trading_bot import db, outcomes
 from trading_bot.models import Signal, Trade
+
+_ET = ZoneInfo("America/New_York")
 
 # ────────────────────── helpers ──────────────────────
 
@@ -543,7 +546,7 @@ def test_stale_candle_coverage_remains_retryable(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    opened = datetime(2026, 4, 1, tzinfo=UTC)
+    opened = datetime(2026, 4, 6, tzinfo=UTC)
     sid = _make_signal(hold_estimate_days=3)
     tid = _make_trade(sid, opened_at=opened)
     stale = fake_candles(
@@ -570,6 +573,102 @@ def test_stale_candle_coverage_remains_retryable(
     error = capsys.readouterr().err
     assert "insufficient candle coverage through deadline" in error
     assert (opened + timedelta(days=3)).isoformat() in error
+
+
+def test_friday_session_covers_weekend_deadline_at_signal_timing(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened = datetime(2026, 3, 5, 9, 31, tzinfo=_ET)
+    deadline = opened + timedelta(days=2)
+    sid = _make_signal(hold_estimate_days=2)
+    tid = _make_trade(sid, opened_at=opened)
+    friday = pd.DataFrame(
+        {"High": [105.0], "Low": [98.0], "Close": [102.0]},
+        index=pd.DatetimeIndex([datetime(2026, 3, 6, tzinfo=_ET)]),
+    )
+    _patch_yf(monkeypatch, friday)
+    trade = next(candidate for candidate in db.get_open_trades() if candidate.id == tid)
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+
+    resolved = outcomes.resolve_trade(
+        trade,
+        signal,
+        now=deadline + timedelta(days=1),
+    )
+
+    assert deadline.weekday() == 5
+    assert resolved.outcome == "expired"
+    assert resolved.closed_at == deadline.astimezone(UTC)
+    assert resolved.exit_price == 102.0
+
+
+def test_missing_friday_session_before_weekend_remains_retryable(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    opened = datetime(2026, 3, 5, 9, 31, tzinfo=_ET)
+    deadline = opened + timedelta(days=2)
+    sid = _make_signal(hold_estimate_days=2)
+    tid = _make_trade(sid, opened_at=opened)
+    stale = pd.DataFrame(
+        {"High": [105.0], "Low": [98.0], "Close": [101.0]},
+        index=pd.DatetimeIndex([datetime(2026, 3, 5, tzinfo=_ET)]),
+    )
+    _patch_yf(monkeypatch, stale)
+    trade = next(candidate for candidate in db.get_open_trades() if candidate.id == tid)
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+
+    resolved = outcomes.resolve_trade(
+        trade,
+        signal,
+        now=deadline + timedelta(days=1),
+    )
+
+    assert resolved.outcome == "open"
+    assert resolved.closed_at is None
+    assert "insufficient candle coverage" in capsys.readouterr().err
+
+
+def test_last_session_covers_good_friday_deadline_at_signal_timing(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened = datetime(2026, 3, 31, 9, 31, tzinfo=_ET)
+    deadline = opened + timedelta(days=3)
+    sid = _make_signal(hold_estimate_days=3)
+    tid = _make_trade(sid, opened_at=opened)
+    through_thursday = pd.DataFrame(
+        {
+            "High": [105.0, 104.0],
+            "Low": [98.0, 99.0],
+            "Close": [101.0, 103.0],
+        },
+        index=pd.DatetimeIndex(
+            [
+                datetime(2026, 4, 1, tzinfo=_ET),
+                datetime(2026, 4, 2, tzinfo=_ET),
+            ]
+        ),
+    )
+    _patch_yf(monkeypatch, through_thursday)
+    trade = next(candidate for candidate in db.get_open_trades() if candidate.id == tid)
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+
+    resolved = outcomes.resolve_trade(
+        trade,
+        signal,
+        now=deadline + timedelta(days=1),
+    )
+
+    assert deadline == datetime(2026, 4, 3, 9, 31, tzinfo=_ET)
+    assert resolved.outcome == "expired"
+    assert resolved.closed_at == deadline.astimezone(UTC)
+    assert resolved.exit_price == 103.0
 
 
 def test_deadline_covering_candle_must_be_closed_before_expiry(

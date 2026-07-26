@@ -15,11 +15,13 @@ Phase 7 introduces position sizing.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from enum import Enum
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yfinance as yf
@@ -34,6 +36,23 @@ _DEFAULT_HOLD_DAYS_CRYPTO = 14
 # yfinance interval per asset class.
 _INTERVAL_STOCK = "1d"
 _INTERVAL_CRYPTO = "1h"
+
+_ET = ZoneInfo("America/New_York")
+
+# One-off full-day NYSE closures not described by the regular holiday rules.
+_EXTRAORDINARY_STOCK_CLOSURES = frozenset(
+    {
+        date(2001, 9, 11),
+        date(2001, 9, 12),
+        date(2001, 9, 13),
+        date(2001, 9, 14),
+        date(2004, 6, 11),
+        date(2007, 1, 2),
+        date(2012, 10, 29),
+        date(2012, 10, 30),
+        date(2018, 12, 5),
+    }
+)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -113,6 +132,101 @@ def _interval(signal: Signal) -> str:
 
 def _candle_width(interval: str) -> timedelta:
     return timedelta(hours=1) if interval == _INTERVAL_CRYPTO else timedelta(days=1)
+
+
+def _observed_weekday(day: date) -> date:
+    if day.weekday() == 5:
+        return day - timedelta(days=1)
+    if day.weekday() == 6:
+        return day + timedelta(days=1)
+    return day
+
+
+def _nth_weekday(year: int, month: int, weekday: int, occurrence: int) -> date:
+    first = date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return first + timedelta(days=offset + 7 * (occurrence - 1))
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> date:
+    next_month = date(year + (month == 12), month % 12 + 1, 1)
+    last = next_month - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def _easter_sunday(year: int) -> date:
+    """Gregorian Easter date using the Meeus/Jones/Butcher algorithm."""
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    leap_correction = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * leap_correction) // 451
+    month = (h + leap_correction - 7 * m + 114) // 31
+    day = (h + leap_correction - 7 * m + 114) % 31 + 1
+    return date(year, month, day)
+
+
+@functools.cache
+def _stock_market_holidays(year: int) -> frozenset[date]:
+    holidays = {
+        _observed_weekday(date(year, 1, 1)),
+        _nth_weekday(year, 1, 0, 3),  # Martin Luther King Jr. Day
+        _nth_weekday(year, 2, 0, 3),  # Washington's Birthday
+        _easter_sunday(year) - timedelta(days=2),  # Good Friday
+        _last_weekday(year, 5, 0),  # Memorial Day
+        _observed_weekday(date(year, 7, 4)),
+        _nth_weekday(year, 9, 0, 1),  # Labor Day
+        _nth_weekday(year, 11, 3, 4),  # Thanksgiving
+        _observed_weekday(date(year, 12, 25)),
+    }
+    if year >= 2022:
+        holidays.add(_observed_weekday(date(year, 6, 19)))
+    # A Saturday New Year's Day is observed in the preceding calendar year.
+    holidays.add(_observed_weekday(date(year + 1, 1, 1)))
+    return frozenset(holidays)
+
+
+def _is_stock_session(day: date) -> bool:
+    return (
+        day.weekday() < 5
+        and day not in _stock_market_holidays(day.year)
+        and day not in _EXTRAORDINARY_STOCK_CLOSURES
+    )
+
+
+def _stock_session_close(day: date) -> datetime:
+    return datetime.combine(day, time(16), tzinfo=_ET).astimezone(UTC)
+
+
+def _last_closed_stock_session_in_window(
+    opened_at: datetime,
+    deadline: datetime,
+    now: datetime,
+) -> date | None:
+    """Latest daily-bar session label authorized by the hold window."""
+    candidate = deadline.astimezone(_ET).date()
+    while True:
+        label_time = datetime.combine(candidate, time.min, tzinfo=_ET).astimezone(UTC)
+        if label_time < opened_at:
+            return None
+        if (
+            _is_stock_session(candidate)
+            and _stock_session_close(candidate) <= deadline
+            and _stock_session_close(candidate) <= now
+        ):
+            return candidate
+        candidate -= timedelta(days=1)
+
+
+def _stock_session_date(raw_ts: Any) -> date:
+    value = raw_ts.to_pydatetime() if hasattr(raw_ts, "to_pydatetime") else raw_ts
+    if not isinstance(value, datetime):
+        raise TypeError(f"Cannot derive stock session from {type(value).__name__}")
+    return value.date()
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -237,6 +351,21 @@ def _covers_deadline(
     now: datetime,
 ) -> bool:
     """Whether closed candles cover the complete settlement hold window."""
+    if interval == _INTERVAL_STOCK:
+        required_session = _last_closed_stock_session_in_window(
+            opened_at,
+            deadline,
+            now,
+        )
+        if required_session is None:
+            return False
+        returned_sessions = {
+            _stock_session_date(raw_ts)
+            for raw_ts in df.index
+            if _stock_session_close(_stock_session_date(raw_ts)) <= now
+        }
+        return required_session in returned_sessions
+
     width = _candle_width(interval)
     closed_coverage_ends = (
         candle_time + width
