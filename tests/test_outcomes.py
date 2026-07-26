@@ -610,6 +610,83 @@ def test_deadline_covering_candle_must_be_closed_before_expiry(
 
 
 @pytest.mark.parametrize(
+    ("asset_class", "interval", "step", "candle_count", "last_close"),
+    [
+        ("stock", "1d", timedelta(days=1), 1, 101.0),
+        ("crypto", "1h", timedelta(hours=1), 24, 102.0),
+    ],
+)
+def test_post_deadline_hit_cannot_resolve_trade(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    asset_class: str,
+    interval: str,
+    step: timedelta,
+    candle_count: int,
+    last_close: float,
+) -> None:
+    opened = datetime(2026, 4, 1, tzinfo=UTC)
+    deadline = opened + timedelta(days=1)
+    sid = _make_signal(asset_class=asset_class, hold_estimate_days=1)
+    tid = _make_trade(sid, opened_at=opened)
+    in_window_closes = [101.0] * candle_count
+    in_window_closes[-1] = last_close
+    replay = pd.DataFrame(
+        {
+            "High": [105.0] * candle_count + [112.0],
+            "Low": [98.0] * (candle_count + 1),
+            "Close": in_window_closes + [111.0],
+        },
+        index=pd.DatetimeIndex(
+            [opened + step * index for index in range(candle_count)] + [deadline]
+        ),
+    )
+    requested: dict[str, object] = {}
+
+    def fake_download(_ticker: str, **kwargs: object) -> pd.DataFrame:
+        requested.update(kwargs)
+        return replay
+
+    monkeypatch.setattr("trading_bot.outcomes.yf.download", fake_download)
+    trade = next(candidate for candidate in db.get_open_trades() if candidate.id == tid)
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+
+    resolved = outcomes.resolve_trade(trade, signal, now=deadline + timedelta(days=1))
+
+    assert resolved.outcome == "expired"
+    assert resolved.exit_price == last_close
+    assert requested["interval"] == interval
+    assert requested["end"] == deadline + step
+
+
+def test_forming_in_window_candle_cannot_resolve_trade(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened = datetime(2026, 4, 1, tzinfo=UTC)
+    sid = _make_signal(asset_class="crypto", hold_estimate_days=1)
+    tid = _make_trade(sid, opened_at=opened)
+    replay = pd.DataFrame(
+        {"High": [112.0], "Low": [98.0], "Close": [111.0]},
+        index=pd.DatetimeIndex([opened]),
+    )
+    _patch_yf(monkeypatch, replay)
+    trade = next(candidate for candidate in db.get_open_trades() if candidate.id == tid)
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+
+    resolved = outcomes.resolve_trade(
+        trade,
+        signal,
+        now=opened + timedelta(minutes=30),
+    )
+
+    assert resolved.outcome == "open"
+    assert resolved.exit_price is None
+
+
+@pytest.mark.parametrize(
     ("high", "low", "expected_outcome", "summary_key"),
     [
         (112.0, 100.0, "win", "wins"),

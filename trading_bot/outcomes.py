@@ -111,6 +111,10 @@ def _interval(signal: Signal) -> str:
     return _INTERVAL_CRYPTO if signal.asset_class == "crypto" else _INTERVAL_STOCK
 
 
+def _candle_width(interval: str) -> timedelta:
+    return timedelta(hours=1) if interval == _INTERVAL_CRYPTO else timedelta(days=1)
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # yfinance fetch (with per-resolver-run cache)
 # ────────────────────────────────────────────────────────────────────────────
@@ -168,7 +172,10 @@ def _fetch_candles(
         df = yf.download(
             ticker,
             start=start,
-            end=end + timedelta(days=1),  # yfinance end is exclusive on daily
+            # yfinance's end is exclusive. Pad by exactly one requested bar so
+            # the candle whose timestamp precedes ``end`` can be returned,
+            # without asking an hourly replay for a full extra day of evidence.
+            end=end + _candle_width(interval),
             interval=interval,
             progress=False,
             auto_adjust=False,
@@ -219,10 +226,6 @@ def _fetch_candles(
     if cache is not None:
         cache[key] = result
     return result
-
-
-def _candle_width(interval: str) -> timedelta:
-    return timedelta(hours=1) if interval == _INTERVAL_CRYPTO else timedelta(days=1)
 
 
 def _covers_deadline(
@@ -315,10 +318,15 @@ def resolve_trade(
 
     df = fetch.candles
 
+    width = _candle_width(interval)
     last_close: float | None = None
     for raw_ts, row in df.iterrows():
         candle_time = _to_utc(raw_ts)
-        if candle_time < opened_at:
+        if (
+            candle_time < opened_at
+            or candle_time >= deadline
+            or candle_time + width > now_utc
+        ):
             continue
 
         high = float(row["High"])
