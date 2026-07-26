@@ -739,6 +739,47 @@ def test_get_option_chain_rejects_malformed_contracts_2xx(
     assert chain.reason in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    ("row", "detail"),
+    [
+        (None, "item 0 must be an object"),
+        ({**_CONTRACTS_BODY["option_contracts"][0], "symbol": ""},
+         "'symbol' must be a non-empty string"),
+        ({**_CONTRACTS_BODY["option_contracts"][0], "underlying_symbol": None},
+         "'underlying_symbol' must be a non-empty string"),
+        ({**_CONTRACTS_BODY["option_contracts"][0], "type": ["call"]},
+         "'type' must be 'call' or 'put'"),
+        ({**_CONTRACTS_BODY["option_contracts"][0], "strike_price": "bad"},
+         "'strike_price' must be a finite number"),
+        ({**_CONTRACTS_BODY["option_contracts"][0], "expiration_date": "2026-99-99"},
+         "'expiration_date' must be an ISO date string"),
+    ],
+    ids=(
+        "non-object", "missing-identity", "missing-underlying", "invalid-type",
+        "invalid-strike", "invalid-expiry",
+    ),
+)
+def test_get_option_chain_rejects_malformed_contract_items(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    row: object,
+    detail: str,
+) -> None:
+    _with_opt_creds(monkeypatch)
+    monkeypatch.setattr(
+        "trading_bot.broker.options.requests.get",
+        lambda *a, **k: _FakeGetResp(200, {"option_contracts": [row]}),
+    )
+
+    chain = options.AlpacaOptionsClient().get_option_chain("AAPL")
+
+    assert chain.ok is False
+    assert chain.contracts == []
+    assert "malformed contracts response" in chain.reason
+    assert detail in chain.reason
+    assert chain.reason in capsys.readouterr().err
+
+
 def test_get_option_chain_preserves_valid_empty_contracts_response(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -796,6 +837,54 @@ def test_get_option_chain_rejects_malformed_snapshots_2xx(
     assert "malformed snapshots response" in chain.reason
     assert detail in chain.reason
     assert chain.reason in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("snapshot", [None, [], "not-an-object"])
+def test_get_option_chain_rejects_non_object_snapshot_values(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    snapshot: object,
+) -> None:
+    _with_opt_creds(monkeypatch)
+
+    def route(url: str, **kwargs: object) -> _FakeGetResp:
+        if "/v2/options/contracts" in url:
+            return _FakeGetResp(200, _CONTRACTS_BODY)
+        return _FakeGetResp(200, {
+            "snapshots": {"AAPL260116C00150000": snapshot},
+        })
+
+    monkeypatch.setattr("trading_bot.broker.options.requests.get", route)
+
+    chain = options.AlpacaOptionsClient().get_option_chain("AAPL")
+
+    assert chain.ok is False
+    assert chain.contracts == []
+    assert "malformed snapshots response" in chain.reason
+    assert "must be an object" in chain.reason
+    assert chain.reason in capsys.readouterr().err
+
+
+def test_get_option_chain_accepts_snapshot_without_optional_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_opt_creds(monkeypatch)
+
+    def route(url: str, **kwargs: object) -> _FakeGetResp:
+        if "/v2/options/contracts" in url:
+            return _FakeGetResp(200, _CONTRACTS_BODY)
+        return _FakeGetResp(200, {
+            "snapshots": {"AAPL260116C00150000": {}},
+        })
+
+    monkeypatch.setattr("trading_bot.broker.options.requests.get", route)
+
+    chain = options.AlpacaOptionsClient().get_option_chain("AAPL")
+
+    assert chain.ok is True
+    assert len(chain.contracts) == 1
+    assert chain.contracts[0].delta is None
+    assert chain.contracts[0].bid is None
 
 
 def test_get_option_chain_preserves_valid_empty_snapshots_response(

@@ -17,9 +17,11 @@ verbatim (an option order is just an order whose ``symbol`` is an OCC string).
 from __future__ import annotations
 
 import dataclasses
+import math
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 
 import requests
@@ -129,17 +131,44 @@ def _as_int(value: Any) -> int | None:
         return None
 
 
-def _parse_contract(d: Mapping[str, Any]) -> OptionContract:
+def _parse_contract(
+    d: Mapping[str, Any],
+) -> tuple[OptionContract | None, str]:
     """Neutral OptionContract from an Alpaca /v2/options/contracts row (metadata
     only — greeks/quotes come from the snapshot merge)."""
+    symbol = d.get("symbol")
+    if not isinstance(symbol, str) or not symbol.strip():
+        return None, "'symbol' must be a non-empty string"
+
+    underlying = d.get("underlying_symbol")
+    if not isinstance(underlying, str) or not underlying.strip():
+        return None, "'underlying_symbol' must be a non-empty string"
+
+    option_type = d.get("type")
+    if not isinstance(option_type, str) or option_type not in VALID_OPTION_TYPES:
+        return None, "'type' must be 'call' or 'put'"
+
+    raw_strike = d.get("strike_price")
+    strike = None if isinstance(raw_strike, bool) else _as_float(raw_strike)
+    if strike is None or not math.isfinite(strike):
+        return None, "'strike_price' must be a finite number"
+
+    expiry = d.get("expiration_date")
+    if not isinstance(expiry, str):
+        return None, "'expiration_date' must be an ISO date string"
+    try:
+        date.fromisoformat(expiry)
+    except ValueError:
+        return None, "'expiration_date' must be an ISO date string"
+
     return OptionContract(
-        symbol=str(d.get("symbol", "")),
-        underlying=str(d.get("underlying_symbol", "")),
-        option_type=str(d.get("type", "")),
-        strike=_as_float(d.get("strike_price")) or 0.0,
-        expiry=str(d.get("expiration_date", "")),
+        symbol=symbol,
+        underlying=underlying,
+        option_type=option_type,
+        strike=strike,
+        expiry=expiry,
         open_interest=_as_int(d.get("open_interest")),
-    )
+    ), ""
 
 
 # A malformed 2xx body is an upstream failure, not a valid empty collection.
@@ -181,7 +210,22 @@ def _parse_contracts_body(
             f"{_MALFORMED_CONTRACTS}: 'next_page_token' must be a string or null",
         )
     page_token = raw_page_token or None
-    contracts = [_parse_contract(r) for r in rows if isinstance(r, Mapping)]
+    contracts: list[OptionContract] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            return (
+                [],
+                None,
+                f"{_MALFORMED_CONTRACTS}: item {index} must be an object",
+            )
+        contract, item_error = _parse_contract(row)
+        if contract is None:
+            return (
+                [],
+                None,
+                f"{_MALFORMED_CONTRACTS}: item {index} {item_error}",
+            )
+        contracts.append(contract)
     return contracts, page_token, ""
 
 
@@ -217,11 +261,15 @@ def _parse_snapshots_body(
             f"{_MALFORMED_SNAPSHOTS}: 'next_page_token' must be a string or null",
         )
     page_token = raw_page_token or None
-    snapshots = {
-        str(symbol): snapshot
-        for symbol, snapshot in raw_snapshots.items()
-        if isinstance(snapshot, Mapping)
-    }
+    snapshots: dict[str, Mapping[str, Any]] = {}
+    for symbol, snapshot in raw_snapshots.items():
+        if not isinstance(snapshot, Mapping):
+            return (
+                {},
+                None,
+                f"{_MALFORMED_SNAPSHOTS}: snapshot {symbol!r} must be an object",
+            )
+        snapshots[str(symbol)] = snapshot
     return snapshots, page_token, ""
 
 
