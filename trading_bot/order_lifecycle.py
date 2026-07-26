@@ -410,6 +410,8 @@ def prepare_order_intent(
     )
     try:
         pending_id = db.insert_pending_order(pending)
+    except db.PendingExitAlreadyExistsError:
+        raise
     except Exception as exc:
         raise OrderIntentCaptureError(
             "order intent was not durably prepared before submission: "
@@ -907,28 +909,33 @@ def submit_position_exit(
     )
     if any(attempt.terminal_at is None for attempt in existing_attempts):
         raise ValueError("exit target already has a nonterminal exit attempt")
-    return submit_prepared_order(
-        broker,
-        ticker=submission.ticker,
-        broker_symbol=submission.broker_symbol,
-        asset_class=submission.asset_class,
-        vehicle=submission.vehicle,
-        target_position_kind=position_kind,
-        side=submission.side,
-        requested_qty=requested_qty,
-        requested_limit_price=requested_limit_price,
-        submitted_at=submitted_at,
-        intent_payload={
-            "intent_kind": "position_exit",
-            "exit_reason": exit_reason.strip(),
-        },
-        order_type=order_type,
-        time_in_force=time_in_force,
-        order_role="exit",
-        closes_position_kind=position_kind,
-        closes_position_id=position_id,
-        broker_result_observer=broker_result_observer,
-    )
+    try:
+        return submit_prepared_order(
+            broker,
+            ticker=submission.ticker,
+            broker_symbol=submission.broker_symbol,
+            asset_class=submission.asset_class,
+            vehicle=submission.vehicle,
+            target_position_kind=position_kind,
+            side=submission.side,
+            requested_qty=requested_qty,
+            requested_limit_price=requested_limit_price,
+            submitted_at=submitted_at,
+            intent_payload={
+                "intent_kind": "position_exit",
+                "exit_reason": exit_reason.strip(),
+            },
+            order_type=order_type,
+            time_in_force=time_in_force,
+            order_role="exit",
+            closes_position_kind=position_kind,
+            closes_position_id=position_id,
+            broker_result_observer=broker_result_observer,
+        )
+    except db.PendingExitAlreadyExistsError as exc:
+        raise ValueError(
+            "exit target already has a nonterminal exit attempt"
+        ) from exc
 
 
 def submit_generic_emergency_close(

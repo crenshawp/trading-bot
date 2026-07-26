@@ -85,7 +85,26 @@ from trading_bot.models import (
 # Version 13 (Phase 6) — adds trades.ind_* advisory indicator-family columns.
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
-SCHEMA_VERSION = 30
+# Version 31 (cross-cutting audit): one nonterminal typed exit per position.
+SCHEMA_VERSION = 31
+
+
+class PendingExitAlreadyExistsError(RuntimeError):
+    """Raised when a typed position already has a nonterminal exit intent."""
+
+    def __init__(
+        self,
+        position_kind: str,
+        position_id: int,
+        pending_order_id: int,
+    ) -> None:
+        self.position_kind = position_kind
+        self.position_id = position_id
+        self.pending_order_id = pending_order_id
+        super().__init__(
+            f"{position_kind} position {position_id} already has nonterminal "
+            f"pending order {pending_order_id}"
+        )
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -1778,6 +1797,60 @@ def _migrate_to_v30(conn: sqlite3.Connection) -> None:
     _create_v30_pending_order_objects(conn)
 
 
+def _migrate_to_v31(conn: sqlite3.Connection) -> None:
+    """Enforce one nonterminal exit intent per typed position.
+
+    Historical duplicates may represent live broker orders. Never choose a
+    winner or invent terminal broker truth during migration; instead preserve
+    every row and require explicit operator reconciliation before retrying.
+    """
+    duplicate_rows = conn.execute(
+        """
+        WITH duplicate_targets AS (
+            SELECT closes_position_kind, closes_position_id
+            FROM pending_orders
+            WHERE order_role = 'exit' AND terminal_at IS NULL
+            GROUP BY closes_position_kind, closes_position_id
+            HAVING COUNT(*) > 1
+        )
+        SELECT pending_orders.closes_position_kind,
+               pending_orders.closes_position_id,
+               pending_orders.id
+        FROM pending_orders
+        JOIN duplicate_targets USING (
+            closes_position_kind, closes_position_id
+        )
+        WHERE pending_orders.order_role = 'exit'
+          AND pending_orders.terminal_at IS NULL
+        ORDER BY pending_orders.closes_position_kind,
+                 pending_orders.closes_position_id,
+                 pending_orders.id
+        """
+    ).fetchall()
+    if duplicate_rows:
+        duplicates: dict[tuple[str, int], list[int]] = {}
+        for row in duplicate_rows:
+            target = (
+                str(row["closes_position_kind"]),
+                int(row["closes_position_id"]),
+            )
+            duplicates.setdefault(target, []).append(int(row["id"]))
+        diagnostic = "; ".join(
+            f"{kind}/{position_id} pending_order_ids={order_ids}"
+            for (kind, position_id), order_ids in duplicates.items()
+        )
+        raise RuntimeError(
+            "cannot enforce typed-exit uniqueness; reconcile duplicate "
+            f"nonterminal exits against broker truth: {diagnostic}"
+        )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "idx_pending_orders_typed_exit_nonterminal "
+        "ON pending_orders(closes_position_kind, closes_position_id) "
+        "WHERE order_role = 'exit' AND terminal_at IS NULL"
+    )
+
+
 def init_db() -> None:
     """Create the schema if absent and apply any pending migrations. Idempotent."""
     conn = get_connection()
@@ -1812,6 +1885,7 @@ def init_db() -> None:
         _migrate_to_v28(conn)
         _migrate_to_v29(conn)
         _migrate_to_v30(conn)
+        _migrate_to_v31(conn)
         cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
         row = cur.fetchone()
         if row is None:
@@ -4822,7 +4896,28 @@ def insert_pending_order(order: PendingOrder) -> int:
     )
     conn = get_connection()
     try:
-        cur = conn.execute(sql, params)
+        try:
+            cur = conn.execute(sql, params)
+        except sqlite3.IntegrityError as exc:
+            if (
+                order.order_role == "exit"
+                and order.closes_position_kind is not None
+                and order.closes_position_id is not None
+            ):
+                existing = conn.execute(
+                    "SELECT id FROM pending_orders "
+                    "WHERE order_role = 'exit' "
+                    "AND closes_position_kind = ? AND closes_position_id = ? "
+                    "AND terminal_at IS NULL ORDER BY id LIMIT 1",
+                    (order.closes_position_kind, order.closes_position_id),
+                ).fetchone()
+                if existing is not None:
+                    raise PendingExitAlreadyExistsError(
+                        order.closes_position_kind,
+                        order.closes_position_id,
+                        int(existing["id"]),
+                    ) from exc
+            raise
         conn.commit()
         new_id = cur.lastrowid
         if new_id is None:

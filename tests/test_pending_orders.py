@@ -177,6 +177,7 @@ def test_pending_order_schema_has_exact_columns_and_constraints(tmp_db: Path) ->
     assert "idx_pending_orders_nonterminal" in indexes
     assert "idx_pending_orders_exit_target" in indexes
     assert "idx_pending_orders_generic_nonterminal" in indexes
+    assert "idx_pending_orders_typed_exit_nonterminal" in indexes
     assert triggers == {
         "trg_pending_orders_immutable_intent",
         "trg_pending_orders_broker_id_bind_once",
@@ -185,6 +186,131 @@ def test_pending_order_schema_has_exact_columns_and_constraints(tmp_db: Path) ->
         "trg_pending_orders_fill_time_on_insert",
         "trg_pending_orders_fill_time_on_update",
     }
+
+
+def test_typed_exit_unique_index_is_authoritative_and_allows_terminal_retry(
+    tmp_db: Path,
+) -> None:
+    first_id = db.insert_pending_order(_pending_order(
+        client_order_id="typed-exit-first",
+        broker_order_id=None,
+        order_role="exit",
+        closes_position_kind="option",
+        closes_position_id=41,
+        side="sell",
+        intent_payload_json=_exit_payload(),
+        lifecycle_status="prepared",
+        broker_status=None,
+    ))
+
+    with pytest.raises(db.PendingExitAlreadyExistsError) as exc_info:
+        db.insert_pending_order(_pending_order(
+            client_order_id="typed-exit-racing",
+            broker_order_id=None,
+            order_role="exit",
+            closes_position_kind="option",
+            closes_position_id=41,
+            side="sell",
+            intent_payload_json=_exit_payload("stop_loss"),
+            lifecycle_status="prepared",
+            broker_status=None,
+        ))
+
+    assert exc_info.value.position_kind == "option"
+    assert exc_info.value.position_id == 41
+    assert exc_info.value.pending_order_id == first_id
+    db.update_pending_order(
+        first_id,
+        lifecycle_status="abandoned",
+        last_refreshed_at=datetime(2026, 7, 20, 15, 1, tzinfo=UTC),
+        terminal_reason="definitively not submitted",
+        terminal_at=datetime(2026, 7, 20, 15, 1, tzinfo=UTC),
+    )
+    retry_id = db.insert_pending_order(_pending_order(
+        client_order_id="typed-exit-retry",
+        broker_order_id=None,
+        order_role="exit",
+        closes_position_kind="option",
+        closes_position_id=41,
+        side="sell",
+        intent_payload_json=_exit_payload("stop_loss"),
+        lifecycle_status="prepared",
+        broker_status=None,
+    ))
+    assert retry_id > first_id
+
+
+def test_v30_typed_exit_duplicate_migration_fails_closed_then_restarts_cleanly(
+    tmp_db: Path,
+) -> None:
+    conn = db.get_connection()
+    try:
+        conn.execute("DROP INDEX idx_pending_orders_typed_exit_nonterminal")
+        conn.execute("UPDATE schema_version SET version = 30")
+        conn.commit()
+    finally:
+        conn.close()
+
+    duplicate_ids = [
+        db.insert_pending_order(_pending_order(
+            client_order_id=f"bot-duplicate-{suffix}",
+            broker_order_id=None,
+            order_role="exit",
+            closes_position_kind="option",
+            closes_position_id=73,
+            side="sell",
+            intent_payload_json=_exit_payload(reason),
+            lifecycle_status="prepared",
+            broker_status=None,
+        ))
+        for suffix, reason in (("a", "take_profit"), ("b", "stop_loss"))
+    ]
+    conn = db.get_connection()
+    try:
+        before = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT * FROM pending_orders ORDER BY id"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        db.init_db()
+    assert (
+        "reconcile duplicate nonterminal exits against broker truth: "
+        f"option/73 pending_order_ids={duplicate_ids}"
+    ) in str(exc_info.value)
+
+    conn = db.get_connection()
+    try:
+        after = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT * FROM pending_orders ORDER BY id"
+            ).fetchall()
+        ]
+        index = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_pending_orders_typed_exit_nonterminal'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert after == before
+    assert index is None
+    assert db.schema_version() == 30
+
+    db.update_pending_order(
+        duplicate_ids[1],
+        lifecycle_status="abandoned",
+        last_refreshed_at=datetime(2026, 7, 20, 15, 2, tzinfo=UTC),
+        terminal_reason="operator reconciled as never submitted",
+        terminal_at=datetime(2026, 7, 20, 15, 2, tzinfo=UTC),
+    )
+    db.init_db()
+    assert db.schema_version() == 31
+    assert len(db.get_pending_exit_orders_for_position("option", 73)) == 2
 
 
 def test_v25_sentiment_migration_preserves_pending_order_and_legacy_trade(
@@ -219,7 +345,7 @@ def test_v25_sentiment_migration_preserves_pending_order_and_legacy_trade(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 30
+    assert db.schema_version() == 31
     assert db.get_pending_order("broker-order-1") == pending_before
     assert pending_before is not None and pending_before.id == pending_id
     legacy = db.get_trade_by_signal_id(signal_id)
@@ -260,7 +386,7 @@ def test_v26_indicator_migration_preserves_pending_order_and_legacy_trade(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 30
+    assert db.schema_version() == 31
     assert db.get_pending_order("broker-order-1") == pending_before
     assert pending_before is not None and pending_before.id == pending_id
     legacy = db.get_trade_by_signal_id(signal_id)
@@ -302,7 +428,7 @@ def test_v27_risk_migration_preserves_pending_order_and_legacy_trade(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 30
+    assert db.schema_version() == 31
     assert db.get_pending_order("broker-order-1") == pending_before
     assert pending_before is not None and pending_before.id == pending_id
     legacy = db.get_trade_by_signal_id(signal_id)
@@ -616,7 +742,7 @@ def test_v28_option_position_migration_preserves_row_and_adds_null_exit_reason(
     assert db.get_option_position(position_id) == dataclasses.replace(
         position, id=position_id
     )
-    assert db.schema_version() == 30
+    assert db.schema_version() == 31
 
 
 def test_duplicate_broker_order_id_is_rejected(tmp_db: Path) -> None:
@@ -1131,7 +1257,7 @@ def test_v23_database_migrates_without_rewriting_existing_rows(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 30
+    assert db.schema_version() == 31
     migrated = db.get_connection()
     try:
         sentinel = migrated.execute(
@@ -1307,7 +1433,7 @@ def test_v28_to_v30_migration_preserves_every_legacy_ledger_value(
     assert after_row["last_fill_at"] == "2026-07-20T15:00:00+00:00"
     assert after_row["last_fill_time_source"] == "observed"
     assert after_row["fees_dollars"] is None
-    assert db.schema_version() == 30
+    assert db.schema_version() == 31
 
 
 def test_v24_pending_order_rows_migrate_collision_free_and_preserve_data(
@@ -1366,7 +1492,7 @@ def test_v24_pending_order_rows_migrate_collision_free_and_preserve_data(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 30
+    assert db.schema_version() == 31
     first = db.get_pending_order("legacy-bound-7")
     second = db.get_pending_order("legacy-bound-11")
     third = db.get_pending_order("legacy-bound-15")

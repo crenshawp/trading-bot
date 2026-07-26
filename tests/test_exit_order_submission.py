@@ -5,6 +5,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -743,6 +745,66 @@ def test_second_call_is_blocked_while_exit_attempt_is_ambiguous(tmp_db: Path) ->
             submitted_at=_EXIT_AT,
         )
     assert broker.submit_calls == 1
+
+
+def test_racing_typed_exit_insert_loser_stops_before_broker_io_and_restart(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    position_id = _insert_linked_option()
+    broker = CountingFakeBroker()
+    precheck_barrier = threading.Barrier(2)
+    real_get = db.get_pending_exit_orders_for_position
+
+    def synchronized_precheck(
+        position_kind: str,
+        target_position_id: int,
+    ) -> list[PendingOrder]:
+        attempts = real_get(position_kind, target_position_id)
+        precheck_barrier.wait(timeout=5)
+        return attempts
+
+    monkeypatch.setattr(
+        db,
+        "get_pending_exit_orders_for_position",
+        synchronized_precheck,
+    )
+
+    def submit() -> str:
+        try:
+            order_lifecycle.submit_position_exit(
+                broker,
+                position_kind="option",
+                position_id=position_id,
+                requested_qty=2.0,
+                requested_limit_price=4.5,
+                exit_reason="stop_loss",
+                submitted_at=_EXIT_AT,
+            )
+        except ValueError as exc:
+            assert "nonterminal exit attempt" in str(exc)
+            return "already_pending"
+        return "submitted"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = sorted(executor.map(lambda _: submit(), range(2)))
+
+    assert outcomes == ["already_pending", "submitted"]
+    assert broker.submit_calls == 1
+    monkeypatch.setattr(db, "get_pending_exit_orders_for_position", real_get)
+    db.init_db()
+    with pytest.raises(ValueError, match="nonterminal exit attempt"):
+        order_lifecycle.submit_position_exit(
+            broker,
+            position_kind="option",
+            position_id=position_id,
+            requested_qty=2.0,
+            requested_limit_price=4.5,
+            exit_reason="stop_loss",
+            submitted_at=_EXIT_AT,
+        )
+    assert broker.submit_calls == 1
+    assert len(real_get("option", position_id)) == 1
 
 
 def test_emergency_direct_closers_use_lifecycle_and_leave_unfilled_rows_open(
