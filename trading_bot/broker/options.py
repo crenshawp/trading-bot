@@ -582,7 +582,10 @@ class AlpacaOptionsClient:
         incomplete paginated response or malformed successful response is
         instead an explicit ``ok=False`` upstream failure.
         """
-        contracts, contracts_reason = self._list_option_contracts_result(underlying)
+        contracts, contracts_reason = self._list_option_contracts_result(
+            underlying,
+            expiration_gte=date.today().isoformat(),
+            )
         if contracts_reason:
             return OptionChainResult(ok=False, reason=contracts_reason)
         if not contracts:
