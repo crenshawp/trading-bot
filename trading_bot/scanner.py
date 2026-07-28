@@ -1419,6 +1419,13 @@ def _run_risk_cycle() -> None:
     except Exception as exc:
         import sys
         print(f"  risk cycle error: {exc}", file=sys.stderr)
+        risk_of_ruin._safe_send(
+            risk_of_ruin._pushover_notify,
+            "RISK CYCLE ERROR - CIRCUIT BREAKER MAY NOT HAVE RUN",
+            f"The Tier-1/Tier-2 evaluation pass failed: {exc}. Positions are "
+            "NOT confirmed safe this cycle; investigate before assuming normal "
+            "operation.",
+        )
 
 
 def _run_evaluator_cycle() -> None:
