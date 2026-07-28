@@ -19,6 +19,8 @@ from typing import Any
 
 import yfinance as yf
 
+from trading_bot.symbol_utils import to_yfinance_symbol
+
 
 @dataclass(frozen=True)
 class EarningsInfo:
@@ -52,7 +54,7 @@ def _fetch_earnings_date(ticker: str) -> datetime | None:
     Isolated so tests can monkeypatch it without touching the network.
     """
     try:
-        calendar = yf.Ticker(ticker).calendar
+        calendar = yf.Ticker(to_yfinance_symbol(ticker)).calendar
         if not isinstance(calendar, dict):
             return None
         dates = calendar.get("Earnings Date")

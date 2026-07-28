@@ -39,6 +39,7 @@ import yfinance as yf
 
 from trading_bot import db, regime, vix
 from trading_bot.models import Prediction
+from trading_bot.symbol_utils import to_yfinance_symbol
 
 # ────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -277,7 +278,7 @@ def _fetch_15m_candles(ticker: str) -> pd.DataFrame | None:
     """Pull recent 15-min candles. Returns None on any failure or empty."""
     try:
         df = yf.download(
-            ticker, period=_FETCH_PERIOD, interval=_INTERVAL,
+            to_yfinance_symbol(ticker), period=_FETCH_PERIOD, interval=_INTERVAL,
             progress=False, auto_adjust=False,
         )
     except Exception as exc:  # noqa: BLE001 - yfinance raises anything

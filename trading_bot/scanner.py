@@ -51,6 +51,7 @@ from trading_bot import (
 from trading_bot.discovery_universe import SHADOW_UNIVERSE
 from trading_bot.models import Signal, Trade
 from trading_bot.secrets import get_required
+from trading_bot.symbol_utils import to_yfinance_symbol
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
@@ -464,7 +465,9 @@ def get_stock_data(ticker):
     # Validate BEFORE touching .columns — the previous order dereferenced
     # df.columns first, so the None/shape guard below it could never actually
     # protect anything (a None return would have raised AttributeError first).
-    df = yf.download(ticker, period="60d", interval="1d", progress=False)
+    df = yf.download(
+        to_yfinance_symbol(ticker), period="60d", interval="1d", progress=False,
+    )
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return None
     if isinstance(df.columns, pd.MultiIndex):
@@ -474,7 +477,9 @@ def get_stock_data(ticker):
 
 
 def get_crypto_data(ticker):
-    df = yf.download(ticker, period="60d", interval="1h", progress=False)
+    df = yf.download(
+        to_yfinance_symbol(ticker), period="60d", interval="1h", progress=False,
+    )
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return None
     if isinstance(df.columns, pd.MultiIndex):
@@ -487,7 +492,7 @@ def get_yahoo_news(ticker, max_articles=5):
     """Pull recent news headlines from Yahoo Finance for a ticker"""
     try:
         print(f"  Fetching news for {ticker} from Yahoo Finance...")
-        stock    = yf.Ticker(ticker)
+        stock    = yf.Ticker(to_yfinance_symbol(ticker))
         news     = stock.news or []
         articles = []
 
@@ -602,7 +607,7 @@ def check_earnings_risk(ticker):
     if ticker in etfs:
         return "LOW"
     try:
-        stock    = yf.Ticker(ticker)
+        stock    = yf.Ticker(to_yfinance_symbol(ticker))
         calendar = stock.calendar
         if calendar is None or not isinstance(calendar, dict):
             return "UNKNOWN"

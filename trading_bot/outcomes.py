@@ -28,6 +28,7 @@ import yfinance as yf
 
 from trading_bot import db
 from trading_bot.models import Signal, Trade
+from trading_bot.symbol_utils import to_yfinance_symbol
 
 # Default hold windows when the signal didn't capture an estimate.
 _DEFAULT_HOLD_DAYS_STOCK = 30
@@ -284,7 +285,7 @@ def _fetch_candles(
 
     try:
         df = yf.download(
-            ticker,
+            to_yfinance_symbol(ticker),
             start=start,
             # yfinance's end is exclusive. Pad by exactly one requested bar so
             # the candle whose timestamp precedes ``end`` can be returned,

@@ -55,6 +55,7 @@ from trading_bot import (
 from trading_bot.broker.base import ORDER_TYPE_LIMIT, TIF_DAY, Broker, OrderResult
 from trading_bot.broker.options import OPTION_TYPE_CALL, OPTION_TYPE_PUT
 from trading_bot.models import LongTermCandidate, LongTermPosition, Signal
+from trading_bot.symbol_utils import to_yfinance_symbol
 
 __all__ = ["LongTermCandidate", "LongTermPosition"]
 
@@ -79,7 +80,7 @@ def _fetch_fundamentals(ticker: str) -> tuple[float | None, float | None]:
     which the screen treats as fail-open.
     """
     try:
-        info = yf.Ticker(ticker).info
+        info = yf.Ticker(to_yfinance_symbol(ticker)).info
         if not isinstance(info, dict):
             return None, None
         growth = info.get("earningsGrowth")
@@ -250,8 +251,8 @@ def fetch_daily_candles(
     days = period_days if period_days is not None else config.TREND_PERIOD + 60
     try:
         frame = yf.download(
-            ticker, period=f"{days}d", interval="1d", progress=False,
-            auto_adjust=False,
+            to_yfinance_symbol(ticker), period=f"{days}d", interval="1d",
+            progress=False, auto_adjust=False,
         )
     except Exception as exc:  # noqa: BLE001 - a data fetch must never raise into a scan
         print(f"  longterm: candle fetch error for {ticker}: {exc}", file=sys.stderr)
