@@ -30,6 +30,7 @@ from trading_bot.alpaca_market_data import (
     latest_closed_bar,
 )
 from trading_bot.discovery_universe import SHADOW_UNIVERSE
+from trading_bot.symbol_utils import to_yfinance_symbol
 
 _ET = ZoneInfo("America/New_York")
 
@@ -111,8 +112,8 @@ def fetch_yf_daily(ticker: str, window_days: int) -> pd.DataFrame | None:
     """Daily yfinance candles for the comparison window. Fail-soft → None."""
     try:
         df = yf.download(
-            ticker, period=f"{window_days}d", interval="1d", progress=False,
-            auto_adjust=False,
+            to_yfinance_symbol(ticker), period=f"{window_days}d", interval="1d",
+            progress=False, auto_adjust=False,
         )
     except Exception as exc:  # noqa: BLE001 - a fetch must never sink the report
         print(f"  compare: yfinance error for {ticker} ({exc})", file=sys.stderr)

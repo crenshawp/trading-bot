@@ -397,3 +397,29 @@ def test_default_universe_dedupes_and_includes_crypto(tmp_db: Path) -> None:
     for pair in config.LONGTERM_CRYPTO_UNIVERSE:
         assert pair in universe
     assert "AAPL" in universe                        # shadow universe present
+
+
+def test_yf_fetch_translates_class_share_symbols(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: this was the last yfinance call site still passing the raw
+    internal symbol.
+
+    Every other call site (outcomes, scanner, long_term, predictions,
+    earnings) wraps the ticker in ``to_yfinance_symbol``. Here ``BRK.B`` — a
+    member of STOCK_WATCHLIST and therefore of the compare universe — went out
+    dotted, returned nothing, and the ticker was permanently reported as
+    yfinance-unavailable: the exact failure symbol_utils exists to prevent.
+    """
+    seen: list[str] = []
+
+    def fake_download(ticker: str, **_: object) -> None:
+        seen.append(ticker)
+        return None
+
+    monkeypatch.setattr(mc.yf, "download", fake_download)
+
+    mc.fetch_yf_daily("BRK.B", 30)
+    mc.fetch_yf_daily("AAPL", 30)
+
+    assert seen == ["BRK-B", "AAPL"]  # translated at the edge, others untouched
