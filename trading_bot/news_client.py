@@ -27,6 +27,23 @@ _NEWS_CACHE_TTL_SECONDS = 600
 _HTTP_TIMEOUT_SECONDS = 10
 _DEFAULT_MAX_ARTICLES = 10
 
+_REDACTED = "***REDACTED***"
+
+
+def redact(text: str, secret: str | None) -> str:
+    """Mask ``secret`` wherever it appears in ``text``.
+
+    Defence in depth for the fail-soft logging below. The key is sent as a
+    header rather than a query parameter precisely so it cannot reach a log,
+    but a `requests` exception renders the full request URL and there is no
+    guarantee a future redirect, proxy error, or library change won't surface
+    it another way. A credential must never be one library detail away from
+    the deploy log, so we scrub on the way out as well.
+    """
+    if not secret:
+        return text
+    return text.replace(secret, _REDACTED)
+
 
 @dataclass(frozen=True)
 class NewsResult:
@@ -92,16 +109,24 @@ def _fetch_uncached(ticker: str, max_articles: int) -> NewsResult:
         return NewsResult(ticker=ticker, ok=False)
 
     yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+    # The key goes in the X-Api-Key header, NOT the query string: `requests`
+    # renders the full URL into its connection/proxy/retry exception messages,
+    # and the `except` below prints that message to stderr — so an `apiKey=`
+    # query parameter put the live NEWSAPI_KEY into the Railway deploy log on
+    # every DNS blip, once per ticker. NewsAPI accepts either form.
     url = (
         "https://newsapi.org/v2/everything"
         f"?q={ticker} stock"
         f"&from={yesterday}"
         "&sortBy=publishedAt"
         "&language=en"
-        f"&apiKey={api_key}"
     )
     try:
-        response = requests.get(url, timeout=_HTTP_TIMEOUT_SECONDS)
+        response = requests.get(
+            url,
+            timeout=_HTTP_TIMEOUT_SECONDS,
+            headers={"X-Api-Key": api_key},
+        )
         if response.status_code != 200:
             print(
                 f"  news: HTTP {response.status_code} for {ticker} "
@@ -117,7 +142,10 @@ def _fetch_uncached(ticker: str, max_articles: int) -> NewsResult:
             if isinstance(a, dict) and a.get("title")
         ]
     except Exception as exc:  # noqa: BLE001 - news must never raise into a scan
-        print(f"  news fetch error for {ticker}: {exc}", file=sys.stderr)
+        print(
+            f"  news fetch error for {ticker}: {redact(str(exc), api_key)}",
+            file=sys.stderr,
+        )
         return NewsResult(ticker=ticker, ok=False)
 
     if not headlines:

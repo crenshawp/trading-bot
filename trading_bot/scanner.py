@@ -631,15 +631,21 @@ def check_earnings_risk(ticker):
 def check_news_risk(ticker):
     try:
         yesterday = (datetime.now() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        # Header auth, not an apiKey= query parameter — see news_client.redact:
+        # a requests exception renders the full URL, and the except below prints
+        # it to stderr, which leaked the live key into the deploy log.
         url = (
             f"https://newsapi.org/v2/everything"
             f"?q={ticker} stock"
             f"&from={yesterday}"
             f"&sortBy=publishedAt"
             f"&language=en"
-            f"&apiKey={NEWSAPI_KEY}"
         )
-        response = requests.get(url, timeout=_HTTP_TIMEOUT_SECONDS)
+        response = requests.get(
+            url,
+            timeout=_HTTP_TIMEOUT_SECONDS,
+            headers={"X-Api-Key": NEWSAPI_KEY},
+        )
         articles = response.json().get("articles", [])
         if not articles:
             return "UNKNOWN"
@@ -669,7 +675,11 @@ def check_news_risk(ticker):
         # NewsAPI request/parse failure (bad key, rate limit, network).
         # "UNKNOWN" is returned either way, but a silently-failing NewsAPI
         # key would otherwise never surface. Log it.
-        print(f"  news risk check error for {ticker}: {e}", file=sys.stderr)
+        print(
+            f"  news risk check error for {ticker}: "
+            f"{news_client.redact(str(e), NEWSAPI_KEY)}",
+            file=sys.stderr,
+        )
         return "UNKNOWN"
 
 
