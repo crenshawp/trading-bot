@@ -1461,3 +1461,63 @@ def test_scan_persists_real_risk_and_counts_open_book_end_to_end(
     assert row["risk_recommended_size"] is not None       # sized off the real ATR
     assert row["risk_pct"] is not None
     assert row["risk_total_pct"] == pytest.approx(2.0 + row["risk_pct"])
+
+
+# ---------------------------------------------------------------------------
+# add_crypto_indicators — Recent_High / Recent_Low must exclude the tested bar
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_ohlcv(rows: int = 400) -> pd.DataFrame:
+    """A deterministic random walk with realistic High >= Close >= Low."""
+    import numpy as np
+
+    rng = np.random.default_rng(7)
+    close = 100 * np.exp(np.cumsum(rng.normal(0, 0.01, rows)))
+    return pd.DataFrame(
+        {
+            "Open": close,
+            "High": close * (1 + abs(rng.normal(0, 0.004, rows))),
+            "Low": close * (1 - abs(rng.normal(0, 0.004, rows))),
+            "Close": close,
+            "Volume": rng.integers(1000, 50000, rows).astype(float),
+        }
+    )
+
+
+def test_recent_high_excludes_the_bar_being_tested() -> None:
+    """`price > recent_high` must be satisfiable.
+
+    Regression: Recent_High was an UNSHIFTED rolling(20).max() over High, so
+    the window contained the tested bar's own High. Since Close <= High <=
+    max(window), `price > recent_high` was unsatisfiable and the Momentum
+    Breakout signal could never fire — on any data, ever. The stock path
+    already shifts (High_20), so the two paths now agree.
+    """
+    out = scanner.add_crypto_indicators(_synthetic_ohlcv())
+
+    breakouts = int((out["Close"] > out["Recent_High"]).sum())
+    assert breakouts > 0, "Momentum Breakout is unreachable — Recent_High is unshifted"
+
+
+def test_recent_low_excludes_the_bar_being_tested() -> None:
+    """`price > recent_low` must be able to be FALSE.
+
+    Same root cause: an unshifted rolling(20).min() over Low satisfies
+    min(window) <= Low <= Close for every bar, so Oversold Reversal's
+    "price is off the recent low" filter was always true and enforced nothing.
+    """
+    out = scanner.add_crypto_indicators(_synthetic_ohlcv())
+
+    above = int((out["Close"] > out["Recent_Low"]).sum())
+    assert above < len(out), "the off-the-low filter is a no-op — Recent_Low is unshifted"
+
+
+def test_recent_high_matches_the_prior_twenty_bars() -> None:
+    """Recent_High is exactly max(High) over the 20 bars BEFORE each bar."""
+    raw = _synthetic_ohlcv(120)
+    out = scanner.add_crypto_indicators(raw.copy())
+
+    probe = out.index[50]
+    expected = raw["High"].loc[probe - 20 : probe - 1].max()
+    assert out["Recent_High"].loc[probe] == pytest.approx(expected)
