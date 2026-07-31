@@ -5,6 +5,7 @@ on the OHLC decision logic and the same-candle ambiguity rule, both of
 which are exercised here.
 """
 
+import dataclasses
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -317,9 +318,20 @@ def test_post_fix_signal_resolves_on_its_own_real_window(
     assert signal is not None
     assert signal.hold_estimate_days == 2       # PERSISTED now (outer bound)
 
-    trade = db.get_trade_by_signal_id(sid)
-    assert trade is not None
-    opened = trade.opened_at
+    persisted_trade = db.get_trade_by_signal_id(sid)
+    assert persisted_trade is not None
+
+    # PIN the open to a fixed mid-week session instead of using the live
+    # wall-clock stamp log_signal wrote. The resolver's settlement guard
+    # (_covers_deadline) is trading-calendar aware: it walks back from the
+    # deadline for a closed session whose midnight-ET label is at/after
+    # opened_at. Seeded from the real clock, this test's window lands on a
+    # weekend on some weekdays (a Friday open gives a Sunday deadline, and the
+    # walk Sun->Sat->Fri finds no qualifying session), so the assertion below
+    # would pass or fail purely by what day the suite ran. Monday 10:00 ET
+    # keeps the whole window inside one trading week, every run.
+    opened = datetime(2026, 7, 13, 14, 0, tzinfo=UTC)   # Monday, 10:00 ET
+    trade = dataclasses.replace(persisted_trade, opened_at=opened)
     df = fake_candles(
         highs=[105, 104, 106], lows=[98, 99, 97], closes=[100, 101, 102],
         start=opened,
