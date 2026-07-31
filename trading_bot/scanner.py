@@ -461,12 +461,26 @@ def add_crypto_indicators(df):
 # DATA
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Daily history pulled per stock scan. "60d" yields ~42 trading rows, and
+# add_stock_indicators then drops ~21 warm-up rows (Slope_Accel alone needs 21),
+# leaving ~21 — fewer bars than EMA50's own period, and below the warm-up that
+# indicators.compute_context needs for adx (28 rows) and the vol-regime baseline
+# (34 rows). The result was that EMA50 was under-warmed on every live signal and
+# ind_adx / ind_vol_regime were NULL / 'unknown' on every stored trade. A year of
+# daily bars (~250 rows, ~229 after warm-up) clears every window with margin.
+# Crypto is unaffected: "60d" at 1h interval is ~1440 bars.
+STOCK_HISTORY_PERIOD = "1y"
+
+
 def get_stock_data(ticker):
     # Validate BEFORE touching .columns — the previous order dereferenced
     # df.columns first, so the None/shape guard below it could never actually
     # protect anything (a None return would have raised AttributeError first).
     df = yf.download(
-        to_yfinance_symbol(ticker), period="60d", interval="1d", progress=False,
+        to_yfinance_symbol(ticker),
+        period=STOCK_HISTORY_PERIOD,
+        interval="1d",
+        progress=False,
     )
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return None
