@@ -451,8 +451,15 @@ def add_crypto_indicators(df):
     df["ROC_Accel"]   = calculate_roc_acceleration(df["Close"])
     df["Vol_MA20"]    = df["Volume"].rolling(20).mean()
     df["BB_upper"], df["BB_mid"], df["BB_lower"] = calculate_bbands(df["Close"])
-    df["Recent_High"] = df["High"].rolling(20).max()
-    df["Recent_Low"]  = df["Low"].rolling(20).min()
+    # .shift(1) so these describe the PRIOR 20 bars, matching High_20 in the
+    # stock path. Unshifted, the window includes the bar being tested, which
+    # made both comparisons in detect_crypto_signals degenerate:
+    #   Close <= High <= rolling(20).max()  ->  "price > recent_high" was
+    #     unsatisfiable, so Momentum Breakout could never fire at all;
+    #   rolling(20).min() <= Low <= Close   ->  "price > recent_low" was
+    #     always true, so Oversold Reversal's off-the-low filter did nothing.
+    df["Recent_High"] = df["High"].rolling(20).max().shift(1)
+    df["Recent_Low"]  = df["Low"].rolling(20).min().shift(1)
     df.dropna(inplace=True)
     return df
 
