@@ -1442,7 +1442,25 @@ def _run_allocation_execution_cycle() -> None:
     """Hourly: build the live plan and execute it. Mirrors cmd_allocate_execute's
     --confirm path in __main__.py, minus the CLI printing. execute_plan already
     checks risk_of_ruin.is_entry_authorized() internally — do not duplicate that
-    check here."""
+    check here.
+
+    Runs ONLY while the equity market is open. `schedule.every(1).hours` fires
+    around the clock — nights, weekends, holidays — and this cycle is the one
+    scheduled job that SUBMITS OPENING ORDERS, so it needs the same trading-day
+    guard `scan_stocks` already applies. Two things go wrong without it:
+
+    1. Orders are submitted outside RTH. `execute_plan` checks the Phase 15
+       entry authorization and nothing else — no submission path anywhere
+       consults market hours.
+    2. Worse, `live_candidates(mark_considered=True)` CONSUMES every actionable
+       signal the moment it is pulled (the locked Phase 17 "considered exactly
+       once" design). An off-hours pass therefore burns signals that the next
+       in-hours pass would have acted on — which is why this guard has to come
+       before that call, not after the plan is built.
+    """
+    if not is_market_open():
+        return
+
     try:
         from trading_bot import allocation, candidate_source, plan_execution
         from trading_bot.broker import AlpacaBroker, AlpacaOptionsClient
