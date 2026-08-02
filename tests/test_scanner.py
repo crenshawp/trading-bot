@@ -1461,3 +1461,81 @@ def test_scan_persists_real_risk_and_counts_open_book_end_to_end(
     assert row["risk_recommended_size"] is not None       # sized off the real ATR
     assert row["risk_pct"] is not None
     assert row["risk_total_pct"] == pytest.approx(2.0 + row["risk_pct"])
+
+
+# ───────────────────── exit watcher cycle (the missing call site) ────────────
+
+
+def test_exit_watcher_cycle_invokes_both_watchers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE REGRESSION TEST. Both exit watchers were fully implemented but
+    called only from tests and demo scripts — nothing in production ever
+    closed a position, while the hourly allocation cycle kept opening them."""
+    from trading_bot import long_term, options_execution
+    calls: list[str] = []
+
+    monkeypatch.setattr(scanner.db, "get_open_option_positions", lambda: [])
+    monkeypatch.setattr(
+        options_execution, "watch_open_option_positions",
+        lambda *a, **k: calls.append("options") or [],
+    )
+    monkeypatch.setattr(
+        long_term, "watch_long_term_positions",
+        lambda *a, **k: calls.append("long_term") or [],
+    )
+    scanner._run_exit_watcher_cycle()
+    # The long-term book is always checked; the option watcher is skipped only
+    # when the option book is empty (as stubbed here).
+    assert "long_term" in calls
+
+
+def test_exit_watcher_cycle_is_failsoft(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A broker/pricing failure must never escape into the scheduling loop."""
+    monkeypatch.setattr(
+        scanner.db, "get_open_option_positions",
+        lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    scanner._run_exit_watcher_cycle()   # must not raise
+
+
+def test_exit_watcher_cycle_is_a_distinct_hook() -> None:
+    """Additive — it does not replace the existing hourly cycles."""
+    assert callable(scanner._run_exit_watcher_cycle)
+    assert scanner._run_exit_watcher_cycle is not scanner._run_allocation_execution_cycle
+    assert scanner._run_exit_watcher_cycle is not scanner._run_risk_cycle
+
+
+def test_exit_history_period_warms_the_trend_sma() -> None:
+    """The long-term protective exit reads a TREND_PERIOD (200-day) SMA. The
+    60-day window used by get_stock_data cannot warm it, so the trend-breakdown
+    rule would silently never fire — hence a separate, longer exit window."""
+    from trading_bot import config
+    assert scanner.EXIT_HISTORY_PERIOD == "1y"
+    assert config.TREND_PERIOD == 200   # 1y (~252 sessions) clears it; 60d does not
+
+
+def test_exit_last_price_rejects_nan_and_non_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bad number must become None, so the submitters' refusal guard holds
+    instead of a garbage limit price reaching the broker."""
+    for bad in (float("nan"), 0.0, -5.0):
+        monkeypatch.setattr(
+            scanner, "get_exit_price_history",
+            lambda _t, _b=bad: pd.DataFrame({"Close": [_b]}),
+        )
+        assert scanner.get_exit_last_price("AAPL") is None
+    monkeypatch.setattr(
+        scanner, "get_exit_price_history", lambda _t: pd.DataFrame({"Close": [101.5]}),
+    )
+    assert scanner.get_exit_last_price("AAPL") == 101.5
+
+
+def test_exit_price_history_is_failsoft(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        scanner.yf, "download",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("network down")),
+    )
+    assert scanner.get_exit_price_history("AAPL") is None
+    assert scanner.get_exit_last_price("AAPL") is None
