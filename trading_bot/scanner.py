@@ -558,7 +558,10 @@ def send_morning_report():
             )
         print("  Morning report sent")
     except Exception as e:
-        print(f"  Morning report error: {e}")
+        # redact: the webhook URL carries its own secret token in the PATH, and
+        # a requests exception renders the full URL. Same class as the
+        # NEWSAPI_KEY leak news_client.redact() was written for.
+        print(f"  Morning report error: {news_client.redact(str(e), DISCORD_WEBHOOK_URL)}")
 
     # Send to Pushover — split into chunks since limit is 1024 chars.
     try:
@@ -1089,7 +1092,11 @@ def _send_prediction_notification(pred: object) -> bool:
         )
         discord_ok = _warn_if_bad_status(resp, "prediction Discord")
     except Exception as exc:
-        print(f"  prediction Discord error: {exc}", file=sys.stderr)
+        print(
+            f"  prediction Discord error: "
+            f"{news_client.redact(str(exc), DISCORD_WEBHOOK_URL)}",
+            file=sys.stderr,
+        )
     pushover_ok = False
     try:
         resp = requests.post("https://api.pushover.net/1/messages.json", data={
@@ -1156,7 +1163,11 @@ def _send_resolution_notification(
         )
         _warn_if_bad_status(resp, "resolution Discord")
     except Exception as exc:
-        print(f"  resolution Discord error: {exc}", file=sys.stderr)
+        print(
+            f"  resolution Discord error: "
+            f"{news_client.redact(str(exc), DISCORD_WEBHOOK_URL)}",
+            file=sys.stderr,
+        )
     try:
         resp = requests.post("https://api.pushover.net/1/messages.json", data={
             "token": PUSHOVER_APP_TOKEN,
@@ -2038,7 +2049,10 @@ def send_notification(
         _warn_if_bad_status(resp, "Discord")
         print("  Discord notification sent")
     except Exception as e:
-        print(f"  Discord error: {e}", file=sys.stderr)
+        print(
+            f"  Discord error: {news_client.redact(str(e), DISCORD_WEBHOOK_URL)}",
+            file=sys.stderr,
+        )
 
     try:
         resp = requests.post("https://api.pushover.net/1/messages.json", data={
