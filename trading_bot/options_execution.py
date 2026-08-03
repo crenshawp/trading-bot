@@ -284,7 +284,7 @@ def submit_execution_order(
         time_in_force=time_in_force,
     )
     # Phase 15: feed the consecutive broker-error detector (resets on success).
-    risk_of_ruin.record_broker_result(order.ok)
+    risk_of_ruin.record_broker_result(order.ok, order.status)
     return order
 
 
@@ -386,7 +386,7 @@ def execute_decision(
         deadline=deadline,
         time_in_force=time_in_force,
     )
-    risk_of_ruin.record_broker_result(order.ok)
+    risk_of_ruin.record_broker_result(order.ok, order.status)
     materialized = order_lifecycle.materialize_submitted_order_fill(
         order,
         observed_at=opened_at,

@@ -477,7 +477,11 @@ def test_watcher_accepted_unfilled_stays_open_and_restart_does_not_resubmit(
 ) -> None:
     position_id = _open_position("AAPL260116C00150000", "AAPL")
     results: list[bool] = []
-    monkeypatch.setattr(oe.risk_of_ruin, "record_broker_result", results.append)
+    monkeypatch.setattr(
+        oe.risk_of_ruin,
+        "record_broker_result",
+        lambda ok, status=None: results.append(ok),
+    )
 
     first = oe.watch_open_option_positions(
         FakeBroker(auto_fill=False),
