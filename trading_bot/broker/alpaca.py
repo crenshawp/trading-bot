@@ -43,6 +43,7 @@ from trading_bot.broker.base import (
     STATUS_REJECTED,
     STATUS_UNKNOWN,
     TIF_DAY,
+    TIF_GTC,
     VALID_ORDER_TYPES,
     VALID_SIDES,
     VALID_TIF,
@@ -110,6 +111,35 @@ def round_limit_price(price: float) -> float:
     the $0.01 tick, crypto pairs).
     """
     return round(price, 2)
+
+
+def resolve_time_in_force(symbol: str, time_in_force: str) -> str:
+    """Pick a time-in-force Alpaca will accept for ``symbol``.
+
+    Alpaca's crypto venue trades continuously and has no session to expire an
+    order at, so it does not accept ``day`` on a crypto pair — only ``gtc`` and
+    ``ioc``. Every caller in this codebase submits with the ``TIF_DAY`` default
+    (``long_term.open_long_term_position``, ``order_lifecycle``'s exit and
+    generic-emergency-close primitives), which means a crypto order is rejected
+    by the venue before it can do anything: no long-term crypto entry, no
+    protective exit, and — most seriously — ``emergency_shutdown`` cannot
+    flatten a crypto position.
+
+    Mapping ``day`` → ``gtc`` (rather than ``ioc``) preserves the existing
+    semantics: this bot submits resting LIMIT orders and tracks their fills
+    through ``order_lifecycle``, so an order that stays working is the
+    behaviour every call site already assumes. ``ioc`` would silently convert
+    each one into fill-now-or-cancel.
+
+    An explicit ``gtc`` is left alone, and non-crypto symbols pass through
+    untouched, so equities and OCC option symbols keep ``day``. Applied at the
+    same single submission boundary as :func:`to_alpaca_symbol` and
+    :func:`round_limit_price`, so every path is covered at once.
+    """
+    if time_in_force != TIF_DAY or _CRYPTO_TICKER_RE.match(symbol) is None:
+        return time_in_force
+    return TIF_GTC
+
 
 # Alpaca order lifecycle states → the neutral status set. Anything unmapped
 # becomes STATUS_UNKNOWN (a new Alpaca state we have not classified), never an
@@ -539,6 +569,10 @@ class AlpacaBroker(Broker):
         # intent log, validation echo, and wire body all carry the same value.
         if limit_price is not None:
             limit_price = round_limit_price(limit_price)
+        # Alpaca's crypto venue rejects `day`; resolve before the intent log so
+        # that log, the validation echo, and the wire body agree — same reason
+        # the limit price is normalized above.
+        time_in_force = resolve_time_in_force(symbol, time_in_force)
         # Log intent BEFORE anything is sent, so there is always a record of
         # what was attempted even if the send fails.
         print(
