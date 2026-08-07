@@ -826,3 +826,49 @@ def test_emergency_close_still_works_with_a_known_price(tmp_db: Path) -> None:
         now=datetime(2026, 1, 5, tzinfo=UTC), reason="emergency_shutdown",
     )
     assert order is not None and order.ok
+
+
+# ---------------------------------------------------------------------------
+# The long-horizon fetch window must actually yield TREND_PERIOD trading bars
+# ---------------------------------------------------------------------------
+
+
+def test_calendar_days_for_bars_covers_the_trend_period() -> None:
+    """yfinance `period` is CALENDAR days but TREND_PERIOD is a BAR count.
+
+    The old window (TREND_PERIOD + 60 = 260 calendar days) spans only ~187
+    weekdays — fewer after holidays — so sma(close, 200) was NaN on the last
+    bar for every stock, permanently disabling both the long-term entry
+    confirmation and the trend-breakdown exit.
+    """
+    import pandas as pd
+
+    from trading_bot import config
+    from trading_bot.indicators import sma
+    from trading_bot.long_term import _calendar_days_for_bars
+
+    days = _calendar_days_for_bars(config.TREND_PERIOD)
+    end = pd.Timestamp("2026-08-04")
+    weekdays = pd.bdate_range(end - pd.Timedelta(days=days), end)
+
+    # Leave room for ~10 market holidays a year on top of the bar requirement.
+    assert len(weekdays) >= config.TREND_PERIOD + 10
+
+    series = pd.Series(range(len(weekdays)), index=weekdays, dtype=float)
+    assert not pd.isna(sma(series, config.TREND_PERIOD).iloc[-1])
+
+
+def test_old_window_would_not_have_covered_the_trend_period() -> None:
+    """Regression guard: pins the exact arithmetic that was wrong before."""
+    import pandas as pd
+
+    from trading_bot import config
+    from trading_bot.indicators import sma
+
+    end = pd.Timestamp("2026-08-04")
+    old_days = config.TREND_PERIOD + 60
+    weekdays = pd.bdate_range(end - pd.Timedelta(days=old_days), end)
+
+    assert len(weekdays) < config.TREND_PERIOD
+    series = pd.Series(range(len(weekdays)), index=weekdays, dtype=float)
+    assert pd.isna(sma(series, config.TREND_PERIOD).iloc[-1])
