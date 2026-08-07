@@ -502,6 +502,55 @@ def get_crypto_data(ticker):
     return df
 
 
+# ── exit-decision pricing ────────────────────────────────────────────────────
+# Deliberately separate from get_stock_data/get_crypto_data: those fetch 60
+# days, which CANNOT warm the TREND_PERIOD (200-day) SMA that the long-term
+# protective exit reads — the trend-breakdown rule would silently never fire.
+# Daily bars are used for the crypto book too so TREND_PERIOD means the same
+# number of DAYS on both books.
+EXIT_HISTORY_PERIOD = "1y"
+
+
+def get_exit_price_history(ticker):
+    """Daily candles for an exit decision, or None. FAIL-SOFT: never raises —
+    a pricing outage must not stop the watcher from checking other positions."""
+    try:
+        df = yf.download(
+            to_yfinance_symbol(ticker), period=EXIT_HISTORY_PERIOD,
+            interval="1d", progress=False,
+        )
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+        df.dropna(inplace=True)
+        return None if df.empty else df
+    except Exception as exc:
+        print(f"  exit watcher: price history failed for {ticker}: {exc}",
+              file=sys.stderr)
+        return None
+
+
+def get_exit_last_price(ticker):
+    """Latest close as a float for an exit decision, or None. FAIL-SOFT.
+
+    Returns None rather than a non-positive or NaN price: the exit submitters
+    refuse an unknown price outright rather than inventing one, and a bad
+    number here would defeat that guard."""
+    df = get_exit_price_history(ticker)
+    if df is None or df.empty:
+        return None
+    try:
+        value = float(df["Close"].iloc[-1])
+    except Exception as exc:
+        print(f"  exit watcher: last price unreadable for {ticker}: {exc}",
+              file=sys.stderr)
+        return None
+    if pd.isna(value) or value <= 0:
+        return None
+    return value
+
+
 def get_yahoo_news(ticker, max_articles=5):
     """Pull recent news headlines from Yahoo Finance for a ticker"""
     try:
@@ -1444,12 +1493,20 @@ def _run_risk_cycle() -> None:
 
         reason = risk_of_ruin.check_catastrophic()
         if reason is not None:
-            risk_of_ruin.emergency_shutdown(broker, trigger=reason)
+            option_fetch, lt_fetch = _emergency_price_fetchers()
+            risk_of_ruin.emergency_shutdown(
+                broker, trigger=reason,
+                option_price_fetch=option_fetch,
+                long_term_price_fetch=lt_fetch,
+            )
         elif risk_of_ruin.get_state() == risk_of_ruin.STATE_HOLDING:
             # A prior shutdown pass left closes pending (market closed) — the
             # bot stays alive and retries automatically until confirmed.
+            option_fetch, lt_fetch = _emergency_price_fetchers()
             risk_of_ruin.emergency_shutdown(
                 broker, trigger="retrying pending emergency closes",
+                option_price_fetch=option_fetch,
+                long_term_price_fetch=lt_fetch,
             )
     except Exception as exc:
         import sys
@@ -1502,6 +1559,110 @@ def _run_allocation_execution_cycle() -> None:
             )
     except Exception as exc:
         print(f"  allocation execution cycle error: {exc}", file=sys.stderr)
+
+
+def _build_option_price_fetch(option_book):
+    """A ``symbol -> mid`` fetcher for the open option book.
+
+    ``watch_open_option_positions`` is handed only the OCC symbol, but a chain
+    is fetched per UNDERLYING — so the mapping is taken from the open book and
+    each underlying's chain is fetched at most once per cycle. Returns None for
+    an unknown/unquoted contract, which the exit submitter treats as "price
+    unavailable" and refuses, rather than closing at the entry premium."""
+    from trading_bot.broker import AlpacaOptionsClient
+
+    underlying_by_symbol = {pos.symbol: pos.underlying for pos in option_book}
+    client = AlpacaOptionsClient()
+    chains: dict[str, dict[str, float]] = {}
+
+    def fetch(symbol):
+        underlying = underlying_by_symbol.get(symbol)
+        if underlying is None:
+            return None
+        if underlying not in chains:
+            quotes: dict[str, float] = {}
+            try:
+                chain = client.get_option_chain(underlying)
+                if chain.ok:
+                    for contract in chain.contracts:
+                        if contract.mid is not None and contract.mid > 0:
+                            quotes[contract.symbol] = float(contract.mid)
+                else:
+                    print(
+                        f"  exit watcher: option chain unavailable for "
+                        f"{underlying} ({chain.reason})", file=sys.stderr,
+                    )
+            except Exception as exc:
+                print(
+                    f"  exit watcher: option chain error for {underlying}: "
+                    f"{exc}", file=sys.stderr,
+                )
+            chains[underlying] = quotes
+        return chains[underlying].get(symbol)
+
+    return fetch
+
+
+def _emergency_price_fetchers():
+    """``(option_price_fetch, long_term_price_fetch)`` for a Tier-2 shutdown.
+
+    Every production call site previously omitted both, so ``price`` was None
+    for every typed position and each close was priced at the ENTRY price —
+    unfillable for exactly the losing positions a shutdown exists to flatten.
+    FAIL-SOFT: if the open book can't be read the option fetcher degrades to
+    "unknown", which the exit submitter refuses loudly instead of guessing."""
+    try:
+        option_book = db.get_open_option_positions()
+    except Exception as exc:
+        print(f"  emergency pricing: option book unreadable ({exc})",
+              file=sys.stderr)
+        return (lambda _symbol: None), get_exit_last_price
+    return _build_option_price_fetch(option_book), get_exit_last_price
+
+
+def _run_exit_watcher_cycle() -> None:
+    """Hourly: evaluate TP / SL / hold-deadline / protective exits for every
+    OPEN position and auto-close the ones that triggered.
+
+    THE MISSING CALL SITE. Both watchers were fully implemented but invoked
+    only from tests and demo scripts, so nothing in production ever closed a
+    position — while the hourly allocation cycle kept opening them. Mirrors
+    _run_evaluator_cycle: swallow-all so a transient failure never kills the
+    scheduling loop, and each watcher is already fail-soft per position."""
+    try:
+        from trading_bot import long_term, options_execution
+        from trading_bot.broker import AlpacaBroker
+
+        broker = AlpacaBroker()
+        now = datetime.now(UTC)
+
+        option_book = db.get_open_option_positions()
+        option_actions = []
+        if option_book:
+            option_actions = options_execution.watch_open_option_positions(
+                broker,
+                underlying_price_fetch=get_exit_last_price,
+                option_price_fetch=_build_option_price_fetch(option_book),
+                now=now,
+                positions=option_book,
+            )
+        lt_actions = long_term.watch_long_term_positions(
+            broker, price_fetch=get_exit_price_history, now=now,
+        )
+
+        actions = [*option_actions, *lt_actions]
+        closed = sum(1 for a in actions if a.action == "close")
+        errors = [a for a in actions if a.action == "error"]
+        if actions:
+            print(
+                f"[{datetime.now().strftime('%H:%M:%S')}] exit watchers: "
+                f"{len(actions)} open position(s), {closed} closed, "
+                f"{len(errors)} error(s)"
+            )
+        for action in errors:
+            print(f"  exit watcher error: {action.reason}", file=sys.stderr)
+    except Exception as exc:
+        print(f"  exit watcher cycle error: {exc}", file=sys.stderr)
 
 
 def _run_evaluator_cycle() -> None:
@@ -2366,6 +2527,13 @@ def main() -> None:
     # evaluation pass before any opening order can be submitted.
     schedule.every(1).hours.do(_never_raise(_run_allocation_execution_cycle))
 
+    # Exit watchers every hour: TP / SL / hold-deadline / protective exits for
+    # the open book. Registered AFTER the allocation cycle so a position opened
+    # this cycle is priced by the next one, and run at boot as well — an exit
+    # that came due while the process was down should not wait a full hour.
+    _never_raise(_run_exit_watcher_cycle)()
+    schedule.every(1).hours.do(_never_raise(_run_exit_watcher_cycle))
+
     # Phase 15.5: DAILY pairs + watchlist evaluation at 09:40 EST — after the
     # 09:36 VIX snapshot so all daily context is fresh, and independent of the
     # morning report (08:00) and daily-perf summary (00:30 UTC), which still fire
@@ -2411,7 +2579,12 @@ def main() -> None:
     def _catastrophic_handler(reason: str) -> None:
         from trading_bot.broker import AlpacaBroker
 
-        risk_of_ruin.emergency_shutdown(AlpacaBroker(), trigger=reason)
+        option_fetch, lt_fetch = _emergency_price_fetchers()
+        risk_of_ruin.emergency_shutdown(
+            AlpacaBroker(), trigger=reason,
+            option_price_fetch=option_fetch,
+            long_term_price_fetch=lt_fetch,
+        )
 
     while True:
         risk_of_ruin.run_guarded(_core_cycle, on_catastrophic=_catastrophic_handler)

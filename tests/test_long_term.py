@@ -795,3 +795,34 @@ def test_cli_longterm_positions_empty(
     from trading_bot import __main__ as m
     m.cmd_longterm_positions()
     assert "(none)" in capsys.readouterr().out
+
+
+# ───────── unknown exit price is refused, never priced at entry ──────────────
+
+
+def test_emergency_close_refuses_when_price_unknown(tmp_db: Path) -> None:
+    """The emergency/Tier-2 closer must NOT price a close at the entry price
+    when the current price is unavailable. Every production caller of
+    ``emergency_shutdown`` used to omit its price fetchers, so this was the
+    live path: a sell limit at entry cannot fill for a losing position — which
+    is exactly the position a shutdown exists to flatten."""
+    _seed_position("AAPL", 100.0)
+    (pos,) = db.get_open_long_term_positions()
+    with pytest.raises(ValueError, match="no current price is available"):
+        long_term.close_long_term_position(
+            FakeBroker(auto_fill=True), pos, exit_price=None,
+            now=datetime(2026, 1, 5, tzinfo=UTC), reason="emergency_shutdown",
+        )
+    # Still open, nothing submitted — the caller retries next pass.
+    assert len(db.get_open_long_term_positions()) == 1
+
+
+def test_emergency_close_still_works_with_a_known_price(tmp_db: Path) -> None:
+    """Positive control — a known price still closes the position."""
+    _seed_position("AAPL", 100.0)
+    (pos,) = db.get_open_long_term_positions()
+    order = long_term.close_long_term_position(
+        FakeBroker(auto_fill=True), pos, exit_price=70.0,
+        now=datetime(2026, 1, 5, tzinfo=UTC), reason="emergency_shutdown",
+    )
+    assert order is not None and order.ok
