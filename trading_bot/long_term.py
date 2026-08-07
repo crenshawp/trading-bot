@@ -419,7 +419,7 @@ def submit_long_term_entry(
         order_type=ORDER_TYPE_LIMIT,
         time_in_force=TIF_DAY,
     )
-    risk_of_ruin.record_broker_result(order.ok)   # Phase 15 detector
+    risk_of_ruin.record_broker_result(order.ok, order.status)   # Phase 15 detector
     materialized = order_lifecycle.materialize_submitted_order_fill(
         order,
         observed_at=now,
