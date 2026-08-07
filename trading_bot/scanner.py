@@ -648,16 +648,15 @@ def send_morning_report():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def is_market_open():
+    # Sessions come from outcomes._is_stock_session, which DERIVES the NYSE
+    # holiday calendar per year (observed-day rules, Good Friday via Easter,
+    # Juneteenth from 2022, the one-off closure table). This used to be a
+    # hardcoded list of ten 2026 dates: from 2027-01-01 every market holiday
+    # would silently have been treated as a normal trading day, forever, with
+    # no warning — scanning stale prior-session bars and firing signals dated
+    # to a non-session, which the hourly execution cycle would then act on.
     now = datetime.now(ZoneInfo("America/New_York"))
-    if now.weekday() >= 5:
-        return False
-    holidays = [
-        "2026-01-01", "2026-01-19", "2026-02-16",
-        "2026-04-03", "2026-05-25", "2026-06-19",
-        "2026-07-03", "2026-09-07", "2026-11-26",
-        "2026-12-25",
-    ]
-    if now.strftime("%Y-%m-%d") in holidays:
+    if not outcomes.is_stock_session(now.date()):
         return False
     market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
     market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
@@ -681,6 +680,15 @@ def check_earnings_risk(ticker):
             return "UNKNOWN"
         earnings_date = pd.Timestamp(calendar["Earnings Date"][0]).tz_localize(None)
         days_away     = (earnings_date - pd.Timestamp(datetime.now())).days
+        # A PAST earnings date is not upcoming risk. yfinance's calendar keeps
+        # carrying the just-reported date until the next estimate publishes, so
+        # without the lower bound "days_away <= 7" matched every negative value
+        # and returned HIGH for weeks — and detect_stock_signals answers a HIGH
+        # by emitting only a warning and discarding every real signal for that
+        # ticker. earnings.is_in_blackout already guards this (today <=
+        # earnings_day); this legacy path never did.
+        if days_away < 0:
+            return "LOW"
         if days_away <= 7:
             return f"HIGH — Earnings in {days_away} days"
         elif days_away <= 14:

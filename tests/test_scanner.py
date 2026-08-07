@@ -1659,3 +1659,107 @@ def test_exit_price_history_is_failsoft(monkeypatch: pytest.MonkeyPatch) -> None
     )
     assert scanner.get_exit_price_history("AAPL") is None
     assert scanner.get_exit_last_price("AAPL") is None
+
+
+# ---------------------------------------------------------------------------
+# Session calendar + earnings-risk window
+# ---------------------------------------------------------------------------
+
+
+class _FakeCalendarTicker:
+    """Minimal yf.Ticker stand-in exposing only .calendar."""
+
+    def __init__(self, earnings_date: pd.Timestamp) -> None:
+        self.calendar = {"Earnings Date": [earnings_date]}
+
+
+def test_past_earnings_date_is_not_flagged_high(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A date that has already passed is not upcoming risk.
+
+    yfinance keeps carrying the just-reported date until the next estimate
+    publishes. Without a lower bound, `days_away <= 7` matched every negative
+    value, so a ticker returned HIGH for weeks after reporting.
+    """
+    reported_37_days_ago = pd.Timestamp(datetime.now()) - pd.Timedelta(days=37)
+    monkeypatch.setattr(
+        scanner.yf, "Ticker", lambda _s: _FakeCalendarTicker(reported_37_days_ago)
+    )
+
+    assert scanner.check_earnings_risk("META") == "LOW"
+
+
+def test_upcoming_earnings_still_flagged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Positive control: the guard must not disarm the real blackout."""
+    in_two_days = pd.Timestamp(datetime.now()) + pd.Timedelta(days=2, hours=1)
+    monkeypatch.setattr(
+        scanner.yf, "Ticker", lambda _s: _FakeCalendarTicker(in_two_days)
+    )
+    assert "HIGH" in scanner.check_earnings_risk("META")
+
+    in_ten_days = pd.Timestamp(datetime.now()) + pd.Timedelta(days=10, hours=1)
+    monkeypatch.setattr(
+        scanner.yf, "Ticker", lambda _s: _FakeCalendarTicker(in_ten_days)
+    )
+    assert "MEDIUM" in scanner.check_earnings_risk("META")
+
+
+def test_a_high_earnings_flag_discards_every_real_signal() -> None:
+    """Why the bug mattered: HIGH makes detect_stock_signals return only a warning.
+
+    Pins the blast radius of a false HIGH — the ticker goes completely dark.
+    """
+    import inspect
+
+    src = inspect.getsource(scanner.detect_stock_signals)
+    assert 'if "HIGH" in earnings_risk:' in src
+    assert "return signals" in src
+
+
+def test_market_holidays_are_derived_not_hardcoded_to_one_year() -> None:
+    """Sessions come from the derived NYSE calendar, so they don't expire.
+
+    The list used to be ten literal 2026 dates: from 2027-01-01 every holiday
+    would have been treated as a normal trading day, forever, with no warning.
+    """
+    from datetime import date
+
+    from trading_bot import outcomes
+
+    # 2027 holidays, none of which appeared in the old hardcoded list.
+    assert not outcomes.is_stock_session(date(2027, 1, 1))    # New Year's Day (Fri)
+    assert not outcomes.is_stock_session(date(2027, 3, 26))   # Good Friday
+    assert not outcomes.is_stock_session(date(2027, 7, 5))    # July 4 observed (Mon)
+    assert not outcomes.is_stock_session(date(2027, 11, 25))  # Thanksgiving
+    assert not outcomes.is_stock_session(date(2027, 12, 24))  # Christmas observed (Fri)
+
+    # And an ordinary 2027 weekday is still a session.
+    assert outcomes.is_stock_session(date(2027, 3, 25))
+
+
+def test_is_market_open_respects_a_derived_holiday(monkeypatch: pytest.MonkeyPatch) -> None:
+    """is_market_open must consult the calendar, not just the clock."""
+    from zoneinfo import ZoneInfo
+
+    et = ZoneInfo("America/New_York")
+    # 2027-01-01 is a Friday inside regular trading hours — weekday and clock
+    # both say "open"; only the holiday calendar says otherwise.
+    holiday_midday = datetime(2027, 1, 1, 12, 0, tzinfo=et)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:  # type: ignore[override]
+            return holiday_midday
+
+    monkeypatch.setattr(scanner, "datetime", _FrozenDatetime)
+    assert scanner.is_market_open() is False
+
+    # A normal Friday at the same hour is open.
+    ordinary_midday = datetime(2027, 3, 25, 12, 0, tzinfo=et)
+
+    class _FrozenOrdinary(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:  # type: ignore[override]
+            return ordinary_midday
+
+    monkeypatch.setattr(scanner, "datetime", _FrozenOrdinary)
+    assert scanner.is_market_open() is True

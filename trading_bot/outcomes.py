@@ -191,12 +191,21 @@ def _stock_market_holidays(year: int) -> frozenset[date]:
     return frozenset(holidays)
 
 
-def _is_stock_session(day: date) -> bool:
+def is_stock_session(day: date) -> bool:
+    """True when *day* is a regular full NYSE trading session.
+
+    Public because the live scanner's ``is_market_open`` needs the same
+    calendar; it used to carry its own hardcoded list of one year's holidays.
+    """
     return (
         day.weekday() < 5
         and day not in _stock_market_holidays(day.year)
         and day not in _EXTRAORDINARY_STOCK_CLOSURES
     )
+
+
+# Internal callers below predate the public name; keep one implementation.
+_is_stock_session = is_stock_session
 
 
 def _stock_session_close(day: date) -> datetime:
