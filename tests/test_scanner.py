@@ -19,7 +19,7 @@ import keyring
 import pandas as pd
 import pytest
 
-from trading_bot import db, scanner
+from trading_bot import db, news_client, scanner
 from trading_bot.models import Signal, Trade
 
 _SERVICE = "trading_bot"
@@ -1461,6 +1461,126 @@ def test_scan_persists_real_risk_and_counts_open_book_end_to_end(
     assert row["risk_recommended_size"] is not None       # sized off the real ATR
     assert row["risk_pct"] is not None
     assert row["risk_total_pct"] == pytest.approx(2.0 + row["risk_pct"])
+
+
+# ─────────────── Discord webhook must never reach a log line ────────────────
+
+_FAKE_WEBHOOK = "https://discord.com/api/webhooks/1234567890/SUPERSECRETTOKEN"
+
+
+def test_discord_send_failure_does_not_log_the_webhook(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The webhook URL IS the credential and its secret lives in the URL PATH,
+    which requests renders into connection-error messages. On Railway one DNS
+    blip would otherwise write the live webhook into the deploy log."""
+    monkeypatch.setattr(scanner, "DISCORD_WEBHOOK_URL", _FAKE_WEBHOOK)
+
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError(
+            f"HTTPSConnectionPool: Max retries exceeded with url: {_FAKE_WEBHOOK}"
+        )
+
+    monkeypatch.setattr(scanner.requests, "post", _boom)
+    monkeypatch.setattr(scanner, "DRY_RUN", False)
+    scanner.send_notification({
+        "ticker": "GOOGL", "asset_type": "stock", "trade_type": "SWING",
+        "direction": "CALL", "setup": "EMA21 Pullback", "price": 180.0,
+        "take_profit": 185.0, "stop_loss": 178.0, "confidence": "High",
+        "detail": "pullback to EMA21", "hold_days": "3-5 days",
+    })
+    # Scope to the Discord line: the stubbed requests.post also fails the
+    # unrelated fail-soft regime/VIX handlers, whose (synthetic) messages are
+    # not what this test is about.
+    err = capsys.readouterr().err
+    discord_lines = [ln for ln in err.splitlines() if "Discord error" in ln]
+    assert discord_lines, "expected the Discord failure to be logged"
+    assert not any("SUPERSECRETTOKEN" in ln for ln in discord_lines)
+    assert any(news_client._REDACTED in ln for ln in discord_lines)
+
+
+def test_redact_leaves_unrelated_text_intact() -> None:
+    """Positive control — redaction must not swallow the diagnostic itself."""
+    msg = f"Max retries exceeded with url: {_FAKE_WEBHOOK}"
+    out = news_client.redact(msg, _FAKE_WEBHOOK)
+    assert "Max retries exceeded" in out and "SUPERSECRETTOKEN" not in out
+
+
+# ---------------------------------------------------------------------------
+# get_stock_data must pull enough history to warm every indicator
+# ---------------------------------------------------------------------------
+
+
+def _trading_rows(period: str) -> int:
+    """Approximate trading rows yfinance returns for a daily `period`."""
+    calendar_days = {"60d": 60, "180d": 180, "1y": 365, "2y": 730}[period]
+    return int(calendar_days * 252 / 365)
+
+
+def _daily_ohlcv(rows: int) -> pd.DataFrame:
+    """A deterministic daily random walk with High >= Close >= Low."""
+    import numpy as np
+
+    rng = np.random.default_rng(11)
+    close = 100 * np.exp(np.cumsum(rng.normal(0, 0.012, rows)))
+    return pd.DataFrame(
+        {
+            "Open": close,
+            "High": close * 1.005,
+            "Low": close * 0.995,
+            "Close": close,
+            "Volume": rng.integers(100_000, 500_000, rows).astype(float),
+        }
+    )
+
+
+def test_stock_history_window_warms_every_stored_indicator() -> None:
+    """The live window must survive add_stock_indicators' warm-up dropna.
+
+    Regression: period="60d" gave ~42 rows, add_stock_indicators dropped ~21
+    warm-up rows, and compute_context then ran on ~21 — below adx's 28-row and
+    the vol-regime baseline's 34-row requirement. Every live stock signal wrote
+    ind_adx = NULL and ind_vol_regime = 'unknown', so Phase 9 could never bucket
+    either feature and allocation.indicator_agreement permanently lost one of
+    its three families. The existing indicator tests all pass long synthetic
+    frames, so none of them saw the real frame length.
+    """
+    from trading_bot import indicators
+
+    df = _daily_ohlcv(_trading_rows(scanner.STOCK_HISTORY_PERIOD))
+    warmed = scanner.add_stock_indicators(df.copy())
+    ctx = indicators.compute_context(warmed, at=-2)
+
+    assert ctx.adx is not None
+    assert ctx.vol_regime != "unknown"
+    assert ctx.realized_vol is not None
+    assert ctx.atr is not None
+    assert ctx.rsi is not None
+
+
+def test_old_sixty_day_window_could_not_warm_them() -> None:
+    """Pins the root cause, so a future shortening of the window is caught."""
+    from trading_bot import indicators
+
+    warmed = scanner.add_stock_indicators(_daily_ohlcv(_trading_rows("60d")))
+    ctx = indicators.compute_context(warmed, at=-2)
+
+    assert ctx.adx is None            # the bug this window change fixes
+    assert ctx.vol_regime == "unknown"
+
+
+def test_stock_history_window_exceeds_ema50_period() -> None:
+    """EMA50 was being computed from fewer bars than its own period.
+
+    It is read as the trend filter in detect_stock_signals, so an under-warmed
+    value is a live-signal correctness issue, not just a reporting one.
+    """
+    warmed = scanner.add_stock_indicators(
+        _daily_ohlcv(_trading_rows(scanner.STOCK_HISTORY_PERIOD))
+    )
+
+    assert len(warmed) > 50 * 2  # comfortably converged, not merely defined
+    assert not pd.isna(warmed["EMA50"].iloc[-2])
 
 
 # ───────────────────── exit watcher cycle (the missing call site) ────────────
