@@ -671,3 +671,40 @@ def test_watcher_refuses_legacy_row_but_continues_linked_positions(
     assert legacy is not None and legacy.outcome == "open"
     assert linked is not None and linked.outcome == "win"
     assert "lifecycle exit refused" in capsys.readouterr().err
+
+
+# ─────────────── unknown exit price is refused, never priced at entry ────────
+
+
+def test_watcher_refuses_close_when_option_price_unknown(tmp_db: Path) -> None:
+    """A triggered exit with no available option price must NOT be submitted at
+    the entry premium. A close priced at entry rests unfillable for exactly the
+    losing positions an exit exists to close, while the book records a close as
+    sent. The position stays open and the error is surfaced instead."""
+    _open_position("AAPL260116C00150000", "AAPL")
+    b = FakeBroker(auto_fill=True)
+    actions = oe.watch_open_option_positions(
+        b,
+        underlying_price_fetch=lambda _u: 111.0,   # take-profit HAS triggered
+        option_price_fetch=lambda _s: None,        # ...but the price is unknown
+        now=_OPENED,
+    )
+    assert len(actions) == 1
+    assert actions[0].action == "error"
+    assert "no current option price" in actions[0].reason
+    # Nothing was submitted and the position is still open for the next pass.
+    assert len(db.get_open_option_positions()) == 1
+    assert db.get_pending_exit_orders_for_position("option", 1) == []
+
+
+def test_watcher_still_closes_when_price_is_known(tmp_db: Path) -> None:
+    """Positive control for the guard above — a known price still closes."""
+    _open_position("AAPL260116C00150000", "AAPL")
+    actions = oe.watch_open_option_positions(
+        FakeBroker(auto_fill=True),
+        underlying_price_fetch=lambda _u: 111.0,
+        option_price_fetch=lambda _s: 8.0,
+        now=_OPENED,
+    )
+    assert actions[0].action == "close"
+    assert db.get_open_option_positions() == []

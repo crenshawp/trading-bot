@@ -523,7 +523,17 @@ def _submit_option_watcher_exit(
     if state.remaining_qty <= 0:
         return None, state
 
-    limit_price = exit_price if exit_price is not None else position.premium_entry
+    if exit_price is None:
+        # NEVER fall back to the entry premium. A close priced at entry is
+        # above the market for exactly the positions an exit exists to close
+        # (a stop-loss fires because the position is DOWN), so the order rests
+        # unfillable while the book records a close as submitted. Refusing is
+        # honest: the position stays visibly open and the next pass retries.
+        raise ValueError(
+            "lifecycle exit refused: no current option price is available "
+            "(refusing to price the close at the entry premium)"
+        )
+    limit_price = exit_price
     order = order_lifecycle.submit_position_exit(
         broker,
         position_kind="option",

@@ -631,7 +631,7 @@ def test_third_cycle_divergence_triggers_tier2_in_same_cycle(
     triggered: list[tuple[object, str]] = []
     monkeypatch.setattr(
         ror, "emergency_shutdown",
-        lambda b, *, trigger: triggered.append((b, trigger)),
+        lambda b, *, trigger, **_kw: triggered.append((b, trigger)),
     )
 
     scanner._run_risk_cycle()
