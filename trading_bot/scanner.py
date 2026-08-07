@@ -572,7 +572,10 @@ def send_morning_report():
             )
         print("  Morning report sent")
     except Exception as e:
-        print(f"  Morning report error: {e}")
+        # redact: the webhook URL carries its own secret token in the PATH, and
+        # a requests exception renders the full URL. Same class as the
+        # NEWSAPI_KEY leak news_client.redact() was written for.
+        print(f"  Morning report error: {news_client.redact(str(e), DISCORD_WEBHOOK_URL)}")
 
     # Send to Pushover — split into chunks since limit is 1024 chars.
     try:
@@ -1103,7 +1106,11 @@ def _send_prediction_notification(pred: object) -> bool:
         )
         discord_ok = _warn_if_bad_status(resp, "prediction Discord")
     except Exception as exc:
-        print(f"  prediction Discord error: {exc}", file=sys.stderr)
+        print(
+            f"  prediction Discord error: "
+            f"{news_client.redact(str(exc), DISCORD_WEBHOOK_URL)}",
+            file=sys.stderr,
+        )
     pushover_ok = False
     try:
         resp = requests.post("https://api.pushover.net/1/messages.json", data={
@@ -1170,7 +1177,11 @@ def _send_resolution_notification(
         )
         _warn_if_bad_status(resp, "resolution Discord")
     except Exception as exc:
-        print(f"  resolution Discord error: {exc}", file=sys.stderr)
+        print(
+            f"  resolution Discord error: "
+            f"{news_client.redact(str(exc), DISCORD_WEBHOOK_URL)}",
+            file=sys.stderr,
+        )
     try:
         resp = requests.post("https://api.pushover.net/1/messages.json", data={
             "token": PUSHOVER_APP_TOKEN,
@@ -1450,6 +1461,47 @@ def _run_risk_cycle() -> None:
             "NOT confirmed safe this cycle; investigate before assuming normal "
             "operation.",
         )
+
+
+def _run_allocation_execution_cycle() -> None:
+    """Hourly: build the live plan and execute it. Mirrors cmd_allocate_execute's
+    --confirm path in __main__.py, minus the CLI printing. execute_plan already
+    checks risk_of_ruin.is_entry_authorized() internally — do not duplicate that
+    check here."""
+    try:
+        from trading_bot import allocation, candidate_source, plan_execution
+        from trading_bot.broker import AlpacaBroker, AlpacaOptionsClient
+
+        broker_client = AlpacaBroker()
+        account = broker_client.get_account()
+        candidates = candidate_source.live_candidates(mark_considered=True)
+        result = allocation.build_plan(
+            candidates, account,
+            entry_authorized=risk_of_ruin.is_entry_authorized(),
+        )
+        if not result.ok:
+            print(f"  allocation execute: nothing to execute ({result.note})")
+            return
+
+        options_available = (account.options_trading_level or 0) > 0
+        run = plan_execution.execute_plan(
+            broker_client, result.plan,
+            option_chain_fetch=AlpacaOptionsClient().get_option_chain,
+            options_available=options_available,
+        )
+        if not run.ok:
+            print(f"  allocation execute: refused ({run.note})", file=sys.stderr)
+            return
+
+        submitted = sum(1 for e in run.executions if e.status == "submitted")
+        rejected = sum(1 for e in run.executions if e.status != "submitted")
+        if submitted or rejected:
+            print(
+                f"[{datetime.now().strftime('%H:%M:%S')}] allocation execute: "
+                f"{submitted} submitted, {rejected} rejected/skipped"
+            )
+    except Exception as exc:
+        print(f"  allocation execution cycle error: {exc}", file=sys.stderr)
 
 
 def _run_evaluator_cycle() -> None:
@@ -2011,7 +2063,10 @@ def send_notification(
         _warn_if_bad_status(resp, "Discord")
         print("  Discord notification sent")
     except Exception as e:
-        print(f"  Discord error: {e}", file=sys.stderr)
+        print(
+            f"  Discord error: {news_client.redact(str(e), DISCORD_WEBHOOK_URL)}",
+            file=sys.stderr,
+        )
 
     try:
         resp = requests.post("https://api.pushover.net/1/messages.json", data={
@@ -2304,6 +2359,12 @@ def main() -> None:
     # Tier-1 circuit breaker, catastrophic detectors, and holding-state retries.
     _never_raise(_run_risk_cycle)()
     schedule.every(1).hours.do(_never_raise(_run_risk_cycle))
+
+    # Autonomous plan execution every hour: build the live plan and submit it.
+    # Deliberately NOT run at boot — only on the hourly schedule, so the
+    # risk-of-ruin / reconciliation state above has had at least one real
+    # evaluation pass before any opening order can be submitted.
+    schedule.every(1).hours.do(_never_raise(_run_allocation_execution_cycle))
 
     # Phase 15.5: DAILY pairs + watchlist evaluation at 09:40 EST — after the
     # 09:36 VIX snapshot so all daily context is fresh, and independent of the

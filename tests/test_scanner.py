@@ -19,7 +19,7 @@ import keyring
 import pandas as pd
 import pytest
 
-from trading_bot import db, scanner
+from trading_bot import db, news_client, scanner
 from trading_bot.models import Signal, Trade
 
 _SERVICE = "trading_bot"
@@ -1461,6 +1461,49 @@ def test_scan_persists_real_risk_and_counts_open_book_end_to_end(
     assert row["risk_recommended_size"] is not None       # sized off the real ATR
     assert row["risk_pct"] is not None
     assert row["risk_total_pct"] == pytest.approx(2.0 + row["risk_pct"])
+
+
+# ─────────────── Discord webhook must never reach a log line ────────────────
+
+_FAKE_WEBHOOK = "https://discord.com/api/webhooks/1234567890/SUPERSECRETTOKEN"
+
+
+def test_discord_send_failure_does_not_log_the_webhook(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The webhook URL IS the credential and its secret lives in the URL PATH,
+    which requests renders into connection-error messages. On Railway one DNS
+    blip would otherwise write the live webhook into the deploy log."""
+    monkeypatch.setattr(scanner, "DISCORD_WEBHOOK_URL", _FAKE_WEBHOOK)
+
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError(
+            f"HTTPSConnectionPool: Max retries exceeded with url: {_FAKE_WEBHOOK}"
+        )
+
+    monkeypatch.setattr(scanner.requests, "post", _boom)
+    monkeypatch.setattr(scanner, "DRY_RUN", False)
+    scanner.send_notification({
+        "ticker": "GOOGL", "asset_type": "stock", "trade_type": "SWING",
+        "direction": "CALL", "setup": "EMA21 Pullback", "price": 180.0,
+        "take_profit": 185.0, "stop_loss": 178.0, "confidence": "High",
+        "detail": "pullback to EMA21", "hold_days": "3-5 days",
+    })
+    # Scope to the Discord line: the stubbed requests.post also fails the
+    # unrelated fail-soft regime/VIX handlers, whose (synthetic) messages are
+    # not what this test is about.
+    err = capsys.readouterr().err
+    discord_lines = [ln for ln in err.splitlines() if "Discord error" in ln]
+    assert discord_lines, "expected the Discord failure to be logged"
+    assert not any("SUPERSECRETTOKEN" in ln for ln in discord_lines)
+    assert any(news_client._REDACTED in ln for ln in discord_lines)
+
+
+def test_redact_leaves_unrelated_text_intact() -> None:
+    """Positive control — redaction must not swallow the diagnostic itself."""
+    msg = f"Max retries exceeded with url: {_FAKE_WEBHOOK}"
+    out = news_client.redact(msg, _FAKE_WEBHOOK)
+    assert "Max retries exceeded" in out and "SUPERSECRETTOKEN" not in out
 
 
 # ---------------------------------------------------------------------------
