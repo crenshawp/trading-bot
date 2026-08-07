@@ -508,7 +508,7 @@ def submit_prepared_order(
     order_role: str = "entry",
     closes_position_kind: str | None = None,
     closes_position_id: int | None = None,
-    broker_result_observer: Callable[[bool], object] | None = None,
+    broker_result_observer: Callable[[bool, str | None], object] | None = None,
 ) -> OrderResult:
     """Prepare, submit once with the same client ID, and bind a usable reply.
 
@@ -555,7 +555,7 @@ def submit_prepared_order(
         )
         if broker_result_observer is not None:
             try:
-                broker_result_observer(order.ok)
+                broker_result_observer(order.ok, order.status)
             except Exception as observer_exc:  # noqa: BLE001 - audit is fail-soft
                 print(
                     f"  order lifecycle: broker-result observer error "
@@ -574,7 +574,7 @@ def submit_prepared_order(
         )
     if broker_result_observer is not None:
         try:
-            broker_result_observer(order.ok)
+            broker_result_observer(order.ok, order.status)
         except Exception as observer_exc:  # noqa: BLE001 - audit is fail-soft
             print(
                 f"  order lifecycle: broker-result observer error ({observer_exc})",
@@ -878,7 +878,7 @@ def submit_position_exit(
     submitted_at: datetime,
     order_type: str = ORDER_TYPE_LIMIT,
     time_in_force: str = TIF_DAY,
-    broker_result_observer: Callable[[bool], object] | None = None,
+    broker_result_observer: Callable[[bool, str | None], object] | None = None,
 ) -> OrderResult:
     """Dormantly prepare and submit one restart-safe typed position exit.
 
@@ -947,7 +947,7 @@ def submit_generic_emergency_close(
     requested_limit_price: float | None,
     reason: str,
     submitted_at: datetime,
-    broker_result_observer: Callable[[bool], object] | None = None,
+    broker_result_observer: Callable[[bool, str | None], object] | None = None,
 ) -> OrderResult | None:
     """Submit one untyped emergency close through the durable outbox.
 

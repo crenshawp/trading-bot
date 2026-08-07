@@ -440,7 +440,7 @@ def submit_long_term_entry(
         order_type=ORDER_TYPE_LIMIT,
         time_in_force=TIF_DAY,
     )
-    risk_of_ruin.record_broker_result(order.ok)   # Phase 15 detector
+    risk_of_ruin.record_broker_result(order.ok, order.status)   # Phase 15 detector
     materialized = order_lifecycle.materialize_submitted_order_fill(
         order,
         observed_at=now,
@@ -574,7 +574,16 @@ def _submit_long_term_watcher_exit(
     if state.remaining_qty <= 0:
         return None, state
 
-    limit_price = exit_price if exit_price is not None else position.entry_price
+    if exit_price is None:
+        # NEVER fall back to the entry price — see the identical guard in
+        # options_execution._submit_option_watcher_exit. A close priced at
+        # entry cannot fill for a losing position, which is precisely the
+        # position a protective exit is closing.
+        raise ValueError(
+            "lifecycle exit refused: no current price is available "
+            "(refusing to price the close at the entry price)"
+        )
+    limit_price = exit_price
     order = order_lifecycle.submit_position_exit(
         broker,
         position_kind="long_term",

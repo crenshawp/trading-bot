@@ -284,7 +284,7 @@ def submit_execution_order(
         time_in_force=time_in_force,
     )
     # Phase 15: feed the consecutive broker-error detector (resets on success).
-    risk_of_ruin.record_broker_result(order.ok)
+    risk_of_ruin.record_broker_result(order.ok, order.status)
     return order
 
 
@@ -386,7 +386,7 @@ def execute_decision(
         deadline=deadline,
         time_in_force=time_in_force,
     )
-    risk_of_ruin.record_broker_result(order.ok)
+    risk_of_ruin.record_broker_result(order.ok, order.status)
     materialized = order_lifecycle.materialize_submitted_order_fill(
         order,
         observed_at=opened_at,
@@ -523,7 +523,17 @@ def _submit_option_watcher_exit(
     if state.remaining_qty <= 0:
         return None, state
 
-    limit_price = exit_price if exit_price is not None else position.premium_entry
+    if exit_price is None:
+        # NEVER fall back to the entry premium. A close priced at entry is
+        # above the market for exactly the positions an exit exists to close
+        # (a stop-loss fires because the position is DOWN), so the order rests
+        # unfillable while the book records a close as submitted. Refusing is
+        # honest: the position stays visibly open and the next pass retries.
+        raise ValueError(
+            "lifecycle exit refused: no current option price is available "
+            "(refusing to price the close at the entry premium)"
+        )
+    limit_price = exit_price
     order = order_lifecycle.submit_position_exit(
         broker,
         position_kind="option",
