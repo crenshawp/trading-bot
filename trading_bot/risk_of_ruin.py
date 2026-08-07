@@ -37,7 +37,7 @@ from datetime import UTC, datetime
 import requests
 
 from trading_bot import config, db, order_lifecycle, secrets, settings
-from trading_bot.broker.base import Broker
+from trading_bot.broker.base import STATUS_REJECTED, Broker
 from trading_bot.broker.reconcile import reconcile
 from trading_bot.models import (
     BrokerExecutionOutcome,
@@ -409,15 +409,38 @@ def _get_streak(key: str) -> int:
         return 0
 
 
-def record_broker_result(ok: bool) -> int:
+def record_broker_result(ok: bool, status: str | None = None) -> int:
     """Record one broker order outcome across the equity/options order paths.
 
-    A structured error/rejection increments the consecutive-error streak; a
-    success resets it. Returns the streak. FAIL-SOFT: a persistence error is
-    logged and the last-known streak returned — the counter must never take
-    down an order path.
+    A success resets the consecutive-error streak; an INFRASTRUCTURE failure
+    (transport error, 5xx, unavailable) increments it. Returns the streak.
+
+    A broker REJECTION (``status='rejected'`` — a 4xx: insufficient buying
+    power, market closed, invalid symbol, fractional short unsupported) leaves
+    the streak UNCHANGED. Such a rejection means the broker was reached and
+    answered; it is an ordinary, self-correcting business outcome, not evidence
+    that the order path is broken. Counting it toward
+    ``MAX_CONSECUTIVE_BROKER_ERRORS`` let three routine refusals in a row arm
+    the Tier-2 catastrophic shutdown and liquidate the book.
+
+    A rejection does NOT reset the streak either — it is neutral. Resetting
+    would let an alternating error/rejection sequence mask a genuinely broken
+    order path forever.
+
+    ``status`` is optional and defaults to counting the failure, so a caller
+    that cannot classify the outcome stays conservative.
+
+    FAIL-SOFT: a persistence error is logged and the last-known streak returned
+    — the counter must never take down an order path.
     """
     try:
+        if not ok and status == STATUS_REJECTED:
+            streak = _get_streak(_BROKER_ERROR_STREAK_KEY)
+            print(
+                f"  risk: broker rejection (streak unchanged at {streak})",
+                file=sys.stderr,
+            )
+            return streak
         streak = 0 if ok else _get_streak(_BROKER_ERROR_STREAK_KEY) + 1
         settings.set(_BROKER_ERROR_STREAK_KEY, str(streak))
         if not ok:

@@ -241,6 +241,23 @@ def to_allocation_candidate(candidate: LongTermCandidate) -> allocation.Candidat
     )
 
 
+def _calendar_days_for_bars(bars: int) -> int:
+    """Calendar-day span that reliably contains ``bars`` daily TRADING bars.
+
+    yfinance's ``period`` is a CALENDAR range, but ``TREND_PERIOD`` is a BAR
+    count. Equities trade ~5 of every 7 calendar days, so asking for
+    ``bars + 60`` calendar days returns far fewer than ``bars`` rows: 260
+    calendar days is only ~187 weekdays, and fewer still after market holidays
+    — below the 200 rows ``indicators.sma(close, 200)`` needs, which left the
+    long-horizon trend NaN for every stock. Scale by 7/5 and keep the existing
+    60-day cushion to absorb holidays.
+
+    Crypto trades 7 days a week, so this over-fetches slightly there; extra
+    history is harmless (the SMA only reads the trailing window).
+    """
+    return -(-bars * 7 // 5) + 60
+
+
 def fetch_daily_candles(
     ticker: str, *, period_days: int | None = None,
 ) -> pd.DataFrame | None:
@@ -248,7 +265,11 @@ def fetch_daily_candles(
 
     Pulls enough history to compute the TREND_PERIOD SMA. Isolated so the CLI and
     scan can use it while tests inject their own fetch."""
-    days = period_days if period_days is not None else config.TREND_PERIOD + 60
+    days = (
+        period_days
+        if period_days is not None
+        else _calendar_days_for_bars(config.TREND_PERIOD)
+    )
     try:
         frame = yf.download(
             to_yfinance_symbol(ticker), period=f"{days}d", interval="1d",
@@ -419,7 +440,7 @@ def submit_long_term_entry(
         order_type=ORDER_TYPE_LIMIT,
         time_in_force=TIF_DAY,
     )
-    risk_of_ruin.record_broker_result(order.ok)   # Phase 15 detector
+    risk_of_ruin.record_broker_result(order.ok, order.status)   # Phase 15 detector
     materialized = order_lifecycle.materialize_submitted_order_fill(
         order,
         observed_at=now,
@@ -553,7 +574,16 @@ def _submit_long_term_watcher_exit(
     if state.remaining_qty <= 0:
         return None, state
 
-    limit_price = exit_price if exit_price is not None else position.entry_price
+    if exit_price is None:
+        # NEVER fall back to the entry price — see the identical guard in
+        # options_execution._submit_option_watcher_exit. A close priced at
+        # entry cannot fill for a losing position, which is precisely the
+        # position a protective exit is closing.
+        raise ValueError(
+            "lifecycle exit refused: no current price is available "
+            "(refusing to price the close at the entry price)"
+        )
+    limit_price = exit_price
     order = order_lifecycle.submit_position_exit(
         broker,
         position_kind="long_term",

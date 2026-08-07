@@ -16,7 +16,13 @@ import pytest
 
 from trading_bot import allocation, config, db
 from trading_bot import risk_of_ruin as ror
-from trading_bot.broker.base import STATUS_FILLED, AccountInfo, Position
+from trading_bot.broker.base import (
+    STATUS_ERROR,
+    STATUS_FILLED,
+    STATUS_REJECTED,
+    AccountInfo,
+    Position,
+)
 from trading_bot.broker.fake import FakeBroker
 from trading_bot.models import (
     LongTermPosition,
@@ -363,9 +369,51 @@ def test_broker_error_streak_resets_on_intervening_success(tmp_db: Path) -> None
     assert ror.check_catastrophic() is None
 
 
+def test_broker_rejection_does_not_arm_the_catastrophic_trigger(tmp_db: Path) -> None:
+    """A 4xx rejection is a business outcome, not a broken order path.
+
+    Regression: 'market closed' / 'insufficient buying power' three times in a
+    row used to reach MAX_CONSECUTIVE_BROKER_ERRORS and liquidate the book.
+    """
+    for _ in range(5):
+        ror.record_broker_result(False, STATUS_REJECTED)
+    assert ror.broker_error_streak() == 0
+    assert ror.check_catastrophic() is None
+
+
+def test_rejection_is_neutral_and_does_not_reset_a_real_error_streak(
+    tmp_db: Path,
+) -> None:
+    """A rejection must not mask a genuinely failing order path either."""
+    ror.record_broker_result(False, STATUS_ERROR)
+    ror.record_broker_result(False, STATUS_ERROR)
+    ror.record_broker_result(False, STATUS_REJECTED)   # neutral: no reset
+    assert ror.broker_error_streak() == 2
+    assert ror.check_catastrophic() is None
+    ror.record_broker_result(False, STATUS_ERROR)      # third real error trips
+    reason = ror.check_catastrophic()
+    assert reason is not None and "3 consecutive broker errors" in reason
+
+
+def test_transport_errors_still_arm_the_trigger(tmp_db: Path) -> None:
+    for _ in range(3):
+        ror.record_broker_result(False, STATUS_ERROR)
+    reason = ror.check_catastrophic()
+    assert reason is not None and "3 consecutive broker errors" in reason
+
+
+def test_unclassified_failure_stays_conservative_and_counts(tmp_db: Path) -> None:
+    """No status supplied -> count it, matching the pre-existing behaviour."""
+    for _ in range(3):
+        ror.record_broker_result(False)
+    assert ror.check_catastrophic() is not None
+
+
 def test_order_paths_feed_the_broker_error_counter(tmp_db: Path) -> None:
-    # A structured rejection through the options order path increments the
-    # streak; a successful submit resets it (the Phase 15 wiring, end to end).
+    # The Phase 15 wiring, end to end: a transport OUTAGE through the options
+    # order path increments the streak and a successful submit resets it, but a
+    # structured broker REJECTION ("market closed") leaves it untouched — the
+    # broker answered, so the order path is not broken.
     from datetime import date
 
     from trading_bot import options_execution as oe
@@ -381,7 +429,11 @@ def test_order_paths_feed_the_broker_error_counter(tmp_db: Path) -> None:
         "call", 600.0, "AAPL", 100.0, [contract], ref_date=date(2026, 1, 1),
     )
     oe.submit_execution_order(FakeBroker(reject_reason="market closed"), decision)
-    assert ror.broker_error_streak() == 1
+    assert ror.broker_error_streak() == 0              # rejection is neutral
+
+    oe.submit_execution_order(FakeBroker(fail=True), decision)
+    assert ror.broker_error_streak() == 1              # outage counts
+
     oe.submit_execution_order(FakeBroker(), decision)
     assert ror.broker_error_streak() == 0              # success resets
 
@@ -579,7 +631,7 @@ def test_third_cycle_divergence_triggers_tier2_in_same_cycle(
     triggered: list[tuple[object, str]] = []
     monkeypatch.setattr(
         ror, "emergency_shutdown",
-        lambda b, *, trigger: triggered.append((b, trigger)),
+        lambda b, *, trigger, **_kw: triggered.append((b, trigger)),
     )
 
     scanner._run_risk_cycle()

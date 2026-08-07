@@ -551,7 +551,7 @@ def test_bind_failure_recovers_same_exit_row_without_resubmit(
             requested_limit_price=4.5,
             exit_reason="take_profit",
             submitted_at=_EXIT_AT,
-            broker_result_observer=observed_results.append,
+            broker_result_observer=lambda ok, status=None: observed_results.append(ok),
         )
     assert observed_results == [True]
     (prepared,) = db.get_pending_exit_orders_for_position("option", position_id)
