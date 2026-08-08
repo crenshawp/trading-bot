@@ -590,3 +590,68 @@ def test_last_cached_at_returns_disk_time_after_warmup(
     regime._reset_cache_for_tests()
     again = regime.last_cached_at()
     assert again is not None
+
+
+# ---------------------------------------------------------------------------
+# Fetch window sizing
+#
+# yfinance's `period=` is a CALENDAR range but _MIN_ROWS is a BAR count. The
+# old `250d` asked for 250 calendar days -> ~171 NYSE sessions against a
+# 205-row requirement, so _fetch_spy raised RegimeFetchError on EVERY call and
+# every trade was tagged market_regime='unknown' (and context_score=0).
+#
+# The existing tests monkeypatch yf.download with synthetic frames and ignore
+# the `period` argument entirely, which is exactly why the mismatch was
+# invisible to them. These assert on the requested window itself, measured
+# against the repo's own NYSE session calendar.
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_window_yields_enough_real_trading_sessions() -> None:
+    """The requested CALENDAR span must contain >= _MIN_ROWS NYSE sessions."""
+    from datetime import date, timedelta
+
+    from trading_bot.outcomes import is_stock_session
+
+    # Worst case over a year of possible "today"s, so the margin isn't an
+    # artifact of one anchor date landing kindly.
+    worst = min(
+        sum(
+            1
+            for i in range(regime._FETCH_PERIOD_DAYS)
+            if is_stock_session(date(2026, 8, 8) - timedelta(days=offset + i))
+        )
+        for offset in range(0, 371, 7)
+    )
+    assert worst >= regime._MIN_ROWS, (
+        f"{regime._FETCH_PERIOD_DAYS} calendar days yields only {worst} NYSE "
+        f"sessions in the worst case, below the {regime._MIN_ROWS} rows "
+        f"_fetch_spy requires — regime would be permanently 'unknown'"
+    )
+
+
+def test_old_250_day_window_would_not_have_been_enough() -> None:
+    """Pins the root cause: 250 calendar days can never satisfy the row guard."""
+    from datetime import date, timedelta
+
+    from trading_bot.outcomes import is_stock_session
+
+    sessions = sum(
+        1 for i in range(250) if is_stock_session(date(2026, 8, 8) - timedelta(days=i))
+    )
+    assert sessions < regime._MIN_ROWS
+
+
+def test_fetch_spy_requests_the_scaled_calendar_window(monkeypatch) -> None:
+    """_fetch_spy passes the scaled window through to yfinance."""
+    seen: dict[str, object] = {}
+
+    def fake_download(ticker, **kwargs):
+        seen.update(kwargs)
+        seen["ticker"] = ticker
+        return _build_spy_df(rows=260)
+
+    monkeypatch.setattr(regime.yf, "download", fake_download)
+    regime._fetch_spy()
+    assert seen["period"] == f"{regime._FETCH_PERIOD_DAYS}d"
+    assert regime._FETCH_PERIOD_DAYS == 347

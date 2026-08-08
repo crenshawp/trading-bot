@@ -40,9 +40,30 @@ from trading_bot import config, db
 _CACHE_PATH: Path = config.ROOT_DIR / ".regime_cache.json"
 _CACHE_TTL: timedelta = timedelta(hours=24)
 _SPY_TICKER: str = "SPY"
-_FETCH_PERIOD_DAYS: int = 250
 _EMA_SLOPE_WINDOW: int = 5  # 5-day slope of the 50 EMA
 _MIN_ROWS_FOR_200_EMA: int = 200
+_MIN_ROWS: int = _MIN_ROWS_FOR_200_EMA + _EMA_SLOPE_WINDOW
+
+
+def _calendar_days_for_bars(bars: int) -> int:
+    """Calendar-day span that reliably contains ``bars`` daily TRADING bars.
+
+    yfinance's ``period`` is a CALENDAR range, but ``_MIN_ROWS`` is a BAR count.
+    Equities trade ~5 of every 7 calendar days, and fewer still after market
+    holidays, so a calendar span sized as if it were a bar count comes up short:
+    the previous ``250d`` returned only ~171 NYSE sessions against a 205-row
+    requirement, so ``_fetch_spy`` raised ``RegimeFetchError`` on EVERY call and
+    the regime was permanently ``unknown``.
+
+    Scale by 7/5 and keep a 60-day cushion to absorb holidays. This mirrors
+    ``long_term._calendar_days_for_bars``, which fixed the identical bug for the
+    long-horizon trend SMA; regime.py was simply never given the same treatment.
+    """
+    return -(-bars * 7 // 5) + 60
+
+
+# 347 days -> ~238 NYSE sessions, a 33-session margin over the 205 required.
+_FETCH_PERIOD_DAYS: int = _calendar_days_for_bars(_MIN_ROWS)
 
 VALID_REGIMES: frozenset[str] = frozenset({"bull", "bear", "sideways", "unknown"})
 
@@ -179,10 +200,9 @@ def _fetch_spy(period_days: int = _FETCH_PERIOD_DAYS) -> pd.DataFrame:
     if "Close" not in df.columns:
         raise RegimeFetchError("SPY data missing 'Close' column")
     df = df.dropna(subset=["Close"])
-    min_rows = _MIN_ROWS_FOR_200_EMA + _EMA_SLOPE_WINDOW
-    if len(df) < min_rows:
+    if len(df) < _MIN_ROWS:
         raise RegimeFetchError(
-            f"insufficient SPY data: got {len(df)} rows, need >= {min_rows}"
+            f"insufficient SPY data: got {len(df)} rows, need >= {_MIN_ROWS}"
         )
     return df
 
