@@ -127,8 +127,17 @@ _NEUTRAL_STATUS_MAP: dict[str, str] = {
     "canceled": STATUS_CANCELED,
     "expired": STATUS_CANCELED,
     "replaced": STATUS_CANCELED,
-    "pending_cancel": STATUS_CANCELED,
-    "pending_replace": STATUS_CANCELED,
+    # NOT terminal. Alpaca's "pending_*" means the cancel/replace REQUEST was
+    # accepted and has not been applied yet — the order is still working at the
+    # exchange and can still fill. Mapping them to STATUS_CANCELED (which is in
+    # models.TERMINAL_PENDING_ORDER_STATUSES) stamped terminal_at on a live
+    # order, and a locally-terminal row is never read from the broker again
+    # (db.get_nonterminal_pending_orders filters on terminal_at IS NULL, and
+    # refresh_pending_order short-circuits) — so any fill that landed between
+    # the cancel request and its application was lost, understating the
+    # position and leaving real shares open at the broker.
+    "pending_cancel": STATUS_NEW,
+    "pending_replace": STATUS_NEW,
     "stopped": STATUS_CANCELED,
     "suspended": STATUS_CANCELED,
     "rejected": STATUS_REJECTED,

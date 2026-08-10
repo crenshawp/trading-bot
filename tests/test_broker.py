@@ -15,7 +15,13 @@ import pytest
 from trading_bot import broker, db
 from trading_bot.broker import alpaca, base
 from trading_bot.broker.fake import FakeBroker
-from trading_bot.models import LongTermPosition, OptionPosition, Signal, Trade
+from trading_bot.models import (
+    TERMINAL_PENDING_ORDER_STATUSES,
+    LongTermPosition,
+    OptionPosition,
+    Signal,
+    Trade,
+)
 
 
 def _seed_open_active(ticker: str, *, track_mode: str = "active") -> None:
@@ -522,6 +528,24 @@ def test_map_status_covers_lifecycle() -> None:
     # An Alpaca state we have not classified maps to 'unknown', never 'error'.
     assert alpaca.map_status("some_future_state") == broker.STATUS_UNKNOWN
     assert alpaca.map_status(None) == broker.STATUS_UNKNOWN
+
+
+def test_pending_cancel_and_replace_are_not_terminal() -> None:
+    """A cancel/replace REQUEST is not a completed cancel.
+
+    Alpaca's ``pending_cancel``/``pending_replace`` mean the request was
+    accepted and has not been applied — the order is still working and can
+    still fill. Mapping them onto a terminal status stamped ``terminal_at`` on
+    a live order, and a locally-terminal row is never re-read from the broker,
+    so a fill landing between the request and its application was lost.
+    """
+    assert alpaca.map_status("pending_cancel") == broker.STATUS_NEW
+    assert alpaca.map_status("pending_replace") == broker.STATUS_NEW
+    # The property that actually matters: neither may be treated as terminal.
+    assert alpaca.map_status("pending_cancel") not in TERMINAL_PENDING_ORDER_STATUSES
+    assert alpaca.map_status("pending_replace") not in TERMINAL_PENDING_ORDER_STATUSES
+    # A real, applied cancel still IS terminal — the fix must not blunt that.
+    assert alpaca.map_status("canceled") in TERMINAL_PENDING_ORDER_STATUSES
 
 
 # ───────────────────────── Alpaca submit_order (write path) ──────────────────

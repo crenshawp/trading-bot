@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from trading_bot import db, options_execution, order_lifecycle
+from trading_bot.broker import alpaca
 from trading_bot.broker.base import (
     ORDER_TYPE_LIMIT,
     STATUS_CANCELED,
@@ -385,3 +386,83 @@ def test_emergency_freezes_growing_entry_before_submitting_actual_quantity(
     assert closed.exit_price == 6.0
     assert closed.pnl_dollars == pnl == 120.0
     assert closed.exit_reason == "emergency_shutdown"
+
+
+
+class _PendingCancelBroker(FakeBroker):
+    """Models Alpaca's real cancel semantics, which FakeBroker does not.
+
+    ``DELETE /v2/orders/{id}`` returning 204 means the cancel was QUEUED, not
+    applied. A ``GET`` immediately afterwards very commonly still shows the
+    order working, with Alpaca's raw status ``pending_cancel``. FakeBroker
+    instead swaps in a fully CANCELED order, i.e. it only ever models the
+    already-applied case — which is why this path had no coverage.
+    """
+
+    def cancel_order(self, order_id: str) -> OrderResult:
+        order = self._orders[order_id]
+        # 204: accepted, not yet applied. The stored order is left WORKING,
+        # carrying whatever the neutral map makes of Alpaca's raw status.
+        self._orders[order_id] = dataclasses.replace(
+            order, status=alpaca.map_status("pending_cancel"), raw_status="pending_cancel"
+        )
+        return OrderResult(ok=True, status=STATUS_CANCELED, order_id=order_id)
+
+
+def test_pending_cancel_does_not_terminalize_a_still_working_entry(
+    tmp_db: Path,
+) -> None:
+    """A cancel REQUEST must not close the ledger on an order that can still fill.
+
+    Alpaca returns ``pending_cancel`` when the cancel was accepted but not yet
+    applied — the order is still working at the exchange. Mapping that onto a
+    terminal status stamped ``terminal_at``, and a locally-terminal row is never
+    read from the broker again, so the freeze materialized the position at
+    whatever had filled at that instant and any later fill was lost forever.
+
+    The correct behaviour was already written — ``freeze_position_entry_intent``
+    has an explicit "entry remains nonterminal after cancel" branch — the status
+    map simply prevented it from ever being reached.
+    """
+    position_id = _insert_linked_option(
+        entry_qty=1.0,
+        requested_qty=2.0,
+        entry_status=STATUS_PARTIALLY_FILLED,
+        broker_order_id="pending-cancel-entry",
+    )
+    broker = _PendingCancelBroker(auto_fill=True)
+    broker._orders["pending-cancel-entry"] = dataclasses.replace(
+        OrderResult(
+            ok=True,
+            status=STATUS_PARTIALLY_FILLED,
+            order_id="pending-cancel-entry",
+            client_order_id=f"entry-client-{position_id}",
+            symbol=_OPTION_SYMBOL,
+            qty=2.0,
+            filled_qty=1.0,
+            filled_avg_price=5.0,
+            side="buy",
+            order_type=ORDER_TYPE_LIMIT,
+            time_in_force=TIF_DAY,
+            limit_price=5.0,
+            submitted_at=_ENTRY_AT.isoformat(),
+            updated_at=_ENTRY_AT.isoformat(),
+        ),
+        # What Alpaca actually reports right after an accepted cancel request.
+        raw_status="pending_cancel",
+    )
+
+    result = order_lifecycle.freeze_position_entry_intent(
+        broker, position_kind="option", position_id=position_id, observed_at=_EXIT_AT
+    )
+
+    # Not frozen, and explicitly reported as still pending — the honest answer.
+    assert result.frozen is False
+    assert result.action == "pending"
+
+    entry = db.get_pending_order("pending-cancel-entry")
+    assert entry is not None
+    # The load-bearing assertion: the row stays live, so the next refresh cycle
+    # still reads it from the broker and the eventual real fill is captured.
+    assert entry.terminal_at is None
+    assert entry.lifecycle_status != STATUS_CANCELED
