@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from trading_bot import config, db, long_term, risk_of_ruin
+from trading_bot import config, db, long_term, options_execution, risk_of_ruin
 from trading_bot import plan_execution as pe
 from trading_bot.allocation import ExecutionPlan, PlannedOrder
 from trading_bot.broker.base import STATUS_REJECTED, OrderResult
@@ -468,20 +468,63 @@ def test_shares_fallback_missing_deadline_fails_soft(
     assert "no hold window carried" in capsys.readouterr().err
 
 
-def test_option_position_deadline_untouched_by_carried_window(
-    tmp_db: Path,
-) -> None:
-    """Phase 13's domain: even with a carried window on the order, an OPTION
-    position's deadline stays exactly as before (None from this path)."""
+def test_option_position_inherits_carried_hold_deadline(tmp_db: Path) -> None:
+    """An OPTION position carries the swing window too.
+
+    Previously asserted the opposite (deadline stayed None, "Phase 13's
+    domain"). Phase 13 never supplied one either, so every production option
+    was created with NO time stop — and since nothing closes a position on
+    contract expiry, one that never reached TP/SL stayed open for ever.
+    """
+    deadline = _NOW + timedelta(days=2)
     run = pe.execute_plan(
         SpyBroker(),
-        ExecutionPlan(orders=[_swing_order(hold_deadline=_NOW + timedelta(days=2))]),
+        ExecutionPlan(orders=[_swing_order(hold_deadline=deadline)]),
         now=_NOW, option_chain_fetch=_chain_fetch,     # full option fits
     )
     assert run.executions[0].vehicle == "option_full"
     (opt,) = db.get_open_option_positions()
-    assert opt.deadline is None
+    assert opt.deadline == deadline
     assert db.get_open_long_term_positions() == []
+
+
+def test_option_watcher_time_stops_on_carried_deadline(tmp_db: Path) -> None:
+    """The consequence that matters: with the window carried, the option
+    watcher actually closes the position once the deadline passes — the
+    underlying sitting between TP and SL no longer means 'hold for ever'."""
+    deadline = _NOW + timedelta(days=2)
+    broker = SpyBroker()
+    pe.execute_plan(
+        broker,
+        ExecutionPlan(orders=[_swing_order(hold_deadline=deadline)]),
+        now=_NOW, option_chain_fetch=_chain_fetch,
+    )
+    book = db.get_open_option_positions()
+    (action,) = options_execution.watch_open_option_positions(
+        broker,
+        underlying_price_fetch=lambda _t: 480.0,      # between TP and SL
+        option_price_fetch=lambda _s: 5.0,
+        now=deadline + timedelta(hours=1),
+        positions=book,
+    )
+    assert action.action == "close"
+    assert action.reason == options_execution.EXIT_HOLD_DEADLINE
+
+
+def test_option_without_carried_window_still_fires_and_logs(
+    tmp_db: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A missing window degrades to no time stop rather than crashing the fire
+    path — same fail-soft contract the shares fallback has."""
+    run = pe.execute_plan(
+        SpyBroker(),
+        ExecutionPlan(orders=[_swing_order(hold_deadline=None)]),
+        now=_NOW, option_chain_fetch=_chain_fetch,
+    )
+    assert run.executions[0].status == "submitted"
+    (opt,) = db.get_open_option_positions()
+    assert opt.deadline is None
+    assert "no hold window carried" in capsys.readouterr().err
 
 
 def test_fired_signal_window_reaches_shares_fallback_deadline(
