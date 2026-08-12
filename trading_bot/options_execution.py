@@ -579,6 +579,38 @@ def watch_open_option_positions(
                 actions.append(ExitAction(pos, "hold", decision.reason))
                 continue
 
+            # A triggered exit must terminalize a still-working entry FIRST,
+            # exactly as the emergency closer above already does. The exit
+            # submitter opens with materialize_position_exit_fills, whose
+            # _load_entry_truth refuses outright while the linked entry order is
+            # non-terminal ("linked entry order is not terminal") — so without
+            # this, a partially-filled entry (a real, ordinary state: the typed
+            # position exists and is tradeable the moment the first contract
+            # fills) has NO reachable TP, SL or hold-deadline exit. The watcher
+            # just re-errors every hour while the stop it was built to honour
+            # goes unfilled. freeze_position_entry_intent is idempotent — an
+            # already-terminal entry short-circuits to "already_terminal"
+            # without cancelling anything — so this is a no-op on the ordinary
+            # fully-filled path.
+            if pos.id is not None:
+                frozen = order_lifecycle.freeze_position_entry_intent(
+                    broker,
+                    position_kind="option",
+                    position_id=pos.id,
+                    observed_at=now,
+                )
+                if not frozen.frozen:
+                    detail = frozen.reason or "entry quantity is not frozen"
+                    print(
+                        f"  options watcher lifecycle exit refused for "
+                        f"{pos.symbol}: entry not frozen ({detail})",
+                        file=sys.stderr,
+                    )
+                    actions.append(ExitAction(
+                        pos, "error", f"entry quantity is not frozen ({detail})",
+                    ))
+                    continue
+
             exit_price = option_price_fetch(pos.symbol)
             order, fill = _submit_option_watcher_exit(
                 broker, pos, exit_price=exit_price, now=now,

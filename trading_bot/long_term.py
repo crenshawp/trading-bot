@@ -687,6 +687,31 @@ def watch_long_term_positions(
                 actions.append(ExitAction(pos, "hold", decision.reason))
                 continue
 
+            # Terminalize a still-working entry FIRST — see the matching note in
+            # options_execution.watch_open_option_positions. close_long_term_
+            # position (the emergency path) already does this; the routine
+            # watcher did not, so a partially-filled entry left the protective
+            # stop and the hold-deadline unreachable. Idempotent on the ordinary
+            # fully-filled path.
+            if pos.id is not None:
+                frozen = order_lifecycle.freeze_position_entry_intent(
+                    broker,
+                    position_kind="long_term",
+                    position_id=pos.id,
+                    observed_at=now,
+                )
+                if not frozen.frozen:
+                    detail = frozen.reason or "entry quantity is not frozen"
+                    print(
+                        f"  longterm watcher lifecycle exit refused for "
+                        f"{pos.ticker}: entry not frozen ({detail})",
+                        file=sys.stderr,
+                    )
+                    actions.append(ExitAction(
+                        pos, "error", f"entry quantity is not frozen ({detail})",
+                    ))
+                    continue
+
             order, fill = _submit_long_term_watcher_exit(
                 broker, pos, exit_price=current_price, now=now,
                 reason=decision.reason,

@@ -17,7 +17,14 @@ import pandas as pd
 import pytest
 
 from trading_bot import config, db, indicators, long_term, risk
-from trading_bot.broker.base import STATUS_FILLED
+from trading_bot.broker.base import (
+    ORDER_TYPE_LIMIT,
+    STATUS_CANCELED,
+    STATUS_FILLED,
+    STATUS_PARTIALLY_FILLED,
+    TIF_DAY,
+    OrderResult,
+)
 from trading_bot.broker.fake import FakeBroker
 from trading_bot.earnings import EarningsInfo
 from trading_bot.long_term import LongTermCandidate, LongTermPosition
@@ -390,6 +397,8 @@ def _seed_linked_entry(
     tp: float | None = None,
     sl: float | None = None,
     deadline: datetime | None = None,
+    entry_status: str = STATUS_FILLED,
+    requested_qty: float | None = None,
 ) -> None:
     intent_kind = "long_term" if source == "long_term" else "shares_fallback"
     payload: dict[str, object] = {
@@ -412,19 +421,25 @@ def _seed_linked_entry(
         vehicle="shares",
         target_position_kind="long_term",
         side="sell" if direction == "short" else "buy",
-        requested_qty=qty,
+        requested_qty=requested_qty if requested_qty is not None else qty,
         requested_limit_price=entry,
         submitted_at=datetime(2026, 1, 1, tzinfo=UTC),
         intent_payload_json=json.dumps(payload, sort_keys=True),
-        lifecycle_status=STATUS_FILLED,
-        broker_status=STATUS_FILLED,
+        lifecycle_status=entry_status,
+        broker_status=entry_status,
         filled_qty=qty,
         filled_avg_price=entry,
         last_fill_at=datetime(2026, 1, 1, tzinfo=UTC),
         last_fill_time_source="broker",
         last_refreshed_at=datetime(2026, 1, 1, tzinfo=UTC),
-        terminal_reason=STATUS_FILLED,
-        terminal_at=datetime(2026, 1, 1, tzinfo=UTC),
+        terminal_reason=(
+            entry_status if entry_status == STATUS_FILLED else None
+        ),
+        terminal_at=(
+            datetime(2026, 1, 1, tzinfo=UTC)
+            if entry_status == STATUS_FILLED
+            else None
+        ),
         position_kind="long_term",
         position_id=position_id,
     ))
@@ -474,6 +489,60 @@ def test_watcher_closes_on_drawdown_stop(
     assert db.get_open_long_term_positions() == []
     closed = db.get_long_term_positions()[0]
     assert closed.status == "closed" and closed.exit_reason == "drawdown_stop"
+
+
+def test_watcher_drawdown_stop_fires_while_the_entry_is_still_working(
+    tmp_db: Path,
+) -> None:
+    """The routine watcher must close a triggered position whose entry is still
+    growing — the mirror of the option-watcher proof in
+    tests/test_exit_lifecycle_activation.py.
+
+    Before the entry freeze was added to this watcher, the exit submitter's
+    materializer refused while the linked entry was non-terminal, so the
+    protective stop was unreachable for any partially-filled entry.
+    """
+    position_id = db.insert_long_term_position(LongTermPosition(
+        ticker="AAPL", asset_class="stock", entry_price=100.0,
+        entry_date=datetime(2026, 1, 1, tzinfo=UTC), qty=6.0, status="open",
+    ))
+    _seed_linked_entry(
+        position_id, ticker="AAPL", entry=100.0, qty=6.0,
+        source="long_term", direction="long",
+        entry_status=STATUS_PARTIALLY_FILLED, requested_qty=10.0,
+    )
+    broker_order_id = f"broker-entry-shares-{position_id}"
+    b = FakeBroker(auto_fill=True)
+    b._orders[broker_order_id] = OrderResult(
+        ok=True,
+        status=STATUS_PARTIALLY_FILLED,
+        order_id=broker_order_id,
+        client_order_id=f"entry-shares-{position_id}",
+        symbol="AAPL",
+        qty=10.0,
+        filled_qty=6.0,
+        filled_avg_price=100.0,
+        side="buy",
+        order_type=ORDER_TYPE_LIMIT,
+        time_in_force=TIF_DAY,
+        limit_price=100.0,
+        submitted_at=datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
+        filled_at=datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
+        updated_at=datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
+        raw_status=STATUS_PARTIALLY_FILLED,
+    )
+
+    actions = long_term.watch_long_term_positions(
+        b, price_fetch=lambda _t: _flat_df(70.0),   # 30% drawdown
+        now=datetime(2026, 1, 5, tzinfo=UTC),
+    )
+
+    assert actions[0].action == "close"
+    assert actions[0].reason == "drawdown_stop"
+    entry = db.get_pending_order(broker_order_id)
+    assert entry is not None
+    assert entry.lifecycle_status == STATUS_CANCELED
+    assert db.get_open_long_term_positions() == []
 
 
 def test_watcher_closes_on_trend_breakdown(tmp_db: Path) -> None:
