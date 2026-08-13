@@ -21,6 +21,7 @@ from trading_bot.broker.base import (
     STATUS_FILLED,
     STATUS_REJECTED,
     AccountInfo,
+    OrdersResult,
     Position,
 )
 from trading_bot.broker.fake import FakeBroker
@@ -1175,4 +1176,61 @@ def test_cli_risk_killswitch(tmp_db: Path, monkeypatch, capsys) -> None:
     m.cmd_risk_killswitch(config.ROR_KILLSWITCH_TOKEN)
     out = capsys.readouterr().out
     assert "KILL SWITCH: halted" in out
+    assert ror.get_state() == ror.STATE_HALTED
+
+
+class _OrdersUnreadableBroker(_ClosingFakeBroker):
+    """Positions read fine; the OPEN-ORDERS read fails on its own.
+
+    The realistic shape of the bug: GET /v2/positions returns 200 and flat while
+    GET /v2/orders?status=open returns 500 with an entry limit still resting.
+    """
+
+    def list_orders(self, status: str = "open"):  # type: ignore[no-untyped-def]
+        return OrdersResult(ok=False, reason="simulated 500 on open-orders read")
+
+
+def test_shutdown_will_not_claim_closure_when_open_orders_are_unreadable(
+    tmp_db: Path,
+) -> None:
+    """An unreadable open-orders list is UNKNOWN, never a confirmed zero.
+
+    `(report.broker_open_orders or 0) > 0` collapsed None into 0, so a failed
+    open-orders read let the bot declare "Closure broker-confirmed", set
+    STATE_HALTED and exit -- while a resting entry order filled minutes later
+    into a position with no process left to manage it.
+    """
+    b = _OrdersUnreadableBroker(auto_fill=True)
+    rec = _Recorder()
+
+    result = ror.emergency_shutdown(
+        b, trigger="test trigger", notifier=rec, now=_TS,
+        option_price_fetch=lambda _s: 6.0,
+        long_term_price_fetch=lambda _t: 470.0,
+    )
+
+    assert result.status == "holding"
+    assert "unreadable" in result.note
+    # The bot must NOT have declared a broker-confirmed halt.
+    assert ror.get_state() != ror.STATE_HALTED
+    assert not any(
+        "BOT HAS ENCOUNTERED A SEVERE ERROR SHUT DOWN INITIATED" in t
+        for t, _m in rec.calls
+    )
+
+
+def test_shutdown_still_halts_when_open_orders_are_readable_and_zero(
+    tmp_db: Path,
+) -> None:
+    """The fix must not blunt the real halt: a confirmed zero still confirms."""
+    b = _ClosingFakeBroker(auto_fill=True)
+    rec = _Recorder()
+
+    result = ror.emergency_shutdown(
+        b, trigger="test trigger", notifier=rec, now=_TS,
+        option_price_fetch=lambda _s: 6.0,
+        long_term_price_fetch=lambda _t: 470.0,
+    )
+
+    assert result.status == "halted"
     assert ror.get_state() == ror.STATE_HALTED

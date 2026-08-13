@@ -138,8 +138,17 @@ _NEUTRAL_STATUS_MAP: dict[str, str] = {
     # position and leaving real shares open at the broker.
     "pending_cancel": STATUS_NEW,
     "pending_replace": STATUS_NEW,
-    "stopped": STATUS_CANCELED,
-    "suspended": STATUS_CANCELED,
+    # NOT terminal either, for the same reason. Alpaca defines "stopped" as
+    # "the order has been stopped, and a trade is GUARANTEED for the order,
+    # usually at a stated price or better, but has not yet occurred" — i.e. a
+    # fill is coming. "suspended" means the order is not eligible for trading
+    # right now, which it can stop being. Mapping either to STATUS_CANCELED
+    # stamped terminal_at on an order that was still going to fill, and the row
+    # is then never refreshed from the broker again — so the guaranteed fill
+    # was never recorded, no position was materialized, and the real shares sat
+    # unmanaged at the broker while reconcile reported broker_only every cycle.
+    "stopped": STATUS_NEW,
+    "suspended": STATUS_NEW,
     "rejected": STATUS_REJECTED,
 }
 

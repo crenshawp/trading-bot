@@ -1339,3 +1339,24 @@ def test_cli_broker_reconcile_clean(
     monkeypatch.setattr(m.broker, "AlpacaBroker", lambda: FakeBroker())
     m.cmd_broker_reconcile()
     assert "No divergences" in capsys.readouterr().out
+
+
+def test_stopped_and_suspended_are_not_terminal() -> None:
+    """A guaranteed-but-not-yet-printed trade is not a completed cancel.
+
+    Alpaca defines ``stopped`` as "a trade is GUARANTEED for the order ... but
+    has not yet occurred", and ``suspended`` as merely not eligible for trading
+    right now. Mapping either onto a terminal status stamped ``terminal_at`` on
+    an order that was still going to fill; a locally-terminal row is never
+    re-read from the broker, so the fill was never recorded and the real shares
+    sat unmanaged. Same defect class as ``pending_cancel``/``pending_replace``.
+    """
+    assert alpaca.map_status("stopped") == broker.STATUS_NEW
+    assert alpaca.map_status("suspended") == broker.STATUS_NEW
+    # The property that actually matters: neither may be treated as terminal.
+    assert alpaca.map_status("stopped") not in TERMINAL_PENDING_ORDER_STATUSES
+    assert alpaca.map_status("suspended") not in TERMINAL_PENDING_ORDER_STATUSES
+    # Genuinely finished states must stay terminal — the fix must not blunt them.
+    assert alpaca.map_status("canceled") in TERMINAL_PENDING_ORDER_STATUSES
+    assert alpaca.map_status("expired") in TERMINAL_PENDING_ORDER_STATUSES
+    assert alpaca.map_status("filled") in TERMINAL_PENDING_ORDER_STATUSES

@@ -733,15 +733,27 @@ def emergency_shutdown(
         settings.set(_LAST_EVENT_KEY, f"tier2 UNCONFIRMED halt: {trigger}")
         return ShutdownResult("unconfirmed", trigger, closed, pending, note)
 
+    # `broker_open_orders` is None when the open-orders read itself FAILED
+    # (reconcile sets `len(...) if orders.ok else None`). `or 0` collapsed that
+    # unknown into a confirmed zero, so a 500 on GET /v2/orders while an entry
+    # limit was still resting let the bot declare "Closure broker-confirmed",
+    # halt, and exit -- and the resting order then filled minutes later into a
+    # position with no process left to manage it. Unknown is not flat: hold and
+    # retry, the same as any other not-yet-flat read. Step 5 above already
+    # refuses to fabricate a closure when reconcile fails outright; this is the
+    # same rule for the half of the report that can fail on its own.
+    open_orders = report.broker_open_orders
     if (
         report.broker_symbols
         or report.internal_symbols
-        or (report.broker_open_orders or 0) > 0
+        or open_orders is None
+        or open_orders > 0
     ):
+        open_orders_detail = "unreadable" if open_orders is None else open_orders
         note = (
             f"closure not yet flat (broker={report.broker_symbols}, "
             f"typed={report.internal_symbols}, "
-            f"open_orders={report.broker_open_orders}) - holding state, "
+            f"open_orders={open_orders_detail}) - holding state, "
             "retrying next cycle"
         )
         print(f"  risk: {note}", file=sys.stderr)
