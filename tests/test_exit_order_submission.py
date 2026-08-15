@@ -18,6 +18,7 @@ from trading_bot.broker.base import (
     ORDER_LOOKUP_NOT_FOUND,
     ORDER_LOOKUP_UNAVAILABLE,
     ORDER_TYPE_LIMIT,
+    STATUS_CANCELED,
     STATUS_ERROR,
     STATUS_FILLED,
     STATUS_NEW,
@@ -840,3 +841,121 @@ def test_emergency_direct_closers_use_lifecycle_and_leave_unfilled_rows_open(
     assert open_long is not None and open_long.status == "open"
     assert len(db.get_pending_exit_orders_for_position("option", option_id)) == 1
     assert len(db.get_pending_exit_orders_for_position("long_term", long_id)) == 1
+
+
+def _insert_terminal_partial_exit(
+    position_id: int,
+    *,
+    label: str,
+    requested_qty: float,
+    filled_qty: float,
+) -> None:
+    """One TERMINAL exit attempt that only partially filled before being canceled."""
+    position = db.get_option_position(position_id)
+    assert position is not None
+    db.insert_pending_order(
+        PendingOrder(
+            client_order_id=f"exit-{label}",
+            broker_order_id=f"broker-exit-{label}",
+            order_role="exit",
+            ticker=position.underlying,
+            broker_symbol=position.symbol,
+            asset_class="stock",
+            vehicle=position.vehicle,
+            target_position_kind="option",
+            closes_position_kind="option",
+            closes_position_id=position_id,
+            side="sell",
+            requested_qty=requested_qty,
+            requested_limit_price=3.0,
+            submitted_at=_EXIT_AT,
+            intent_payload_json=json.dumps(
+                {"intent_kind": "position_exit", "exit_reason": "take_profit"},
+                sort_keys=True,
+            ),
+            lifecycle_status=STATUS_CANCELED,
+            broker_status=STATUS_CANCELED,
+            filled_qty=filled_qty,
+            filled_avg_price=3.0,
+            last_fill_at=_EXIT_AT,
+            last_fill_time_source="broker",
+            last_refreshed_at=_EXIT_AT,
+            terminal_reason=STATUS_CANCELED,
+            terminal_at=_EXIT_AT,
+        )
+    )
+
+
+def test_exit_submission_is_bounded_by_the_unexited_remainder(tmp_db: Path) -> None:
+    """A retry sized to the ORIGINAL position must not oversell the remainder.
+
+    ``_position_exit_submission.held_qty`` is the FULL position size, checked
+    against total terminal ENTRY quantity — never what is left to exit. A prior
+    TERMINAL exit attempt that partially filled has already sold part of the
+    holding, and the nonterminal-attempt guard does not catch it (a terminal
+    attempt is, by definition, not nonterminal).
+
+    On the unfixed code this transmitted a real 4-contract sell against a
+    3-contract remainder — 5 sold against a 4-contract position — and the
+    resulting aggregate then tripped ``_aggregate_exit_truth`` on every later
+    pass, leaving the position open, unpriced and permanently unexitable.
+    """
+    position_id = _insert_linked_option(qty=4.0)
+    _insert_terminal_partial_exit(
+        position_id, label="a1", requested_qty=4.0, filled_qty=1.0,
+    )
+
+    state = order_lifecycle.position_exit_fill_state("option", position_id)
+    assert state.remaining_qty == 3.0  # 4 held, 1 already sold
+
+    broker = FakeBroker()
+    with pytest.raises(ValueError, match="unexited remainder"):
+        order_lifecycle.submit_position_exit(
+            broker,
+            position_kind="option",
+            position_id=position_id,
+            requested_qty=4.0,  # the original position, not the remainder
+            requested_limit_price=3.0,
+            exit_reason="take_profit",
+            submitted_at=_EXIT_AT,
+        )
+
+    # Nothing reached the broker and no second exit row was written.
+    assert len(db.get_pending_exit_orders_for_position("option", position_id)) == 1
+
+
+def test_exit_submission_still_allows_the_exact_remainder(tmp_db: Path) -> None:
+    """The bound must not over-tighten — the real remainder is still submittable."""
+    position_id = _insert_linked_option(qty=4.0)
+    _insert_terminal_partial_exit(
+        position_id, label="a1", requested_qty=4.0, filled_qty=1.0,
+    )
+
+    result = order_lifecycle.submit_position_exit(
+        FakeBroker(),
+        position_kind="option",
+        position_id=position_id,
+        requested_qty=3.0,  # exactly what is left
+        requested_limit_price=3.0,
+        exit_reason="take_profit",
+        submitted_at=_EXIT_AT,
+    )
+
+    assert result.status != STATUS_ERROR
+    assert len(db.get_pending_exit_orders_for_position("option", position_id)) == 2
+
+
+def test_first_exit_of_an_untouched_position_is_unaffected(tmp_db: Path) -> None:
+    """With no prior exit rows the remainder IS the holding — the common path."""
+    position_id = _insert_linked_option(qty=2.0)
+    result = order_lifecycle.submit_position_exit(
+        FakeBroker(),
+        position_kind="option",
+        position_id=position_id,
+        requested_qty=2.0,
+        requested_limit_price=4.5,
+        exit_reason="take_profit",
+        submitted_at=_EXIT_AT,
+    )
+    assert result.status != STATUS_ERROR
+    assert len(db.get_pending_exit_orders_for_position("option", position_id)) == 1

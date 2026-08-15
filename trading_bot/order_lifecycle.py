@@ -904,6 +904,26 @@ def submit_position_exit(
         requested_qty, submission.held_qty
     ):
         raise ValueError("exit requested_qty exceeds the linked open holding")
+    # `held_qty` is the FULL position size, never the unexited remainder: it is
+    # `option_position.contracts` / `long_position.qty`, cross-checked against
+    # total terminal ENTRY quantity.  A prior TERMINAL exit attempt that
+    # partially filled has already sold part of that holding, and nothing above
+    # subtracts it — the nonterminal check below only rejects a concurrent
+    # in-flight attempt, which a terminal one is not.  Bound the request by
+    # ACTUAL unexited truth instead: without this, a retry sized to the original
+    # position transmits a real broker order for quantity that is no longer
+    # held, and the resulting aggregate then trips `_aggregate_exit_truth`
+    # ("aggregate exit quantity oversells entry quantity") on every later pass,
+    # leaving the position open, unpriced and impossible to exit through this
+    # path ever again.
+    remaining_qty = remaining_position_quantity(position_kind, position_id)
+    if remaining_qty is None:
+        # Integrity unknown — the unexited quantity cannot be established, so
+        # there is no safe size to send.  Refusing matches what every caller
+        # already does with an unknown state rather than guessing at one.
+        raise ValueError("exit target exit-fill integrity is unknown")
+    if requested_qty > remaining_qty and not _same_number(requested_qty, remaining_qty):
+        raise ValueError("exit requested_qty exceeds the unexited remainder")
     existing_attempts = db.get_pending_exit_orders_for_position(
         position_kind, position_id
     )
