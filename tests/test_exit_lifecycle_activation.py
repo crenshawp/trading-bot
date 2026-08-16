@@ -53,6 +53,8 @@ def _insert_linked_option(
     entry_price: float = 5.0,
     entry_status: str = STATUS_FILLED,
     broker_order_id: str | None = None,
+    tp: float | None = None,
+    sl: float | None = None,
 ) -> int:
     position_id = db.insert_option_position(
         OptionPosition(
@@ -66,6 +68,8 @@ def _insert_linked_option(
             premium_entry=entry_price,
             outcome="open",
             vehicle="option_full",
+            tp=tp,
+            sl=sl,
         )
     )
     terminal = entry_status in {STATUS_FILLED, STATUS_CANCELED}
@@ -387,6 +391,113 @@ def test_emergency_freezes_growing_entry_before_submitting_actual_quantity(
     assert closed.pnl_dollars == pnl == 120.0
     assert closed.exit_reason == "emergency_shutdown"
 
+
+
+def _growing_entry_broker(position_id: int, broker_order_id: str) -> FakeBroker:
+    """A broker whose linked entry is still working with 1.5 of 2 filled."""
+    broker = FakeBroker(auto_fill=True)
+    later_fill_at = _ENTRY_AT + timedelta(minutes=5)
+    broker._orders[broker_order_id] = OrderResult(
+        ok=True,
+        status=STATUS_PARTIALLY_FILLED,
+        order_id=broker_order_id,
+        client_order_id=f"entry-client-{position_id}",
+        symbol=_OPTION_SYMBOL,
+        qty=2.0,
+        filled_qty=1.5,
+        filled_avg_price=5.2,
+        side="buy",
+        order_type=ORDER_TYPE_LIMIT,
+        time_in_force=TIF_DAY,
+        limit_price=5.0,
+        submitted_at=_ENTRY_AT.isoformat(),
+        filled_at=later_fill_at.isoformat(),
+        updated_at=later_fill_at.isoformat(),
+        raw_status=STATUS_PARTIALLY_FILLED,
+    )
+    return broker
+
+
+def test_option_watcher_stop_loss_fires_while_the_entry_is_still_working(
+    tmp_db: Path,
+) -> None:
+    """The ROUTINE watcher must close a triggered position whose entry is
+    still growing — not merely the emergency closer.
+
+    A partially-filled entry is an ordinary state: the typed position exists
+    and is exposed the moment the first contract fills. Before the freeze was
+    added here, the exit submitter's materializer refused outright ("linked
+    entry order is not terminal"), so TP, SL and the hold deadline were ALL
+    unreachable for that position and the watcher merely re-errored each hour.
+    """
+    position_id = _insert_linked_option(
+        entry_qty=1.0,
+        requested_qty=2.0,
+        entry_status=STATUS_PARTIALLY_FILLED,
+        broker_order_id="working-entry",
+        tp=205.0,
+        sl=175.0,
+    )
+    broker = _growing_entry_broker(position_id, "working-entry")
+    position = db.get_option_position(position_id)
+    assert position is not None
+
+    actions = options_execution.watch_open_option_positions(
+        broker,
+        underlying_price_fetch=lambda _underlying: 170.0,  # below sl=175
+        option_price_fetch=lambda _symbol: 6.0,
+        now=_EXIT_AT,
+        positions=[position],
+    )
+
+    assert len(actions) == 1
+    assert actions[0].action == "close"
+    assert actions[0].reason == options_execution.EXIT_STOP_LOSS
+
+    # The working entry was cancelled and its final fill materialized, so the
+    # exit went out for the quantity actually held.
+    entry = db.get_pending_order("working-entry")
+    assert entry is not None
+    assert entry.lifecycle_status == STATUS_CANCELED
+    assert entry.filled_qty == 1.5
+    assert actions[0].order is not None
+    assert actions[0].order.qty == 1.5
+
+    closed = db.get_option_position(position_id)
+    assert closed is not None
+    assert closed.exit_reason == options_execution.EXIT_STOP_LOSS
+    assert closed.exit_price == 6.0
+
+
+def test_option_watcher_leaves_a_settled_entry_untouched(tmp_db: Path) -> None:
+    """The freeze is a no-op on the ordinary fully-filled path.
+
+    freeze_position_entry_intent short-circuits to "already_terminal" for a
+    settled entry, so no cancel is issued and the close is unchanged — this
+    pins that the fix did not disturb the common case.
+    """
+    position_id = _insert_linked_option(
+        entry_qty=2.0, entry_status=STATUS_FILLED, tp=205.0, sl=175.0,
+    )
+    broker = FakeBroker(auto_fill=True)
+    position = db.get_option_position(position_id)
+    assert position is not None
+
+    actions = options_execution.watch_open_option_positions(
+        broker,
+        underlying_price_fetch=lambda _underlying: 170.0,
+        option_price_fetch=lambda _symbol: 6.0,
+        now=_EXIT_AT,
+        positions=[position],
+    )
+
+    assert len(actions) == 1
+    assert actions[0].action == "close"
+    assert actions[0].order is not None
+    assert actions[0].order.qty == 2.0
+    entry = db.get_pending_order(f"entry-broker-{position_id}")
+    assert entry is not None
+    assert entry.lifecycle_status == STATUS_FILLED  # never cancelled
 
 
 class _PendingCancelBroker(FakeBroker):
