@@ -15,6 +15,7 @@ is annotated regardless.
 
 import argparse
 import os
+import re
 import sys
 import time
 from datetime import UTC, datetime
@@ -702,6 +703,10 @@ def check_earnings_risk(ticker):
         return "UNKNOWN"
 
 
+# "sec" as a standalone word — the regulator — never "second"/"sector"/"insecure".
+_SEC_MENTION = re.compile(r"\bsec\b")
+
+
 def check_news_risk(ticker):
     try:
         yesterday = (datetime.now() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
@@ -720,11 +725,25 @@ def check_news_risk(ticker):
             timeout=_HTTP_TIMEOUT_SECONDS,
             headers={"X-Api-Key": NEWSAPI_KEY},
         )
+        # requests does NOT raise on 4xx/5xx. An expired key (401), a free-tier
+        # rate limit (429) or an upgrade-required (426) returns an error BODY
+        # with no "articles" key, which fell through to [] -> "UNKNOWN" with
+        # nothing printed — so the news gate would be off for the entire
+        # watchlist, permanently and invisibly. Same class of bug as the
+        # Discord/Pushover one _warn_if_bad_status was written for.
+        if not 200 <= response.status_code < 300:
+            print(
+                f"  news risk check for {ticker}: NewsAPI HTTP "
+                f"{response.status_code} (news gate is OFF for this ticker)",
+                file=sys.stderr,
+            )
+            return "UNKNOWN"
+
         articles = response.json().get("articles", [])
         if not articles:
             return "UNKNOWN"
 
-        HIGH_RISK_WORDS   = ["crash", "lawsuit", "SEC", "fraud", "investigation",
+        HIGH_RISK_WORDS   = ["crash", "lawsuit", "fraud", "investigation",
                              "bankruptcy", "recall", "hack", "breach", "downgrade"]
         MEDIUM_RISK_WORDS = ["volatility", "uncertainty", "warning", "concern",
                              "miss", "disappoints", "selloff", "drop"]
@@ -732,7 +751,17 @@ def check_news_risk(ticker):
         medium_hits = []
 
         for article in articles:
-            headline = article.get("title", "").lower()
+            # `or ""`, not a get() default: NewsAPI sends "title": null for a
+            # removed article, and None.lower() raised into the outer except,
+            # downgrading the whole ticker's check to UNKNOWN.
+            headline = (article.get("title") or "").lower()
+            # "SEC" was in HIGH_RISK_WORDS as an uppercase literal tested against
+            # this lower-cased headline, so it could never match. It is matched
+            # here instead, on a WORD BOUNDARY: a plain "sec" substring would
+            # fire on "second", "sector" and "insecure", suppressing signals far
+            # more often than it caught a regulator.
+            if _SEC_MENTION.search(headline):
+                high_hits.append("SEC")
             for word in HIGH_RISK_WORDS:
                 if word in headline:
                     high_hits.append(word)
