@@ -110,6 +110,19 @@ def windowed_stats_for_pair(
     return _windowed_stats(rows)
 
 
+def windowed_stats_for_signal_type(
+    signal_type: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[int, float | None, float | None]:
+    """Windowed ACTIVE-book stats for a setup across every ticker."""
+    run_ts = now if now is not None else datetime.now(UTC)
+    cutoff = run_ts - timedelta(days=config.SP_WINDOW_DAYS)
+    return _windowed_stats(
+        db.get_resolved_signal_type_outcomes(signal_type, cutoff)
+    )
+
+
 def _propose(status: str, closed: int, expectancy: float | None) -> tuple[str, str]:
     """Per-pair proposal with hysteresis."""
     if closed < config.SP_MIN_CLOSED_SIGNALS:

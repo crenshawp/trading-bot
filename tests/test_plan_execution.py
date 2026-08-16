@@ -143,8 +143,8 @@ def test_check_authorization_restored_after_reauthorize(tmp_db: Path) -> None:
 
 
 def _swing_order(
-    *, ticker: str = "META", qty: float = 10.0, entry: float = 480.0,
-    est_cost: float = 600.0, dollar_risk: float = 150.0, side: str = "buy",
+    *, ticker: str = "META", qty: float = 40.0, entry: float = 480.0,
+    est_cost: float = 600.0, dollar_risk: float = 600.0, side: str = "buy",
     rank: int = 1, hold_deadline: datetime | None = None,
     signal_id: int | None = None,
 ) -> PlannedOrder:

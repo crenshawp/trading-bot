@@ -6,7 +6,7 @@ import dataclasses
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -310,7 +310,7 @@ def test_v30_typed_exit_duplicate_migration_fails_closed_then_restarts_cleanly(
         terminal_at=datetime(2026, 7, 20, 15, 2, tzinfo=UTC),
     )
     db.init_db()
-    assert db.schema_version() == 31
+    assert db.schema_version() == db.SCHEMA_VERSION
     assert len(db.get_pending_exit_orders_for_position("option", 73)) == 2
 
 
@@ -346,7 +346,7 @@ def test_v25_sentiment_migration_preserves_pending_order_and_legacy_trade(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 31
+    assert db.schema_version() == db.SCHEMA_VERSION
     assert db.get_pending_order("broker-order-1") == pending_before
     assert pending_before is not None and pending_before.id == pending_id
     legacy = db.get_trade_by_signal_id(signal_id)
@@ -387,7 +387,7 @@ def test_v26_indicator_migration_preserves_pending_order_and_legacy_trade(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 31
+    assert db.schema_version() == db.SCHEMA_VERSION
     assert db.get_pending_order("broker-order-1") == pending_before
     assert pending_before is not None and pending_before.id == pending_id
     legacy = db.get_trade_by_signal_id(signal_id)
@@ -429,7 +429,7 @@ def test_v27_risk_migration_preserves_pending_order_and_legacy_trade(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 31
+    assert db.schema_version() == db.SCHEMA_VERSION
     assert db.get_pending_order("broker-order-1") == pending_before
     assert pending_before is not None and pending_before.id == pending_id
     legacy = db.get_trade_by_signal_id(signal_id)
@@ -715,7 +715,7 @@ def test_option_position_round_trip_and_update_preserve_exit_reason(
     assert updated.exit_reason == "emergency_shutdown"
 
 
-def test_v28_option_position_migration_preserves_row_and_adds_null_exit_reason(
+def test_v28_option_position_migration_preserves_row_and_backfills_deadline(
     tmp_db: Path,
 ) -> None:
     position = OptionPosition(
@@ -741,9 +741,10 @@ def test_v28_option_position_migration_preserves_row_and_adds_null_exit_reason(
     db.init_db()
 
     assert db.get_option_position(position_id) == dataclasses.replace(
-        position, id=position_id
+        position, id=position_id,
+        deadline=position.opened_at + timedelta(days=30),
     )
-    assert db.schema_version() == 31
+    assert db.schema_version() == db.SCHEMA_VERSION
 
 
 def test_duplicate_broker_order_id_is_rejected(tmp_db: Path) -> None:
@@ -1258,7 +1259,7 @@ def test_v23_database_migrates_without_rewriting_existing_rows(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 31
+    assert db.schema_version() == db.SCHEMA_VERSION
     migrated = db.get_connection()
     try:
         sentinel = migrated.execute(
@@ -1434,7 +1435,7 @@ def test_v28_to_v30_migration_preserves_every_legacy_ledger_value(
     assert after_row["last_fill_at"] == "2026-07-20T15:00:00+00:00"
     assert after_row["last_fill_time_source"] == "observed"
     assert after_row["fees_dollars"] is None
-    assert db.schema_version() == 31
+    assert db.schema_version() == db.SCHEMA_VERSION
 
 
 def test_v24_pending_order_rows_migrate_collision_free_and_preserve_data(
@@ -1493,7 +1494,7 @@ def test_v24_pending_order_rows_migrate_collision_free_and_preserve_data(
     db.init_db()
     db.init_db()
 
-    assert db.schema_version() == 31
+    assert db.schema_version() == db.SCHEMA_VERSION
     first = db.get_pending_order("legacy-bound-7")
     second = db.get_pending_order("legacy-bound-11")
     third = db.get_pending_order("legacy-bound-15")
@@ -1668,7 +1669,7 @@ def test_concurrent_supported_initialization_serializes_without_data_loss(
     with ThreadPoolExecutor(max_workers=2) as executor:
         list(executor.map(lambda _: db.init_db(), range(2)))
 
-    assert db.schema_version() == 31
+    assert db.schema_version() == db.SCHEMA_VERSION
     pending = db.get_pending_order("legacy-atomic-7")
     assert pending is not None and pending.id == 7
     assert len(db.get_pending_orders()) == 1
@@ -1705,7 +1706,7 @@ def test_orphan_rebuild_staging_ledger_recovers_after_drop_before_rename(
 
     db.init_db()
 
-    assert db.schema_version() == 31
+    assert db.schema_version() == db.SCHEMA_VERSION
     pending = db.get_pending_order("legacy-atomic-7")
     assert pending is not None and pending.id == 7
     conn = db.get_connection()

@@ -6,12 +6,11 @@ illustrative fixture. Three boundaries are enforced by the query itself
 (``db.get_actionable_signals``), never left to downstream checks:
 
 1. RECENCY — only signals fired within ``config.CANDIDATE_RECENCY_HOURS``.
-2. CONSIDERED-ONCE — only signals with ``considered_at IS NULL``. When
-   ``mark_considered=True`` (the execute-bound pull), every matched signal is
-   stamped AT PULL TIME — before authorization, allocation, or submission — so
-   a signal is considered exactly once regardless of what the plan later did
-   with it. Phase 16's (ticker, pool) idempotency guard prevents double
-   EXECUTION; this flag prevents endless re-CONSIDERATION.
+2. CONSIDERED-ONCE — only signals with ``considered_at IS NULL``. Production
+   pulls are non-destructive; the execution caller stamps a candidate only
+   after a permanent filter decision or accepted/skipped execution. Capacity-
+   blocked and transiently failed candidates remain retryable until recency
+   expires.
 3. TRACK — shadow-tracked signals and signals whose paper trade already
    resolved are excluded; long-term entries (no trade row — they are tracked in
    ``long_term_positions``) flow through the LEFT JOIN.
@@ -33,7 +32,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from trading_bot import config, db, outcomes, signal_pairs
-from trading_bot.allocation import Candidate, route_pool
+from trading_bot.allocation import AllocationResult, Candidate, route_pool
 from trading_bot.models import is_hard_risk
 
 
@@ -63,6 +62,14 @@ def _to_candidate(
     _closed, _win_rate, expectancy = signal_pairs.windowed_stats_for_pair(
         ticker, signal_type, now=now,
     )
+    strategy_closed, _strategy_win_rate, strategy_expectancy = (
+        signal_pairs.windowed_stats_for_signal_type(signal_type, now=now)
+    )
+    strategy_enabled = not (
+        strategy_closed >= config.GLOBAL_SIGNAL_MIN_CLOSED
+        and strategy_expectancy is not None
+        and strategy_expectancy <= config.GLOBAL_SIGNAL_MIN_EXPECTANCY
+    )
     rsi = row["trade_ind_rsi"] if row["trade_ind_rsi"] is not None else row["rsi"]
     candidate = Candidate(
         ticker=ticker,
@@ -72,6 +79,7 @@ def _to_candidate(
         entry=float(row["entry_price"]),
         atr=row["atr"],
         ticker_active=watchlist.get(ticker, "active") == "active",
+        strategy_enabled=strategy_enabled,
         pair_enabled=db.get_signal_pair_status(ticker, signal_type) == "enabled",
         # Only the existing hard-equivalent HIGH grade blocks. MEDIUM/LOW/
         # UNKNOWN are persisted advisory context and remain non-blocking.
@@ -113,13 +121,9 @@ def live_candidates(
     supersedes its older sibling — and maps each row into the exact
     :class:`allocation.Candidate` shape.
 
-    ``mark_considered=True`` stamps EVERY matched signal (including older
-    duplicates superseded by the dedupe — they were pulled too) the moment they
-    are pulled, per the locked Phase 17 design: planned-but-not-executed,
-    filtered, skipped, or unauthorized signals are all consumed exactly once
-    and never re-planned indefinitely. Preview paths (``allocate plan``,
-    ``execute`` without ``--confirm``) pass False so reviewing a plan does not
-    consume the signals the confirmed run needs.
+    ``mark_considered=True`` remains available for explicit administrative
+    consumption. The production executor passes False and consumes
+    ``Candidate.source_signal_ids`` only after it knows the handling outcome.
     """
     moment = now if now is not None else datetime.now(UTC)
     hours = window_hours if window_hours is not None else config.CANDIDATE_RECENCY_HOURS
@@ -131,11 +135,61 @@ def live_candidates(
 
     watchlist = _watchlist_status_map()
     candidates: list[Candidate] = []
+    source_ids: dict[tuple[str, str], list[int]] = {}
+    for row in rows:
+        key = (str(row["ticker"]), str(row["signal_type"]))
+        source_ids.setdefault(key, []).append(int(row["id"]))
     seen: set[tuple[str, str]] = set()
     for row in rows:                       # newest first — first wins the dedupe
         key = (str(row["ticker"]), str(row["signal_type"]))
         if key in seen:
             continue
         seen.add(key)
-        candidates.append(_to_candidate(row, watchlist, moment))
+        candidates.append(dataclasses.replace(
+            _to_candidate(row, watchlist, moment),
+            source_signal_ids=tuple(source_ids[key]),
+        ))
     return candidates
+
+
+def mark_final_candidates(
+    candidates: list[Candidate],
+    result: AllocationResult,
+    execution_run: Any | None = None,
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Durably consume only permanent filters and accepted/skipped orders.
+
+    Allocation-capacity skips, authorization pauses, rejections, and transport
+    errors remain retryable. Returns the number of newly stamped signal rows.
+    """
+    candidate_by_key = {(c.ticker, c.signal_type): c for c in candidates}
+    candidate_by_id = {
+        c.signal_id: c for c in candidates if c.signal_id is not None
+    }
+    final_candidates = {
+        candidate_by_key[(skip.ticker, skip.signal_type)]
+        for skip in result.skipped
+        if skip.stage == "filter"
+        and (skip.ticker, skip.signal_type) in candidate_by_key
+    }
+    if execution_run is not None:
+        for execution in execution_run.executions:
+            if execution.status not in {"submitted", "skipped"}:
+                continue
+            candidate = candidate_by_id.get(execution.order.signal_id)
+            if candidate is not None:
+                final_candidates.add(candidate)
+
+    signal_ids = sorted({
+        signal_id
+        for candidate in final_candidates
+        for signal_id in (
+            candidate.source_signal_ids
+            or (() if candidate.signal_id is None else (candidate.signal_id,))
+        )
+    })
+    if not signal_ids:
+        return 0
+    return db.mark_signals_considered(signal_ids, now or datetime.now(UTC))

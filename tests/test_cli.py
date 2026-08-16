@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
+from trading_bot import db
 from trading_bot.__main__ import main
 
 
@@ -22,13 +23,13 @@ def _run(argv: list[str]) -> None:
 def test_cli_db_init_prints_version(tmp_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _run(["db", "init"])
     out = capsys.readouterr().out
-    assert "Schema version: 31" in out
+    assert f"Schema version: {db.SCHEMA_VERSION}" in out
 
 
 def test_cli_db_status_shows_counts(tmp_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _run(["db", "status"])
     out = capsys.readouterr().out
-    assert "Schema version: 31" in out
+    assert f"Schema version: {db.SCHEMA_VERSION}" in out
     assert "signals" in out
     assert "trades" in out
     assert "daily_performance" in out

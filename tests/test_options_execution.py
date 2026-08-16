@@ -72,6 +72,22 @@ def test_select_contract_in_band_but_insufficient_dte() -> None:
     assert oe.select_contract("call", [_contract(0.70, dte=5)], ref_date=_REF) is None
 
 
+def test_select_contract_rejects_leaps_outside_swing_window() -> None:
+    assert oe.select_contract(
+        "call", [_contract(0.70, dte=config.MAX_DTE + 1)], ref_date=_REF,
+    ) is None
+
+
+def test_select_contract_prefers_target_dte_when_delta_ties() -> None:
+    got = oe.select_contract(
+        "call",
+        [_contract(0.70, dte=55), _contract(0.70, dte=config.TARGET_DTE)],
+        ref_date=_REF,
+    )
+    assert got is not None
+    assert got.expiry == (_REF + timedelta(days=config.TARGET_DTE)).isoformat()
+
+
 # ───────────────────────── selection orientation + preference ────────────────
 
 
@@ -107,10 +123,9 @@ def test_select_contract_undersized_band_widens_down() -> None:
 
 def test_cost_for_contract_applies_multiplier() -> None:
     c = _contract(0.70, bid=4.9, ask=5.1)   # mid == 5.0
-    # 5.0 premium * 100 multiplier * 2 contracts == 1000. A 100x bug would give
-    # 10 (no multiplier) or 100000 — this pins the multiplier in place.
-    assert oe.cost_for_contract(c, 2) == 1000.0
-    assert oe.cost_for_contract(c, 1) == 500.0
+    # Entries submit at the ask, so sizing must use that same executable price.
+    assert oe.cost_for_contract(c, 2) == 1020.0
+    assert oe.cost_for_contract(c, 1) == 510.0
 
 
 def test_cost_for_contract_none_without_premium() -> None:
@@ -125,13 +140,13 @@ def test_cost_for_contract_none_without_premium() -> None:
 
 
 def test_choose_execution_full_option() -> None:
-    # mid 5.0 -> $500/contract; $600 capital fits one full-band contract.
+    # ask 5.1 -> $510/contract; $600 capital fits one full-band contract.
     contracts = [_contract(0.70)]
     dec = oe.choose_execution(
         "call", 600.0, "AAPL", 100.0, contracts, ref_date=_REF,
     )
     assert dec.vehicle == oe.VEHICLE_OPTION_FULL
-    assert dec.qty == 1.0 and dec.est_cost == 500.0
+    assert dec.qty == 1.0 and dec.est_cost == 510.0
     assert dec.side == "buy"
 
 
@@ -156,6 +171,27 @@ def test_choose_execution_falls_back_to_shares_when_no_contract_fits() -> None:
     assert dec.vehicle == oe.VEHICLE_SHARES
     assert dec.qty == 3.0            # $300 / $100 underlying = 3 fractional shares
     assert dec.symbol == "AAPL"
+
+
+def test_option_risk_budget_is_separate_from_shares_position_value() -> None:
+    dec = oe.choose_execution(
+        "call",
+        300.0,  # maximum premium loss
+        "AAPL",
+        100.0,
+        [_contract(0.70)],  # one contract costs $500, so it cannot fit
+        ref_date=_REF,
+        shares_capital=2_000.0,
+    )
+    assert dec.vehicle == oe.VEHICLE_SHARES
+    assert dec.est_cost == 2_000.0
+    assert dec.qty == 20.0
+
+
+def test_option_market_hours_guard() -> None:
+    assert oe.is_option_market_open(datetime(2026, 7, 10, 15, 0, tzinfo=UTC))
+    assert not oe.is_option_market_open(datetime(2026, 7, 11, 15, 0, tzinfo=UTC))
+    assert not oe.is_option_market_open(datetime(2026, 7, 10, 22, 0, tzinfo=UTC))
 
 
 def test_choose_execution_options_unavailable_routes_to_shares() -> None:

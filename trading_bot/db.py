@@ -11,7 +11,7 @@ import json
 import sqlite3
 import time
 from collections.abc import Mapping, Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -87,7 +87,8 @@ from trading_bot.models import (
 # Version 3 (Phase 2.2) — adds trades.vix_level + trades.vix_band + vix_snapshots.
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
 # Version 31 (cross-cutting audit): one nonterminal typed exit per position.
-SCHEMA_VERSION = 31
+# Version 32 (production hardening): backfill missing option hold deadlines.
+SCHEMA_VERSION = 32
 
 
 class PendingExitAlreadyExistsError(RuntimeError):
@@ -1865,6 +1866,54 @@ def _migrate_to_v31(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_to_v32(conn: sqlite3.Connection) -> None:
+    """Backfill a time stop for legacy option positions.
+
+    Phase 20 began carrying the originating signal deadline into newly-created
+    option rows, but positions opened before that cutover retained ``NULL`` and
+    therefore had no reachable time exit.  Derive exactly the same deadline as
+    the candidate path: signal fire time plus its captured hold estimate, with
+    the resolver's stock default for older signals that predate that field.
+
+    This migration changes no broker/order truth.  It only makes an overdue
+    position eligible for the ordinary watcher, which still requires a fresh
+    quote, an open options market, and actual broker fill evidence before the
+    position can close.
+    """
+    rows = conn.execute(
+        """
+        SELECT option_positions.id,
+               option_positions.opened_at,
+               signals.timestamp AS signal_timestamp,
+               signals.hold_estimate_days
+        FROM option_positions
+        LEFT JOIN signals ON signals.id = option_positions.signal_id
+        WHERE option_positions.deadline IS NULL
+          AND (option_positions.outcome IS NULL OR option_positions.outcome = 'open')
+        """
+    ).fetchall()
+    for row in rows:
+        raw_start = row["signal_timestamp"] or row["opened_at"]
+        try:
+            start = datetime.fromisoformat(str(raw_start))
+        except (TypeError, ValueError):
+            # An unreadable legacy timestamp must stay visible as NULL rather
+            # than inventing an exit time.  Normal runtime diagnostics will
+            # continue to surface it for operator repair.
+            continue
+        raw_days = row["hold_estimate_days"]
+        try:
+            parsed_days = int(raw_days) if raw_days is not None else 0
+        except (TypeError, ValueError):
+            parsed_days = 0
+        days = parsed_days if parsed_days > 0 else 30
+        deadline = start + timedelta(days=days)
+        conn.execute(
+            "UPDATE option_positions SET deadline = ? WHERE id = ?",
+            (deadline.isoformat(), int(row["id"])),
+        )
+
+
 _PENDING_ORDER_STAGING_TABLES: tuple[str, ...] = (
     "pending_orders_v25",
     "pending_orders_v29",
@@ -1965,6 +2014,7 @@ def init_db() -> None:
             _migrate_to_v29(conn)
             _migrate_to_v30(conn)
             _migrate_to_v31(conn)
+            _migrate_to_v32(conn)
             cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
             row = cur.fetchone()
             if row is None:
@@ -3634,6 +3684,39 @@ def get_resolved_outcomes(
     finally:
         conn.close()
     return [(str(r["outcome"]), r["pnl_pct"]) for r in rows]
+
+
+def get_resolved_signal_type_outcomes(
+    signal_type: str,
+    since: datetime,
+    *,
+    track_mode: str = "active",
+) -> list[tuple[str, float | None]]:
+    """Recent decided outcomes for one setup across all tickers.
+
+    The execution-level family gate deliberately reads the active book so
+    shadow recovery data cannot make a losing live strategy executable before
+    its live evidence has recovered.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT trades.outcome AS outcome, trades.pnl_pct AS pnl_pct
+            FROM trades
+            JOIN signals ON signals.id = trades.signal_id
+            WHERE trades.outcome IN ('win','loss')
+              AND trades.closed_at IS NOT NULL
+              AND trades.closed_at >= ?
+              AND trades.track_mode = ?
+              AND signals.signal_type = ?
+            ORDER BY trades.closed_at ASC
+            """,
+            (since.isoformat(), track_mode, signal_type),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [(str(row["outcome"]), row["pnl_pct"]) for row in rows]
 
 
 def get_resolved_shadow_outcomes(

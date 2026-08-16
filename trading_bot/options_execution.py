@@ -20,7 +20,8 @@ from __future__ import annotations
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time
+from zoneinfo import ZoneInfo
 
 from trading_bot import config, db, order_lifecycle, risk_of_ruin
 from trading_bot.broker.base import ORDER_TYPE_LIMIT, TIF_DAY, Broker, OrderResult
@@ -35,6 +36,24 @@ VEHICLE_OPTION_FULL = "option_full"
 VEHICLE_OPTION_UNDERSIZED = "option_undersized"
 VEHICLE_SHARES = "shares"
 VEHICLE_NONE = "none"
+
+_ET = ZoneInfo("America/New_York")
+
+
+def is_option_market_open(now: datetime) -> bool:
+    """Whether regular US options trading is open at ``now``.
+
+    Alpaca does not support extended-hours option execution.  The scanner uses
+    this guard before requesting an exit quote or submitting a DAY order, so a
+    weekend/overnight watcher cannot queue a stale limit for the next session.
+    """
+    from trading_bot.outcomes import is_stock_session
+
+    local = now.astimezone(_ET)
+    return (
+        is_stock_session(local.date())
+        and time(9, 30) <= local.time().replace(tzinfo=None) < time(16, 0)
+    )
 
 
 def _dte(expiry: str, ref_date: date) -> int | None:
@@ -66,6 +85,8 @@ def select_contract(
     delta_low: float = config.TARGET_DELTA_LOW,
     delta_high: float = config.TARGET_DELTA_HIGH,
     min_dte: int = config.MIN_DTE,
+    max_dte: int = config.MAX_DTE,
+    target_dte: int = config.TARGET_DTE,
     min_open_interest: int = config.MIN_OPEN_INTEREST,
     max_spread_pct: float = config.MAX_SPREAD_PCT,
 ) -> OptionContract | None:
@@ -89,7 +110,7 @@ def select_contract(
         if d is None or not (delta_low <= abs(d) <= delta_high):
             continue
         dte = _dte(c.expiry, ref_date)
-        if dte is None or dte < min_dte:
+        if dte is None or not (min_dte <= dte <= max_dte):
             continue
         if not _passes_liquidity(c, min_open_interest, max_spread_pct):
             continue
@@ -97,15 +118,26 @@ def select_contract(
 
     if not qualifying:
         return None
-    return min(qualifying, key=lambda t: abs(t[0] - centre))[1]
+    return min(
+        qualifying,
+        key=lambda item: (
+            abs(item[0] - centre),
+            abs((_dte(item[1].expiry, ref_date) or target_dte) - target_dte),
+        ),
+    )[1]
 
 
 # ── cost model (every calc routes through OPTION_MULTIPLIER) ──────────────────
 
 
 def _premium(contract: OptionContract) -> float | None:
-    """The per-share premium to size against: prefer mid, then ask, then bid."""
-    for price in (contract.mid, contract.ask, contract.bid):
+    """Executable buy premium used for sizing: prefer ask, then mid, then bid.
+
+    Sizing at midpoint while submitting at the ask can exceed the risk budget
+    before the order even leaves the process. The ask is therefore the first
+    usable price for a long-option entry.
+    """
+    for price in (contract.ask, contract.mid, contract.bid):
         if price is not None and price > 0.0:
             return price
     return None
@@ -121,7 +153,7 @@ def cost_for_contract(contract: OptionContract, qty: float) -> float | None:
     premium = _premium(contract)
     if premium is None:
         return None
-    return premium * config.OPTION_MULTIPLIER * qty
+    return round(premium * config.OPTION_MULTIPLIER * qty, 2)
 
 
 # ── execution hierarchy: full option → undersized option → shares ────────────
@@ -169,11 +201,11 @@ def _size_option(
     premium = _premium(contract)
     if premium is None:
         return None
-    per_contract = premium * config.OPTION_MULTIPLIER
+    per_contract = round(premium * config.OPTION_MULTIPLIER, 2)
     qty = int(allocated_capital // per_contract)   # floor to whole contracts
     if qty < 1:
         return None
-    est_cost = per_contract * qty
+    est_cost = round(per_contract * qty, 2)
     if est_cost < min_dollar_risk:
         return None
     return ExecutionDecision(
@@ -212,6 +244,7 @@ def choose_execution(
     ref_date: date,
     options_available: bool = True,
     min_dollar_risk: float = config.MIN_DOLLAR_RISK,
+    shares_capital: float | None = None,
 ) -> ExecutionDecision:
     """Pick the execution vehicle for an allocated swing candidate.
 
@@ -251,7 +284,10 @@ def choose_execution(
             file=sys.stderr,
         )
     return _shares_decision(
-        direction, underlying, underlying_price, allocated_capital,
+        direction,
+        underlying,
+        underlying_price,
+        allocated_capital if shares_capital is None else shares_capital,
     )
 
 

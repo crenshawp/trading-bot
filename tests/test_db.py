@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from trading_bot import db
-from trading_bot.models import DailyPerf, Signal, Trade
+from trading_bot.models import DailyPerf, OptionPosition, Signal, Trade
 
 
 def _make_signal(**overrides: Any) -> Signal:
@@ -30,11 +30,42 @@ def _make_signal(**overrides: Any) -> Signal:
 def test_init_db_is_idempotent(tmp_db: Path) -> None:
     db.init_db()  # tmp_db already called init_db once; second call must not error
     db.init_db()
-    assert db.schema_version() == 31
+    assert db.schema_version() == db.SCHEMA_VERSION
 
 
 def test_schema_version_is_1_after_init(tmp_db: Path) -> None:
-    assert db.schema_version() == 31
+    assert db.schema_version() == db.SCHEMA_VERSION
+
+
+def test_v32_backfills_missing_open_option_deadline_from_signal_window(
+    tmp_db: Path,
+) -> None:
+    fired = datetime(2026, 8, 3, 9, 31)
+    sid = db.insert_signal(_make_signal(timestamp=fired, hold_estimate_days=3))
+    position_id = db.insert_option_position(OptionPosition(
+        signal_id=sid,
+        order_id="paper-order",
+        symbol="GOOGL270115C00200000",
+        underlying="GOOGL",
+        option_type="call",
+        strike=200.0,
+        expiry="2027-01-15",
+        contracts=1.0,
+        opened_at=fired,
+        outcome="open",
+        deadline=None,
+    ))
+
+    conn = db.get_connection()
+    try:
+        db._migrate_to_v32(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+    migrated = db.get_option_position(position_id)
+    assert migrated is not None
+    assert migrated.deadline == fired + timedelta(days=3)
 
 
 # ---- signals ----

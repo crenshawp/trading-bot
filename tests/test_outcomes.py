@@ -723,7 +723,7 @@ def test_deadline_covering_candle_must_be_closed_before_expiry(
 @pytest.mark.parametrize(
     ("asset_class", "interval", "step", "candle_count", "last_close"),
     [
-        ("stock", "1d", timedelta(days=1), 1, 101.0),
+        ("stock", "1h", timedelta(hours=1), 24, 101.0),
         ("crypto", "1h", timedelta(hours=1), 24, 102.0),
     ],
 )
@@ -795,6 +795,47 @@ def test_forming_in_window_candle_cannot_resolve_trade(
 
     assert resolved.outcome == "open"
     assert resolved.exit_price is None
+
+
+def test_friday_open_with_monday_morning_deadline_settles_from_friday_session(
+    tmp_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Friday 09:31 ET signal with a three-calendar-day hold expires Monday
+    before Monday's close.  Friday is valid post-entry evidence and must not
+    enter the old ``required_session=None`` retry loop."""
+    opened = datetime(2026, 7, 24, 9, 31, tzinfo=_ET)
+    deadline = opened + timedelta(days=3)
+    sid = _make_signal(hold_estimate_days=3)
+    tid = _make_trade(sid, opened_at=opened)
+    friday_after_entry = pd.DataFrame(
+        {
+            "High": [105.0, 106.0],
+            "Low": [98.0, 99.0],
+            "Close": [101.0, 102.0],
+        },
+        index=pd.DatetimeIndex(
+            [
+                datetime(2026, 7, 24, 10, 30, tzinfo=_ET),
+                datetime(2026, 7, 24, 15, 0, tzinfo=_ET),
+            ]
+        ),
+    )
+    _patch_yf(monkeypatch, friday_after_entry)
+    trade = next(candidate for candidate in db.get_open_trades() if candidate.id == tid)
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None
+
+    resolved = outcomes.resolve_trade(
+        trade,
+        signal,
+        now=deadline + timedelta(hours=1),
+    )
+
+    assert deadline.weekday() == 0
+    assert resolved.outcome == "expired"
+    assert resolved.closed_at == deadline.astimezone(UTC)
+    assert resolved.exit_price == 102.0
 
 
 @pytest.mark.parametrize(

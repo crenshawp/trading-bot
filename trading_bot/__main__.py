@@ -15,6 +15,7 @@ from trading_bot import (
     db,
     discovery,
     discovery_universe,
+    execution_exposure,
     long_term,
     marketdata_compare,
     outcomes,
@@ -1459,9 +1460,7 @@ def cmd_broker_reconcile() -> None:
 # ---- allocate CLI (Phase 12 plan / Phase 16 execute) ----
 
 
-def _build_live_plan(
-    *, sample: bool = False, mark_considered: bool = False,
-) -> tuple[
+def _build_live_plan(*, sample: bool = False) -> tuple[
     broker.AccountInfo, list[allocation.Candidate],
     allocation.AllocationResult, str,
 ]:
@@ -1471,28 +1470,51 @@ def _build_live_plan(
 
     Phase 17: candidates default to the bot's LIVE fired signals
     (``candidate_source.live_candidates``); ``sample=True`` keeps the labelled
-    illustrative fixture available for demos. ``mark_considered`` is passed
-    through to the live source — True only on the execute-bound pull (the
-    ``--confirm`` run), so previews never consume signals.
+    illustrative fixture available for demos. Pulling is non-destructive; a
+    confirmed executor consumes only durable final handling outcomes.
     """
-    account = broker.AlpacaBroker().get_account()
+    broker_client = broker.AlpacaBroker()
+    account = broker_client.get_account()
+    existing_exposure: allocation.ExistingExposure | None = None
+    exposure_error = ""
     if sample:
         candidates = allocation.sample_candidates()
         source_label = "illustrative SAMPLE set (--sample)"
     else:
         candidates = candidate_source.live_candidates(
-            mark_considered=mark_considered,
+            mark_considered=False,
         )
+        exposure_result = execution_exposure.build_existing_exposure(
+            account,
+            broker_client.get_positions(),
+            db.get_open_option_positions(),
+            db.get_open_long_term_positions(),
+            db.get_nonterminal_pending_orders(),
+        )
+        existing_exposure = exposure_result.exposure
+        if not exposure_result.ok or existing_exposure is None:
+            exposure_error = exposure_result.reason or "exposure unavailable"
         source_label = (
             f"live fired signals (last {config.CANDIDATE_RECENCY_HOURS}h, "
             "unconsidered)"
         )
     # Phase 15: the risk-of-ruin gate — a revoked new_position_entry capability
     # yields an entries-empty plan (existing positions' watchers run regardless).
-    result = allocation.build_plan(
-        candidates, account,
-        entry_authorized=risk_of_ruin.is_entry_authorized(),
-    )
+    if exposure_error:
+        result = allocation.AllocationResult(
+            ok=False,
+            plan=allocation.ExecutionPlan(),
+            note=(
+                "account unavailable or existing exposure unavailable: "
+                f"{exposure_error}"
+            ),
+        )
+    else:
+        result = allocation.build_plan(
+            candidates, account,
+            entry_authorized=risk_of_ruin.is_entry_authorized(),
+            existing_exposure=existing_exposure,
+        )
     return account, candidates, result, source_label
 
 
@@ -1568,9 +1590,9 @@ def cmd_allocate_execute(*, confirm: bool, sample: bool = False) -> None:
     ``plan_execution.execute_plan`` and prints what was submitted / rejected /
     skipped.
 
-    Phase 17: the plan is built from LIVE fired signals, and the ``--confirm``
-    pull is the one that marks them considered — a signal enters a submitting
-    plan exactly once, whatever that plan later does with it.
+    Phase 17: the plan is built from LIVE fired signals. Confirmed execution
+    consumes permanent filters and accepted/already-executed orders; transient
+    rejection and capacity skips remain retryable.
     """
     # The sample fixture is for plan/demo inspection only.  Refuse this flag
     # combination before constructing an Alpaca client so fabricated candidates
@@ -1582,9 +1604,7 @@ def cmd_allocate_execute(*, confirm: bool, sample: bool = False) -> None:
         print("    python -m trading_bot allocate plan --sample")
         return
 
-    account, candidates, result, source_label = _build_live_plan(
-        sample=sample, mark_considered=confirm,
-    )
+    account, candidates, result, source_label = _build_live_plan(sample=sample)
 
     if not confirm:
         _print_allocation_result(candidates, result, source_label)
@@ -1596,6 +1616,7 @@ def cmd_allocate_execute(*, confirm: bool, sample: bool = False) -> None:
 
     print("PLAN EXECUTION  (Phase 16 - operator-confirmed, Alpaca PAPER)")
     print("-" * 84)
+    candidate_source.mark_final_candidates(candidates, result)
     if not result.ok:
         print(f"  Nothing to execute: {result.note}")
         return
@@ -1610,6 +1631,7 @@ def cmd_allocate_execute(*, confirm: bool, sample: bool = False) -> None:
         option_chain_fetch=chain_fetch,
         options_available=options_available,
     )
+    candidate_source.mark_final_candidates(candidates, result, run)
 
     if not run.ok:
         print(f"  EXECUTION REFUSED - {run.note}")

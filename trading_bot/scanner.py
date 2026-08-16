@@ -43,7 +43,9 @@ from trading_bot import (
     regime,
     risk,
     risk_of_ruin,
+    self_optimization,
     settings,
+    shadow_discovery,
     vix,
 )
 from trading_bot import (
@@ -1563,16 +1565,38 @@ def _run_allocation_execution_cycle() -> None:
     checks risk_of_ruin.is_entry_authorized() internally — do not duplicate that
     check here."""
     try:
-        from trading_bot import allocation, candidate_source, plan_execution
+        from trading_bot import (
+            allocation,
+            candidate_source,
+            execution_exposure,
+            plan_execution,
+        )
         from trading_bot.broker import AlpacaBroker, AlpacaOptionsClient
 
         broker_client = AlpacaBroker()
         account = broker_client.get_account()
-        candidates = candidate_source.live_candidates(mark_considered=True)
+        exposure_result = execution_exposure.build_existing_exposure(
+            account,
+            broker_client.get_positions(),
+            db.get_open_option_positions(),
+            db.get_open_long_term_positions(),
+            db.get_nonterminal_pending_orders(),
+        )
+        if not exposure_result.ok or exposure_result.exposure is None:
+            print(
+                "  allocation execute: exposure unavailable - new entries "
+                f"deferred ({exposure_result.reason})",
+                file=sys.stderr,
+            )
+            return
+
+        candidates = candidate_source.live_candidates(mark_considered=False)
         result = allocation.build_plan(
             candidates, account,
             entry_authorized=risk_of_ruin.is_entry_authorized(),
+            existing_exposure=exposure_result.exposure,
         )
+        candidate_source.mark_final_candidates(candidates, result)
         if not result.ok:
             print(f"  allocation execute: nothing to execute ({result.note})")
             return
@@ -1583,6 +1607,7 @@ def _run_allocation_execution_cycle() -> None:
             option_chain_fetch=AlpacaOptionsClient().get_option_chain,
             options_available=options_available,
         )
+        candidate_source.mark_final_candidates(candidates, result, run)
         if not run.ok:
             print(f"  allocation execute: refused ({run.note})", file=sys.stderr)
             return
@@ -1599,7 +1624,7 @@ def _run_allocation_execution_cycle() -> None:
 
 
 def _build_option_price_fetch(option_book):
-    """A ``symbol -> mid`` fetcher for the open option book.
+    """A ``symbol -> executable bid`` fetcher for the open option book.
 
     ``watch_open_option_positions`` is handed only the OCC symbol, but a chain
     is fetched per UNDERLYING — so the mapping is taken from the open book and
@@ -1622,8 +1647,11 @@ def _build_option_price_fetch(option_book):
                 chain = client.get_option_chain(underlying)
                 if chain.ok:
                     for contract in chain.contracts:
-                        if contract.mid is not None and contract.mid > 0:
-                            quotes[contract.symbol] = float(contract.mid)
+                        # Watcher exits SELL long contracts. A midpoint limit
+                        # can rest indefinitely during a stop or deadline; the
+                        # current bid is the marketable, bounded limit.
+                        if contract.bid is not None and contract.bid > 0:
+                            quotes[contract.symbol] = float(contract.bid)
                 else:
                     print(
                         f"  exit watcher: option chain unavailable for "
@@ -1640,6 +1668,34 @@ def _build_option_price_fetch(option_book):
     return fetch
 
 
+def _build_latest_price_fetch(tickers):
+    """Batch current stock/crypto quote mids into a fail-soft price fetcher."""
+    from trading_bot.alpaca_market_data import AlpacaMarketDataClient
+
+    client = AlpacaMarketDataClient()
+    prices: dict[str, float] = {}
+    stocks = sorted({ticker for ticker in tickers if not ticker.endswith("-USD")})
+    crypto = sorted({ticker for ticker in tickers if ticker.endswith("-USD")})
+    results = []
+    if stocks:
+        results.append(client.get_stock_latest_quotes(stocks))
+    if crypto:
+        results.append(client.get_crypto_latest_quotes(crypto))
+    for result in results:
+        if not result.ok:
+            print(
+                f"  exit watcher: latest quotes unavailable ({result.reason})",
+                file=sys.stderr,
+            )
+            continue
+        for ticker, quote in result.quotes.items():
+            bid = float(quote.bid_price)
+            ask = float(quote.ask_price)
+            if bid > 0.0 and ask > 0.0:
+                prices[ticker] = (bid + ask) / 2.0
+    return prices.get
+
+
 def _emergency_price_fetchers():
     """``(option_price_fetch, long_term_price_fetch)`` for a Tier-2 shutdown.
 
@@ -1650,11 +1706,15 @@ def _emergency_price_fetchers():
     "unknown", which the exit submitter refuses loudly instead of guessing."""
     try:
         option_book = db.get_open_option_positions()
+        long_term_book = db.get_open_long_term_positions()
     except Exception as exc:
         print(f"  emergency pricing: option book unreadable ({exc})",
               file=sys.stderr)
-        return (lambda _symbol: None), get_exit_last_price
-    return _build_option_price_fetch(option_book), get_exit_last_price
+        return (lambda _symbol: None), (lambda _ticker: None)
+    return (
+        _build_option_price_fetch(option_book),
+        _build_latest_price_fetch(p.ticker for p in long_term_book),
+    )
 
 
 def _run_exit_watcher_cycle() -> None:
@@ -1675,13 +1735,21 @@ def _run_exit_watcher_cycle() -> None:
 
         option_book = db.get_open_option_positions()
         option_actions = []
-        if option_book:
+        if option_book and options_execution.is_option_market_open(now):
             option_actions = options_execution.watch_open_option_positions(
                 broker,
-                underlying_price_fetch=get_exit_last_price,
+                underlying_price_fetch=_build_latest_price_fetch(
+                    p.underlying for p in option_book
+                ),
                 option_price_fetch=_build_option_price_fetch(option_book),
                 now=now,
                 positions=option_book,
+            )
+        elif option_book:
+            print(
+                f"[{datetime.now().strftime('%H:%M:%S')}] exit watchers: "
+                f"options market closed - deferred {len(option_book)} option "
+                "position(s) until a fresh regular-session quote is available"
             )
         lt_actions = long_term.watch_long_term_positions(
             broker, price_fetch=get_exit_price_history, now=now,
@@ -1720,6 +1788,40 @@ def _run_evaluator_cycle() -> None:
     except Exception as exc:
         import sys
         print(f"  evaluator cycle error: {exc}", file=sys.stderr)
+
+
+def _run_shadow_evaluation_cycle() -> None:
+    """Evaluate live shadow outcomes and promote eligible candidates."""
+    try:
+        evaluations = shadow_discovery.evaluate_shadow_universe()
+        promoted = sum(e.promoted for e in evaluations)
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] shadow evaluation: "
+            f"{len(evaluations)} candidate(s), {promoted} promoted"
+        )
+    except Exception as exc:
+        print(f"  shadow evaluation cycle error: {exc}", file=sys.stderr)
+
+
+def _run_optimization_cycle() -> None:
+    """Persist the daily flags-only degradation and feature evaluation."""
+    try:
+        if not readiness.is_ready("self_optimization"):
+            print(
+                "  self-optimization dormant: below readiness threshold",
+                file=sys.stderr,
+            )
+            return
+        payload = self_optimization.run_optimization()
+        run_id = self_optimization.persist_run(payload)
+        degradations = payload.get("degradations", [])
+        flags = sum(item.get("verdict") == "degrading" for item in degradations)
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] self-optimization: "
+            f"persisted run {run_id}, {flags} degradation flag(s)"
+        )
+    except Exception as exc:
+        print(f"  self-optimization cycle error: {exc}", file=sys.stderr)
 
 
 def _run_daily_perf_update() -> None:
@@ -2522,9 +2624,14 @@ def main() -> None:
     # orders but has no submission path, preserving the operator-confirmed
     # boundary for every new opening order.
     _run_order_lifecycle_cycle()
+    # Settle any trades that matured while the service was restarting before
+    # readiness and strategy gates read their sample counts.
+    _run_outcome_resolver()
     # Evaluate readiness once at boot so a capability already over threshold is
     # announced promptly (idempotent — the one-time flag prevents re-notifying).
     _run_readiness_evaluation()
+    _run_shadow_evaluation_cycle()
+    _run_optimization_cycle()
 
     # Stock scan — once per day at 9:31am EST
     schedule.every().day.at("09:31").do(_never_raise(scan_stocks))
@@ -2578,6 +2685,14 @@ def main() -> None:
     # (already authorized to auto-act per Phase 10) actually run each day.
     _never_raise(_run_evaluator_cycle)()
     schedule.every().day.at("09:40").do(_never_raise(_run_evaluator_cycle))
+
+    # Complete the self-managing loop: promotion evaluates after the pair/
+    # watchlist state machines, and optimization persists a nightly flags-only
+    # diagnostic after the US session.
+    schedule.every().day.at("09:42").do(
+        _never_raise(_run_shadow_evaluation_cycle)
+    )
+    schedule.every().day.at("20:45").do(_never_raise(_run_optimization_cycle))
 
     # Materialize yesterday's daily_performance row daily at 00:30 UTC
     # (~20:30 ET, well after market close and the hourly resolver). Phase 1.4.

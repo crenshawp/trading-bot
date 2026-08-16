@@ -34,8 +34,13 @@ from trading_bot.symbol_utils import to_yfinance_symbol
 _DEFAULT_HOLD_DAYS_STOCK = 30
 _DEFAULT_HOLD_DAYS_CRYPTO = 14
 
-# yfinance interval per asset class.
-_INTERVAL_STOCK = "1d"
+# yfinance interval per asset class.  Stock signals are opened just after the
+# bell and commonly have 1-5 calendar-day holds.  Daily bars cannot represent
+# that lifecycle safely: a Friday signal whose deadline is Monday morning has
+# no *daily* candle timestamp after the open and before the deadline, so the old
+# resolver retried it forever.  Hourly bars provide post-entry evidence while
+# remaining available for the full live-settlement horizon.
+_INTERVAL_STOCK = "1h"
 _INTERVAL_CRYPTO = "1h"
 
 _ET = ZoneInfo("America/New_York")
@@ -220,8 +225,13 @@ def _last_closed_stock_session_in_window(
     """Latest daily-bar session label authorized by the hold window."""
     candidate = deadline.astimezone(_ET).date()
     while True:
-        label_time = datetime.combine(candidate, time.min, tzinfo=_ET).astimezone(UTC)
-        if label_time < opened_at:
+        # A signal opened during a session may legitimately use later candles
+        # from that SAME session.  Comparing the session's midnight label to
+        # ``opened_at`` incorrectly rejected every such session and made short
+        # Friday->weekend/Monday windows impossible to settle.  The close is the
+        # relevant boundary: once it is not after the entry, no usable session
+        # remains in the window.
+        if _stock_session_close(candidate) <= opened_at:
             return None
         if (
             _is_stock_session(candidate)
@@ -355,13 +365,14 @@ def _fetch_candles(
 def _covers_deadline(
     df: pd.DataFrame,
     *,
+    asset_class: str,
     interval: str,
     opened_at: datetime,
     deadline: datetime,
     now: datetime,
 ) -> bool:
     """Whether closed candles cover the complete settlement hold window."""
-    if interval == _INTERVAL_STOCK:
+    if asset_class == "stock":
         required_session = _last_closed_stock_session_in_window(
             opened_at,
             deadline,
@@ -503,6 +514,7 @@ def resolve_trade(
     if now_utc >= deadline:
         if not _covers_deadline(
             df,
+            asset_class=signal.asset_class,
             interval=interval,
             opened_at=opened_at,
             deadline=deadline,

@@ -326,6 +326,51 @@ def test_allocate_unsizeable_is_skipped() -> None:
     assert skipped[0].reason == "unsizeable"
 
 
+def test_allocate_counts_existing_pool_exposure_against_deploy_cap() -> None:
+    ranked = [_ranked("AAA", "SWING", allocation.TIER_NORMAL, 1)]
+    exposure = allocation.ExistingExposure(
+        portfolio_capital=100_000.0,
+        gross_value=20_000.0,
+        pool_values={"SWING": 2_900.0},
+    )
+    orders, skipped, pools = allocation.allocate(
+        ranked, {"SWING": (10_000.0, 10_000.0)},
+        existing_exposure=exposure,
+    )
+    assert orders == []
+    assert "deploy cap" in skipped[0].reason
+    assert pools[0].existing_deployed == 2_900.0
+
+
+def test_allocate_enforces_underlying_concentration_across_contracts() -> None:
+    ranked = [_ranked("AAA", "SWING", allocation.TIER_NORMAL, 1)]
+    exposure = allocation.ExistingExposure(
+        portfolio_capital=10_000.0,
+        gross_value=1_900.0,
+        ticker_values={"AAA": 1_900.0},
+    )
+    orders, skipped, _pools = allocation.allocate(
+        ranked, {"SWING": (10_000.0, 10_000.0)},
+        existing_exposure=exposure,
+    )
+    assert orders == []
+    assert skipped[0].reason.startswith("ticker-exposure")
+
+
+def test_allocate_enforces_portfolio_gross_exposure() -> None:
+    ranked = [_ranked("AAA", "SWING", allocation.TIER_NORMAL, 1)]
+    exposure = allocation.ExistingExposure(
+        portfolio_capital=10_000.0,
+        gross_value=4_900.0,
+    )
+    orders, skipped, _pools = allocation.allocate(
+        ranked, {"SWING": (10_000.0, 10_000.0)},
+        existing_exposure=exposure,
+    )
+    assert orders == []
+    assert skipped[0].reason.startswith("portfolio-exposure")
+
+
 # ───────────────────────── Stage 4: build_plan end-to-end ───────────────────
 
 

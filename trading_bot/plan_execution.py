@@ -1,11 +1,10 @@
 """Plan execution — the Phase 12 plan → broker bridge (Phase 16, PAPER).
 
-Closes the gap between "plan produced" and "order actually submitted": an
-OPERATOR-TRIGGERED path (``allocate execute --confirm``) that takes an approved
-:class:`~trading_bot.allocation.ExecutionPlan` and routes each PlannedOrder to
-the correct EXISTING submission path by pool. Nothing here is scheduled —
-opening new exposure stays operator-gated, exactly the discipline every prior
-phase held (closing/protecting positions remains the watchers' job, untouched).
+Closes the gap between "plan produced" and "order actually submitted". Both
+the confirmed CLI and the hourly scanner pass an approved
+:class:`~trading_bot.allocation.ExecutionPlan` here, and each PlannedOrder is
+routed to the correct existing submission path by pool. Independent risk
+authorization and idempotency checks remain mandatory at this final boundary.
 
 This module owns the execution AUDIT TRAIL and IDEMPOTENCY GUARD: every planned
 order the execute command acts on is recorded in ``plan_executions``
@@ -217,9 +216,13 @@ def _execute_swing(
 
     direction = "long" if order.side == "buy" else "short"
     decision = oe.choose_execution(
-        direction, order.est_cost, order.ticker, order.entry, contracts,
+        # Option premium can go to zero, so its budget is the plan's actual
+        # stop-risk dollars—not the full underlying position value.  Shares
+        # fallback still uses the volatility-normalized position value.
+        direction, order.dollar_risk, order.ticker, order.entry, contracts,
         ref_date=now.astimezone(_ET).date(),
         options_available=options_available and chain_ok,
+        shares_capital=order.est_cost,
     )
     if decision.vehicle == oe.VEHICLE_NONE:
         return OrderExecution(
@@ -314,8 +317,7 @@ def execute_plan(
 ) -> ExecutionRunResult:
     """Submit every order in an approved plan via its pool's EXISTING path.
 
-    OPERATOR-TRIGGERED only (the ``allocate execute --confirm`` CLI); nothing
-    schedules this. The run:
+    Called by the confirmed CLI and by the hourly paper-trading worker. The run:
 
     1. checks the Phase 15 ``new_position_entry`` authorization INDEPENDENTLY —
        revoked refuses the whole run, submits nothing;

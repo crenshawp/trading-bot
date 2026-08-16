@@ -2,10 +2,9 @@
 
 Turns a set of simultaneously-firing signals into an ordered EXECUTION PLAN,
 respecting capital limits, confidence tiers, and pool boundaries. It PRODUCES A
-PLAN — it never executes. The plan is a data structure handed back to the
-caller; wiring it to the Phase 11 broker's ``submit_order`` is deliberately
-deferred until the allocation logic is proven (a test asserts zero broker
-submissions occur anywhere in the allocate path).
+PLAN — it never executes. The confirmed CLI or hourly scanner may hand that
+data structure to :mod:`trading_bot.plan_execution`; a test asserts zero broker
+submissions occur anywhere inside this allocation path.
 
 FOUR LEGIBLE STAGES (kept distinct, NOT one blended score):
 
@@ -58,6 +57,7 @@ class Candidate:
     atr: float | None
     # Stage 1 gate inputs
     ticker_active: bool = True
+    strategy_enabled: bool = True
     pair_enabled: bool = True
     earnings_blackout: bool = False
     # Stage 2 scoring inputs
@@ -78,6 +78,10 @@ class Candidate:
     # fired-signal source. Samples/manual candidates have no durable origin and
     # keep the compatibility default rather than inventing an ID.
     signal_id: int | None = None
+    # Every recent unconsidered signal collapsed into this newest-per-setup
+    # candidate. A terminal handling decision consumes the whole group so an
+    # older duplicate cannot reappear on the next cycle.
+    source_signal_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -152,6 +156,22 @@ class PoolAccounting:
     deployed: float                # capital placed into the plan
     cash_remaining: float
     orders: int
+    existing_deployed: float = 0.0
+
+
+@dataclass(frozen=True)
+class ExistingExposure:
+    """Broker-backed positions and working entries injected into allocation.
+
+    Ticker keys are underlyings rather than OCC contract symbols, preventing a
+    repeat option entry from bypassing concentration limits by changing expiry
+    or strike.
+    """
+
+    portfolio_capital: float
+    gross_value: float = 0.0
+    pool_values: dict[str, float] = field(default_factory=dict)
+    ticker_values: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -354,6 +374,8 @@ def filter_reason(
     """
     if not candidate.ticker_active:
         return "ticker_inactive"
+    if not candidate.strategy_enabled:
+        return "strategy_disabled"
     if not candidate.pair_enabled:
         return "pair_muted"
     if candidate.earnings_blackout:
@@ -412,6 +434,8 @@ def rank_candidates(eligible: list[tuple[Candidate, str]]) -> list[RankedCandida
 def allocate(
     ranked: list[RankedCandidate],
     pool_caps: dict[str, tuple[float, float]],
+    *,
+    existing_exposure: ExistingExposure | None = None,
 ) -> tuple[list[PlannedOrder], list[SkippedSignal], list[PoolAccounting]]:
     """Assign capital top-down by rank WITHIN each pool. Returns the planned
     orders (rank-ordered), the skipped list, and per-pool accounting.
@@ -430,9 +454,15 @@ def allocate(
     orders: list[PlannedOrder] = []
     skipped: list[SkippedSignal] = []
     pools_acct: list[PoolAccounting] = []
+    exposure = existing_exposure
+    new_gross = 0.0
+    new_ticker_values: dict[str, float] = {}
 
     for pool in config.POOLS:
         capital, cash = pool_caps.get(pool, (0.0, 0.0))
+        existing_deployed = (
+            exposure.pool_values.get(pool, 0.0) if exposure is not None else 0.0
+        )
         deployed = 0.0
         cash_remaining = cash
         placed = 0
@@ -451,13 +481,40 @@ def allocate(
                 else config.POOL_DEPLOY_CAP_NORMAL
             )
             ceiling = capital * cap_frac
-            if deployed + pv > ceiling + _ALLOC_EPS:
+            if existing_deployed + deployed + pv > ceiling + _ALLOC_EPS:
                 skipped.append(SkippedSignal(
                     c.ticker, c.signal_type, pool, "allocate",
                     f"capital-exhausted: {rc.tier} deploy cap "
                     f"({cap_frac:.0%} of pool)",
                 ))
                 continue
+            if exposure is not None and exposure.portfolio_capital > 0.0:
+                ticker_ceiling = (
+                    exposure.portfolio_capital
+                    * config.MAX_TICKER_EXPOSURE_PCT
+                    / 100.0
+                )
+                ticker_value = (
+                    exposure.ticker_values.get(c.ticker, 0.0)
+                    + new_ticker_values.get(c.ticker, 0.0)
+                )
+                if ticker_value + pv > ticker_ceiling + _ALLOC_EPS:
+                    skipped.append(SkippedSignal(
+                        c.ticker, c.signal_type, pool, "allocate",
+                        "ticker-exposure: maximum underlying concentration",
+                    ))
+                    continue
+                gross_ceiling = (
+                    exposure.portfolio_capital
+                    * config.MAX_GROSS_EXPOSURE_PCT
+                    / 100.0
+                )
+                if exposure.gross_value + new_gross + pv > gross_ceiling + _ALLOC_EPS:
+                    skipped.append(SkippedSignal(
+                        c.ticker, c.signal_type, pool, "allocate",
+                        "portfolio-exposure: maximum gross exposure",
+                    ))
+                    continue
             if pv > cash_remaining + _ALLOC_EPS:
                 skipped.append(SkippedSignal(
                     c.ticker, c.signal_type, pool, "allocate",
@@ -474,12 +531,15 @@ def allocate(
                 signal_id=c.signal_id,
             ))
             deployed += pv
+            new_gross += pv
+            new_ticker_values[c.ticker] = new_ticker_values.get(c.ticker, 0.0) + pv
             cash_remaining -= pv
             placed += 1
 
         pools_acct.append(PoolAccounting(
             pool=pool, capital=capital, cash=cash, deployed=deployed,
             cash_remaining=cash_remaining, orders=placed,
+            existing_deployed=existing_deployed,
         ))
 
     orders.sort(key=lambda o: o.rank)
@@ -495,14 +555,14 @@ def build_plan(
     *,
     split: dict[str, float] | None = None,
     entry_authorized: bool = True,
+    existing_exposure: ExistingExposure | None = None,
 ) -> AllocationResult:
     """Run the four-stage pipeline and EMIT an :class:`AllocationResult`.
 
     FILTER → RANK → ALLOCATE → PLAN. The returned plan is a pure data structure;
     this function NEVER calls ``broker.submit_order`` or otherwise executes —
-    wiring the plan to the broker is deliberately deferred to a later phase until
-    the allocation logic is proven (a test asserts zero submissions occur in this
-    path).
+    execution remains a separate caller-owned step (a test asserts zero broker
+    submissions occur in this path).
 
     ``entry_authorized`` is the Phase 15 risk-of-ruin gate (callers pass
     ``risk_of_ruin.is_entry_authorized()``): when the ``new_position_entry``
@@ -588,7 +648,9 @@ def build_plan(
     ranked = rank_candidates(eligible)
 
     # Stage 3 — ALLOCATE top-down within each pool.
-    orders, alloc_skipped, pools_acct = allocate(ranked, caps)
+    orders, alloc_skipped, pools_acct = allocate(
+        ranked, caps, existing_exposure=existing_exposure,
+    )
     skipped.extend(alloc_skipped)
 
     # Stage 4 — PLAN. Return the data structure; execute NOTHING.

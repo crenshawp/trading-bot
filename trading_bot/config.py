@@ -45,6 +45,12 @@ SP_WINDOW_DAYS: int = 60           # recency window for the expectancy stats
 SP_MUTE_EXPECTANCY: float = 0.0     # enabled -> muted when expectancy <= this
 SP_ENABLE_EXPECTANCY: float = 0.05  # muted -> enabled when expectancy >= this
 
+# Execution-level gate above the ticker/pair hierarchy.  A sufficiently sampled
+# losing family keeps firing and collecting outcomes, but receives no new broker
+# capital until its recent active-book expectancy recovers.
+GLOBAL_SIGNAL_MIN_CLOSED: int = 20
+GLOBAL_SIGNAL_MIN_EXPECTANCY: float = 0.0
+
 # ──────────────────────────────────────────────────────────────────────────
 # News & sentiment (Phase 5)
 # ──────────────────────────────────────────────────────────────────────────
@@ -100,6 +106,12 @@ RISK_PER_TRADE_PCT: float = 1.0           # % of notional risked on one trade
 MAX_PORTFOLIO_RISK_PCT: float = 6.0       # advisory cap on summed open risk %
 MAX_POSITION_PCT: float = 20.0            # advisory per-position notional cap %
 MAX_CORRELATED_CLUSTER_PCT: float = 25.0  # advisory cap on a correlated cluster %
+# Enforced execution-book limits.  Unlike the fire-time advisory assessment,
+# these are evaluated against broker positions plus working entry orders before
+# a new plan is built.  Reaching a limit skips that candidate/cycle; it does not
+# revoke the entry capability or stop the worker.
+MAX_GROSS_EXPOSURE_PCT: float = 50.0
+MAX_TICKER_EXPOSURE_PCT: float = 20.0
 # Stop distance for volatility-normalized sizing = ATR * this multiple. 1.5
 # matches the scanner's actual stop (sl = price - atr*1.5), so the advisory
 # size lines up with the stop the trade is really tracked against.
@@ -204,6 +216,12 @@ TARGET_DELTA_HIGH: float = 0.75
 UNDERSIZED_DELTA_FLOOR: float = 0.50
 # Never enter inside the final fortnight: minimum days-to-expiration at entry.
 MIN_DTE: int = 14
+# A 1-5 day swing must not accidentally select a LEAPS contract merely because
+# its delta is a few basis points closer to the target.  Keep expiries bounded
+# and prefer the centre of the intended window.  If no contract qualifies, the
+# live hierarchy continues through the shares fallback.
+MAX_DTE: int = 60
+TARGET_DTE: int = 30
 # Liquidity floor — a contract failing EITHER gate is excluded regardless of delta.
 MIN_OPEN_INTEREST: int = 100
 MAX_SPREAD_PCT: float = 10.0        # max bid-ask spread as % of mid price

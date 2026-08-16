@@ -291,6 +291,22 @@ def test_muted_pair_maps_disabled(tmp_db: Path) -> None:
     assert c.pair_enabled is False            # build_plan will drop it
 
 
+def test_losing_setup_family_is_disabled_for_execution(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        candidate_source.signal_pairs,
+        "windowed_stats_for_signal_type",
+        lambda _signal_type, *, now=None: (
+            config.GLOBAL_SIGNAL_MIN_CLOSED, 30.0, -0.5,
+        ),
+    )
+    sid = _seed_signal()
+    _seed_trade(sid)
+    (candidate,) = _live()
+    assert candidate.strategy_enabled is False
+
+
 def test_dedupe_keeps_newest_signal_per_pair(tmp_db: Path) -> None:
     older = _seed_signal(entry=470.0, timestamp=_NOW - timedelta(hours=2))
     newer = _seed_signal(entry=480.0, timestamp=_NOW - timedelta(hours=1))
@@ -300,6 +316,7 @@ def test_dedupe_keeps_newest_signal_per_pair(tmp_db: Path) -> None:
     (c,) = _live(mark_considered=True)
     assert c.entry == 480.0                   # the re-fired setup supersedes
     assert c.signal_id == newer               # exact newest persisted origin
+    assert c.source_signal_ids == (newer, older)
 
     # BOTH rows were pulled, so BOTH are consumed — the superseded older
     # duplicate is never re-offered on its own next cycle.
@@ -307,6 +324,47 @@ def test_dedupe_keeps_newest_signal_per_pair(tmp_db: Path) -> None:
         signal = db.get_signal_by_id(sid)
         assert signal is not None
         assert signal.considered_at is not None
+
+
+def test_final_filter_consumes_all_deduped_source_rows(tmp_db: Path) -> None:
+    older = _seed_signal(entry=470.0, timestamp=_NOW - timedelta(hours=2))
+    newer = _seed_signal(entry=480.0, timestamp=_NOW - timedelta(hours=1))
+    _seed_trade(older)
+    _seed_trade(newer)
+    db.set_signal_pair_status("META", "ema21_pullback", "muted")
+    candidates = _live()
+    result = allocation.build_plan(candidates, _ACCOUNT)
+
+    assert candidate_source.mark_final_candidates(
+        candidates, result, now=_NOW,
+    ) == 2
+    for sid in (older, newer):
+        signal = db.get_signal_by_id(sid)
+        assert signal is not None
+        assert signal.considered_at == _NOW
+
+
+def test_capacity_skip_remains_retryable(tmp_db: Path) -> None:
+    sid = _seed_signal()
+    _seed_trade(sid)
+    candidates = _live()
+    result = allocation.build_plan(
+        candidates,
+        _ACCOUNT,
+        existing_exposure=allocation.ExistingExposure(
+            portfolio_capital=100_000.0,
+            gross_value=15_000.0,
+            pool_values={config.POOL_SWING: 15_000.0},
+        ),
+    )
+
+    assert result.plan.orders == []
+    assert result.skipped[0].stage == "allocate"
+    assert candidate_source.mark_final_candidates(
+        candidates, result, now=_NOW,
+    ) == 0
+    signal = db.get_signal_by_id(sid)
+    assert signal is not None and signal.considered_at is None
 
 
 # ───────────────────────── hold-window carrying (Phase 20) ──────────────────

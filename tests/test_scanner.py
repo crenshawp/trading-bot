@@ -1619,11 +1619,105 @@ def test_exit_watcher_cycle_is_failsoft(monkeypatch: pytest.MonkeyPatch) -> None
     scanner._run_exit_watcher_cycle()   # must not raise
 
 
+def test_option_exit_price_fetch_uses_executable_bid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trading_bot import broker
+    from trading_bot.broker.options import OptionChainResult, OptionContract
+    from trading_bot.models import OptionPosition
+
+    symbol = "META260918C00500000"
+    position = OptionPosition(
+        symbol=symbol, underlying="META", option_type="call", strike=500.0,
+        expiry="2026-09-18", contracts=1.0, opened_at=datetime.now(UTC),
+    )
+    chain = OptionChainResult(ok=True, contracts=[OptionContract(
+        symbol=symbol, underlying="META", option_type="call", strike=500.0,
+        expiry="2026-09-18", bid=1.0, ask=3.0, mid=2.0,
+    )])
+
+    class ChainClient:
+        def get_option_chain(self, _underlying: str) -> OptionChainResult:
+            return chain
+
+    monkeypatch.setattr(broker, "AlpacaOptionsClient", ChainClient)
+    fetch = scanner._build_option_price_fetch([position])
+    assert fetch(symbol) == 1.0
+
+
+def test_latest_price_fetch_batches_stock_and_crypto_quotes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trading_bot import alpaca_market_data as amd
+
+    stock = amd.MarketQuote(
+        "META", datetime.now(UTC), 99.0, 1.0, 101.0, 1.0,
+    )
+    crypto = amd.MarketQuote(
+        "BTC-USD", datetime.now(UTC), 60_000.0, 1.0, 60_100.0, 1.0,
+    )
+
+    class QuoteClient:
+        def get_stock_latest_quotes(self, _symbols: list[str]) -> amd.QuotesResult:
+            return amd.QuotesResult(ok=True, quotes={"META": stock})
+
+        def get_crypto_latest_quotes(self, _symbols: list[str]) -> amd.QuotesResult:
+            return amd.QuotesResult(ok=True, quotes={"BTC-USD": crypto})
+
+    monkeypatch.setattr(amd, "AlpacaMarketDataClient", QuoteClient)
+    fetch = scanner._build_latest_price_fetch(["META", "BTC-USD"])
+    assert fetch("META") == 100.0
+    assert fetch("BTC-USD") == 60_050.0
+
+
 def test_exit_watcher_cycle_is_a_distinct_hook() -> None:
     """Additive — it does not replace the existing hourly cycles."""
     assert callable(scanner._run_exit_watcher_cycle)
     assert scanner._run_exit_watcher_cycle is not scanner._run_allocation_execution_cycle
     assert scanner._run_exit_watcher_cycle is not scanner._run_risk_cycle
+
+
+def test_shadow_evaluation_cycle_promotes_through_live_evaluator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        scanner.shadow_discovery,
+        "evaluate_shadow_universe",
+        lambda: calls.append(True) or [],
+    )
+    scanner._run_shadow_evaluation_cycle()
+    assert calls == [True]
+
+
+def test_optimization_cycle_persists_when_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted: list[object] = []
+    payload = {"degradations": [{"verdict": "degrading"}]}
+    monkeypatch.setattr(scanner.readiness, "is_ready", lambda _cap: True)
+    monkeypatch.setattr(
+        scanner.self_optimization, "run_optimization", lambda: payload,
+    )
+    monkeypatch.setattr(
+        scanner.self_optimization,
+        "persist_run",
+        lambda item: persisted.append(item) or 7,
+    )
+    scanner._run_optimization_cycle()
+    assert persisted == [payload]
+
+
+def test_optimization_cycle_stays_dormant_below_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(scanner.readiness, "is_ready", lambda _cap: False)
+    monkeypatch.setattr(
+        scanner.self_optimization,
+        "run_optimization",
+        lambda: (_ for _ in ()).throw(AssertionError("must stay dormant")),
+    )
+    scanner._run_optimization_cycle()
 
 
 def test_exit_history_period_warms_the_trend_sma() -> None:
