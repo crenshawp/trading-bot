@@ -1674,6 +1674,13 @@ def _build_latest_price_fetch(tickers):
 
     client = AlpacaMarketDataClient()
     prices: dict[str, float] = {}
+    # Materialize first: both production call sites pass a GENERATOR
+    # expression, and the two comprehensions below iterate `tickers` twice.
+    # A generator is exhausted by the first pass, so `crypto` came back empty
+    # every time and no crypto quote was ever requested — leaving a Tier-2
+    # emergency shutdown with no price for the crypto position it exists to
+    # flatten. The existing test passed a list, which is the case that works.
+    tickers = list(tickers)
     stocks = sorted({ticker for ticker in tickers if not ticker.endswith("-USD")})
     crypto = sorted({ticker for ticker in tickers if ticker.endswith("-USD")})
     results = []
