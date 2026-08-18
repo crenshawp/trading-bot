@@ -9,6 +9,7 @@ watchers keep running.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -43,8 +44,35 @@ def _pool_for_long_term(position: LongTermPosition) -> str:
     return config.POOL_LONG_TERM
 
 
+def _pending_source(order: PendingOrder) -> str | None:
+    """The intent payload's ``source``, or ``None`` if it cannot be read.
+
+    Fail-soft by contract: an unreadable payload must not break the exposure
+    snapshot, so the caller falls back to the structural routing below.
+    """
+    try:
+        payload = json.loads(order.intent_payload_json)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    source = payload.get("source")
+    return source if isinstance(source, str) else None
+
+
 def _pending_pool(order: PendingOrder) -> str:
     if order.target_position_kind == "option":
+        return config.POOL_SWING
+    # A swing shares-fallback entry (the options hierarchy's third tier) carries
+    # target_position_kind="long_term" because it materializes into the long-term
+    # book — but it is SWING capital, and _pool_for_long_term already routes the
+    # filled position to POOL_SWING on exactly this predicate. Routing on
+    # target_position_kind alone made the same dollars count against LONG_TERM
+    # while working and SWING once filled, so the pool they consumed flipped at
+    # fill time: the swing pool under-reported its deployment (letting the tier
+    # deploy-cap over-commit) while genuine long-term candidates were skipped
+    # capital-exhausted against exposure that was never theirs.
+    if _pending_source(order) == "swing_fallback":
         return config.POOL_SWING
     if order.asset_class == "crypto":
         return config.POOL_CRYPTO
