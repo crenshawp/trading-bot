@@ -1694,7 +1694,9 @@ def test_optimization_cycle_persists_when_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     persisted: list[object] = []
-    payload = {"degradations": [{"verdict": "degrading"}]}
+    # "degraded" is the real verdict self_optimization emits; the fixture used to
+    # say "degrading", which no code path ever produces.
+    payload = {"degradations": [{"verdict": "degraded"}]}
     monkeypatch.setattr(scanner.readiness, "is_ready", lambda _cap: True)
     monkeypatch.setattr(
         scanner.self_optimization, "run_optimization", lambda: payload,
@@ -1706,6 +1708,36 @@ def test_optimization_cycle_persists_when_ready(
     )
     scanner._run_optimization_cycle()
     assert persisted == [payload]
+
+
+def test_optimization_cycle_counts_real_degradation_verdicts(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The printed flag count must match the verdicts self_optimization emits.
+
+    The counter compared against "degrading", a string nothing produces, so it
+    read 0 no matter how many pairs were flagged. Only "degraded" counts;
+    "stable" / "insufficient_sample" / "no_baseline" must not.
+    """
+    payload = {
+        "degradations": [
+            {"verdict": "degraded"},
+            {"verdict": "degraded"},
+            {"verdict": "stable"},
+            {"verdict": "insufficient_sample"},
+            {"verdict": "no_baseline"},
+        ]
+    }
+    monkeypatch.setattr(scanner.readiness, "is_ready", lambda _cap: True)
+    monkeypatch.setattr(
+        scanner.self_optimization, "run_optimization", lambda: payload,
+    )
+    monkeypatch.setattr(scanner.self_optimization, "persist_run", lambda _item: 7)
+
+    scanner._run_optimization_cycle()
+
+    assert "2 degradation flag(s)" in capsys.readouterr().out
 
 
 def test_optimization_cycle_stays_dormant_below_readiness(

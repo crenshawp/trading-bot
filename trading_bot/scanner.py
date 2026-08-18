@@ -1815,7 +1815,11 @@ def _run_optimization_cycle() -> None:
         payload = self_optimization.run_optimization()
         run_id = self_optimization.persist_run(payload)
         degradations = payload.get("degradations", [])
-        flags = sum(item.get("verdict") == "degrading" for item in degradations)
+        # self_optimization._degradation_finding emits "degraded" — never
+        # "degrading". Matching the wrong string made this counter permanently 0,
+        # so the operator's only visible signal that self-optimisation found a
+        # decaying edge always read "0 degradation flag(s)".
+        flags = sum(item.get("verdict") == "degraded" for item in degradations)
         print(
             f"[{datetime.now().strftime('%H:%M:%S')}] self-optimization: "
             f"persisted run {run_id}, {flags} degradation flag(s)"
