@@ -46,13 +46,20 @@ def is_option_market_open(now: datetime) -> bool:
     Alpaca does not support extended-hours option execution.  The scanner uses
     this guard before requesting an exit quote or submitting a DAY order, so a
     weekend/overnight watcher cannot queue a stale limit for the next session.
+
+    That promise needs the session's REAL closing bell, which is 13:00 ET on the
+    three NYSE half-days rather than 16:00.  Between those two times the guard
+    used to answer "open", and the watcher submitted a DAY limit into a shut
+    market — an order the broker cancels at end of day, leaving a position the
+    watcher had already recorded as being exited.
     """
-    from trading_bot.outcomes import is_stock_session
+    from trading_bot.outcomes import is_stock_session, stock_session_close
 
     local = now.astimezone(_ET)
     return (
         is_stock_session(local.date())
-        and time(9, 30) <= local.time().replace(tzinfo=None) < time(16, 0)
+        and time(9, 30) <= local.time().replace(tzinfo=None)
+        < stock_session_close(local.date())
     )
 
 

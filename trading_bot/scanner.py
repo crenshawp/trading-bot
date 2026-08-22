@@ -658,11 +658,21 @@ def is_market_open():
     # would silently have been treated as a normal trading day, forever, with
     # no warning — scanning stale prior-session bars and firing signals dated
     # to a non-session, which the hourly execution cycle would then act on.
+    #
+    # The CLOSING bell comes from outcomes.stock_session_close, not a hardcoded
+    # 16:00. The NYSE shuts at 13:00 ET on three half-days a year (July 3, the
+    # Friday after Thanksgiving, Christmas Eve), and a session-only check said
+    # "open" for the three hours after that bell — during which the hourly
+    # execution cycle submits real opening orders and durably consumes the
+    # signals behind them.
     now = datetime.now(ZoneInfo("America/New_York"))
     if not outcomes.is_stock_session(now.date()):
         return False
+    close_time = outcomes.stock_session_close(now.date())
     market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
-    market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+    market_close = now.replace(
+        hour=close_time.hour, minute=close_time.minute, second=0, microsecond=0,
+    )
     return market_open <= now <= market_close
 
 
