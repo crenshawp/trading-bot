@@ -201,12 +201,78 @@ def is_stock_session(day: date) -> bool:
 
     Public because the live scanner's ``is_market_open`` needs the same
     calendar; it used to carry its own hardcoded list of one year's holidays.
+
+    "Full" here means the day is a session at all, NOT that it runs to 16:00 —
+    an early-close session is still a session. Callers that submit orders need
+    :func:`stock_session_close` for the day's actual closing bell.
     """
     return (
         day.weekday() < 5
         and day not in _stock_market_holidays(day.year)
         and day not in _EXTRAORDINARY_STOCK_CLOSURES
     )
+
+
+# The NYSE closes at 13:00 ET on three occasions a year. Derived per year for
+# the same reason the holiday set is: a hardcoded table silently expires, and an
+# expired one here does not merely mislabel a session — it authorizes the hourly
+# execution cycle to submit orders into a market that shut three hours earlier.
+_EARLY_CLOSE_TIME = time(13, 0)
+_REGULAR_CLOSE_TIME = time(16, 0)
+
+
+@functools.cache
+def _stock_market_early_closes(year: int) -> frozenset[date]:
+    """The 13:00 ET half-days of *year*, derived rather than tabulated.
+
+    Each rule is conditioned on the ADJACENT holiday falling on a weekday, which
+    is what makes an early close exist at all: when the holiday lands on a
+    weekend the eve is either itself the observed closure or not a session, and
+    the NYSE runs a full day instead.
+
+    * July 3, when Independence Day is a weekday. A Saturday July 4 is observed
+      on Friday July 3 (a full closure, not an early one); a Sunday July 4 puts
+      July 3 on a Saturday.
+    * The Friday after Thanksgiving — always, since Thanksgiving is fixed to a
+      Thursday.
+    * December 24, when Christmas Day is a weekday. A Saturday Christmas is
+      observed on December 24 itself, and a Sunday Christmas puts the 24th on a
+      Saturday.
+    """
+    early: set[date] = set()
+
+    independence = date(year, 7, 4)
+    if independence.weekday() < 5:
+        early.add(independence - timedelta(days=1))
+
+    thanksgiving = _nth_weekday(year, 11, 3, 4)
+    early.add(thanksgiving + timedelta(days=1))
+
+    christmas = date(year, 12, 25)
+    if christmas.weekday() < 5:
+        early.add(christmas - timedelta(days=1))
+
+    # Defensive: a rule above can only ever name a weekday, but an extraordinary
+    # closure (a national day of mourning, say) outranks an early close, and a
+    # future rule change should not be able to invent a half-day on a holiday.
+    return frozenset(day for day in early if is_stock_session(day))
+
+
+def is_early_close(day: date) -> bool:
+    """True when *day* is a session that ends at 13:00 ET instead of 16:00."""
+    return day in _stock_market_early_closes(day.year)
+
+
+def stock_session_close(day: date) -> time:
+    """The NYSE closing bell (ET, naive) for *day*: 13:00 on a half-day, else 16:00.
+
+    Callers that SUBMIT orders must gate on this rather than assuming 16:00.
+    Returns the regular close for a non-session too — the caller is expected to
+    have already established that the day is a session via
+    :func:`is_stock_session`, and answering with a time for a closed day is less
+    surprising than raising into a market-hours guard.
+    """
+    return _EARLY_CLOSE_TIME if is_early_close(day) else _REGULAR_CLOSE_TIME
 
 
 # Internal callers below predate the public name; keep one implementation.
