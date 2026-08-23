@@ -27,12 +27,25 @@ class ExposureResult:
     reason: str = ""
 
 
-def _position_value(position: Position) -> float | None:
-    """Absolute current value, falling back to broker entry cost if needed."""
+def _position_value(position: Position, contract_multiplier: float = 1.0) -> float | None:
+    """Absolute current value, falling back to broker entry cost if needed.
+
+    ``contract_multiplier`` is ``OPTION_MULTIPLIER`` for an option contract and
+    1 for shares. It applies ONLY to the entry-cost fallback: ``avg_entry_price``
+    is the per-share premium and ``qty`` is contracts, so the dollars are
+    ``premium x 100 x contracts`` — the same arithmetic the working-order loop
+    below already does for a pending option entry, and the same one
+    ``options_execution._premium_cost`` does at fire time.
+
+    ``market_value`` is left alone: the broker reports an option position's
+    market value with the multiplier already applied.
+    """
     if position.market_value is not None:
         return abs(float(position.market_value))
     if position.avg_entry_price is not None:
-        return abs(float(position.avg_entry_price) * float(position.qty))
+        return abs(
+            float(position.avg_entry_price) * float(position.qty) * contract_multiplier
+        )
     return None
 
 
@@ -119,20 +132,33 @@ def build_existing_exposure(
         ticker_values[ticker] = ticker_values.get(ticker, 0.0) + value
 
     for position in broker_positions.positions:
-        value = _position_value(position)
+        # Identify the holding BEFORE valuing it: only the internal books know
+        # whether a broker symbol is an option contract, and an option's
+        # entry-cost fallback needs the contract multiplier.
+        option = option_by_symbol.get(position.symbol)
+        long_term = long_term_by_symbol.get(position.symbol)
+        pending = pending_by_symbol.get(position.symbol)
+        if option is not None:
+            is_option = True
+        elif long_term is not None:
+            is_option = False  # long-term holdings are shares or crypto
+        else:
+            # A partially filled option entry has a broker position before the
+            # option_positions row exists; the working order names its kind.
+            is_option = pending is not None and pending.target_position_kind == "option"
+        multiplier = float(config.OPTION_MULTIPLIER) if is_option else 1.0
+
+        value = _position_value(position, multiplier)
         if value is None:
             return ExposureResult(
                 False, reason=f"cannot value broker position {position.symbol}",
             )
-        option = option_by_symbol.get(position.symbol)
         if option is not None:
             add(config.POOL_SWING, option.underlying, value)
             continue
-        long_term = long_term_by_symbol.get(position.symbol)
         if long_term is not None:
             add(_pool_for_long_term(long_term), long_term.ticker, value)
             continue
-        pending = pending_by_symbol.get(position.symbol)
         if pending is not None:
             add(_pending_pool(pending), pending.ticker, value)
             continue
