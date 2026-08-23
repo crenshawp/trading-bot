@@ -155,3 +155,86 @@ def test_unreadable_intent_payload_falls_back_to_structural_routing() -> None:
     assert result.ok is True
     assert result.exposure is not None
     assert result.exposure.pool_values == {config.POOL_LONG_TERM: 5_000.0}
+
+
+def test_option_entry_cost_fallback_applies_the_contract_multiplier() -> None:
+    """An option position with no ``market_value`` must still be valued in
+    dollars, not in per-share premium.
+
+    ``avg_entry_price`` is the premium per share and ``qty`` is contracts, so
+    the outlay is ``premium x OPTION_MULTIPLIER x contracts`` — exactly what the
+    working-order branch below already computes for a pending option entry, and
+    what ``options_execution._premium_cost`` computes at fire time. Without the
+    multiplier a $4,000 option book was reported as $40, so the allocator's
+    gross- and ticker-exposure caps saw essentially unlimited room.
+
+    ``_position_body_error`` explicitly permits a missing ``market_value``
+    (``if row.get(field) is not None``), so this branch is reachable.
+    """
+    positions = PositionsResult(ok=True, positions=[
+        Position("META260918C00500000", 2.0, avg_entry_price=20.0),
+    ])
+    result = execution_exposure.build_existing_exposure(
+        _account(), positions, [_option()], [], [],
+    )
+
+    assert result.ok is True
+    assert result.exposure is not None
+    # 20.00 premium x 100 x 2 contracts = $4,000 (was $40 before the fix).
+    assert result.exposure.gross_value == 4_000.0
+    assert result.exposure.ticker_values == {"META": 4_000.0}
+    assert result.exposure.pool_values == {config.POOL_SWING: 4_000.0}
+
+
+def test_share_entry_cost_fallback_is_unchanged() -> None:
+    """Control: a plain equity holding must NOT gain a 100x multiplier."""
+    positions = PositionsResult(ok=True, positions=[
+        Position("AAPL", 10.0, avg_entry_price=200.0),
+    ])
+    result = execution_exposure.build_existing_exposure(
+        _account(), positions, [], [_long_term()], [],
+    )
+
+    assert result.ok is True
+    assert result.exposure is not None
+    assert result.exposure.gross_value == 2_000.0
+
+
+def test_option_market_value_is_not_multiplied_again() -> None:
+    """The broker reports an option's market value with the multiplier already
+    applied, so the primary branch must pass it through untouched."""
+    positions = PositionsResult(ok=True, positions=[
+        Position("META260918C00500000", 2.0, market_value=4_000.0,
+                 avg_entry_price=20.0),
+    ])
+    result = execution_exposure.build_existing_exposure(
+        _account(), positions, [_option()], [], [],
+    )
+
+    assert result.ok is True
+    assert result.exposure is not None
+    assert result.exposure.gross_value == 4_000.0
+
+
+def test_partially_filled_option_entry_uses_the_multiplier_before_its_book_row() -> None:
+    """A partially filled option entry has a broker position before the
+    option_positions row exists — the working order names the kind."""
+    pending_option = PendingOrder(
+        broker_order_id="o-9", client_order_id="c-9", ticker="NVDA",
+        broker_symbol="NVDA260918C00900000", asset_class="stock",
+        vehicle="option", target_position_kind="option", side="buy",
+        requested_qty=3.0, requested_limit_price=5.0, submitted_at=_NOW,
+        intent_payload_json='{"intent_kind":"option"}', filled_qty=1.0,
+    )
+    positions = PositionsResult(ok=True, positions=[
+        Position("NVDA260918C00900000", 1.0, avg_entry_price=5.0),
+    ])
+    result = execution_exposure.build_existing_exposure(
+        _account(), positions, [], [], [pending_option],
+    )
+
+    assert result.ok is True
+    assert result.exposure is not None
+    # Filled contract: 5.00 x 100 x 1 = $500. Working remainder: 2 x 5.00 x 100
+    # = $1,000 (the working-order branch already applied the multiplier).
+    assert result.exposure.ticker_values == {"NVDA": 1_500.0}
