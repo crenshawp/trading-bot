@@ -1179,6 +1179,42 @@ def test_cli_risk_killswitch(tmp_db: Path, monkeypatch, capsys) -> None:
     assert ror.get_state() == ror.STATE_HALTED
 
 
+def test_cli_risk_killswitch_actually_closes_typed_positions(
+    tmp_db: Path, monkeypatch, capsys,
+) -> None:
+    """The operator kill switch must FLATTEN the book, not defer every position.
+
+    Regression: `cmd_risk_killswitch` called `kill_switch` without
+    `option_price_fetch` / `long_term_price_fetch`, so both typed closers hit
+    their deliberate "no current price is available" refusal and every holding
+    landed in `pending`. The existing CLI test ran against an EMPTY book, so it
+    halted trivially and never caught this. The three automatic call sites in
+    scanner.py already wired `_emergency_price_fetchers`; the CLI was missed.
+    """
+    from trading_bot import __main__ as m
+
+    _seed_open_option()
+    _seed_open_long_term()
+    b = _ClosingFakeBroker(auto_fill=True)
+    monkeypatch.setattr(m.broker, "AlpacaBroker", lambda: b)
+    monkeypatch.setattr(ror, "_pushover_notify", lambda _t, _m: True)
+    # Stand in for the live quote lookups the real helper performs.
+    monkeypatch.setattr(
+        "trading_bot.scanner._emergency_price_fetchers",
+        lambda: ((lambda _s: 6.0), (lambda _t: 470.0)),
+    )
+
+    m.cmd_risk_killswitch(config.ROR_KILLSWITCH_TOKEN)
+
+    out = capsys.readouterr().out
+    assert "KILL SWITCH: halted" in out
+    # The books are actually EMPTY — nothing was merely deferred to `pending`.
+    assert db.get_open_option_positions() == []
+    assert db.get_open_long_term_positions() == []
+    assert "pending:" not in out
+    assert ror.get_state() == ror.STATE_HALTED
+
+
 class _OrdersUnreadableBroker(_ClosingFakeBroker):
     """Positions read fine; the OPEN-ORDERS read fails on its own.
 

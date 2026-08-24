@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
@@ -1724,7 +1725,9 @@ def _build_latest_price_fetch(tickers):
     return prices.get
 
 
-def _emergency_price_fetchers():
+def _emergency_price_fetchers() -> tuple[
+    Callable[[str], float | None], Callable[[str], float | None]
+]:
     """``(option_price_fetch, long_term_price_fetch)`` for a Tier-2 shutdown.
 
     Every production call site previously omitted both, so ``price`` was None

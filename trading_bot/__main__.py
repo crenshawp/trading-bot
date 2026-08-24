@@ -1973,7 +1973,21 @@ def cmd_risk_reauthorize(token: str) -> None:
 def cmd_risk_killswitch(token: str) -> None:
     """Human-invoked Tier-2 emergency shutdown — the IDENTICAL orchestrator an
     auto-detected catastrophic trigger runs."""
-    result = risk_of_ruin.kill_switch(token, broker.AlpacaBroker())
+    # Imported lazily: scanner pulls in half the universe at module load, and
+    # this is a one-shot operator command where that cost does not matter.
+    # Without these fetchers every TYPED position (option / long-term) hits the
+    # deliberate "no current price" refusal in the closers and lands in
+    # `pending` — i.e. the kill switch would flatten nothing. The three
+    # automatic call sites already wire the same helper.
+    from trading_bot.scanner import _emergency_price_fetchers
+
+    option_fetch, lt_fetch = _emergency_price_fetchers()
+    result = risk_of_ruin.kill_switch(
+        token,
+        broker.AlpacaBroker(),
+        option_price_fetch=option_fetch,
+        long_term_price_fetch=lt_fetch,
+    )
     if result is None:
         print(
             "kill switch REFUSED: invalid confirmation token "
