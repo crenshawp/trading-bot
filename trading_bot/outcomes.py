@@ -280,7 +280,11 @@ _is_stock_session = is_stock_session
 
 
 def _stock_session_close(day: date) -> datetime:
-    return datetime.combine(day, time(16), tzinfo=_ET).astimezone(UTC)
+    # Delegates to the public helper rather than hardcoding 16:00: on the three
+    # NYSE half-days the bell is 13:00 ET, and treating those sessions as open
+    # until 16:00 made `_last_closed_stock_session_in_window` reject a session
+    # that had in fact closed three hours earlier.
+    return datetime.combine(day, stock_session_close(day), tzinfo=_ET).astimezone(UTC)
 
 
 def _last_closed_stock_session_in_window(

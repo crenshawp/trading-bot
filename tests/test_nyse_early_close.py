@@ -80,6 +80,27 @@ def test_the_close_time_follows_the_calendar() -> None:
     assert outcomes.stock_session_close(date(2026, 12, 24)) == time(13, 0)
 
 
+def test_the_resolver_session_close_also_follows_the_calendar() -> None:
+    """The resolver's private helper must agree with the public one.
+
+    Regression: `stock_session_close` was taught about half-days, but the
+    private `_stock_session_close` used by
+    `_last_closed_stock_session_in_window` and `_covers_deadline` still
+    hardcoded 16:00. A half-day session was therefore treated as open for
+    three hours after the bell, so the resolver rejected a session that had
+    already closed and deferred settlement to the prior session or a later
+    cycle.
+    """
+    for half_day in (date(2026, 11, 27), date(2026, 12, 24)):
+        closed_at = outcomes._stock_session_close(half_day)
+        assert closed_at.astimezone(_ET).timetz().replace(tzinfo=None) == time(13, 0), (
+            f"{half_day} resolver close disagrees with the calendar"
+        )
+    # An ordinary session is unchanged.
+    ordinary = outcomes._stock_session_close(date(2026, 8, 21))
+    assert ordinary.astimezone(_ET).timetz().replace(tzinfo=None) == time(16, 0)
+
+
 def test_a_derived_half_day_never_lands_on_a_non_session() -> None:
     """Every derived date must be a real session; an early close on a holiday
     would be a contradiction that silently widened the guard."""
