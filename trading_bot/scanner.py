@@ -1779,8 +1779,39 @@ def _run_exit_watcher_cycle() -> None:
                 f"options market closed - deferred {len(option_book)} option "
                 "position(s) until a fresh regular-session quote is available"
             )
+        # Same guard as the option branch above, and for the same reason its
+        # docstring gives: "a weekend/overnight watcher cannot queue a stale
+        # limit for the next session". This cycle runs hourly around the clock,
+        # and a share exit goes out as a TIF_DAY limit priced off `price_fetch`,
+        # which returns DAILY candles — so an out-of-hours trigger submits a
+        # limit at the LAST SESSION'S CLOSE, which Alpaca queues for the next
+        # open. Worse, `_submit_long_term_watcher_exit` then refuses any further
+        # attempt while that order is nonterminal, so on the Monday gap-down the
+        # protective stop is meant to escape, the resting limit sits above the
+        # market, does not fill, and nothing else can be submitted until it
+        # expires at Monday's close.
+        #
+        # Split by asset class rather than deferring the whole book: crypto
+        # trades 24/7 and must stay watched.
+        # The watcher is still called unconditionally — that it runs in
+        # production at all is a pinned regression — but it is handed the
+        # filtered book rather than left to read the whole one from the DB.
+        lt_book = db.get_open_long_term_positions()
+        if lt_book and not is_market_open():
+            tradeable = [p for p in lt_book if p.asset_class == "crypto"]
+            deferred = len(lt_book) - len(tradeable)
+            if deferred:
+                print(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] exit watchers: "
+                    f"equity market closed - deferred {deferred} share "
+                    "position(s) until a fresh regular-session quote is available"
+                )
+        else:
+            tradeable = lt_book
+
         lt_actions = long_term.watch_long_term_positions(
             broker, price_fetch=get_exit_price_history, now=now,
+            positions=tradeable,
         )
 
         actions = [*option_actions, *lt_actions]
