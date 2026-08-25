@@ -37,7 +37,8 @@ from datetime import UTC, datetime
 import requests
 
 from trading_bot import config, db, order_lifecycle, secrets, settings
-from trading_bot.broker.base import STATUS_REJECTED, Broker
+from trading_bot.broker.base import STATUS_REJECTED, Broker, Position
+from trading_bot.broker.options import parse_occ_symbol
 from trading_bot.broker.reconcile import reconcile
 from trading_bot.models import (
     BrokerExecutionOutcome,
@@ -536,6 +537,29 @@ class ShutdownResult:
     note: str = ""
 
 
+def _generic_close_limit_price(position: Position) -> float | None:
+    """Per-unit limit price for an untyped broker-only position.
+
+    ``market_value`` is the position's DOLLARS and ``qty`` is its units, so the
+    quotient is the per-unit price a limit order needs — except for an option,
+    where the broker reports market value with ``OPTION_MULTIPLIER`` already
+    applied while ``qty`` stays in contracts (the invariant spelled out in
+    ``execution_exposure._position_value``). Dividing that out is what keeps the
+    quotient a per-share premium instead of a 100x one.
+
+    ``avg_entry_price`` needs no such correction on the fallback branch: it is
+    already the per-share premium.
+    """
+    if position.market_value is not None and position.qty:
+        multiplier = (
+            float(config.OPTION_MULTIPLIER)
+            if parse_occ_symbol(position.symbol) is not None
+            else 1.0
+        )
+        return abs(position.market_value) / position.qty / multiplier
+    return position.avg_entry_price
+
+
 def emergency_shutdown(
     broker: Broker,
     *,
@@ -656,11 +680,7 @@ def emergency_shutdown(
             if bpos.symbol in typed_broker_symbols:
                 continue
             try:
-                price = (
-                    abs(bpos.market_value) / bpos.qty
-                    if bpos.market_value is not None and bpos.qty
-                    else bpos.avg_entry_price
-                )
+                price = _generic_close_limit_price(bpos)
                 side = "sell" if bpos.side != "short" else "buy"
                 order = order_lifecycle.submit_generic_emergency_close(
                     broker,
