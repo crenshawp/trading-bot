@@ -429,6 +429,121 @@ def test_alpaca_crypto_position_round_trips_through_close_submission(
     request_body = captured[1]["json"]
     assert isinstance(request_body, dict)
     assert request_body["symbol"] == "BTC/USD"
+    # The emergency/protective close of a crypto position must not go out with
+    # `day` — Alpaca's crypto venue rejects it, which would leave the position
+    # un-flattenable. See test_alpaca_crypto_submit_upgrades_day_to_gtc.
+    assert request_body["time_in_force"] == "gtc"
+
+
+# ─────────────────── crypto time-in-force at the submit boundary ─────────────
+# Alpaca's crypto venue trades continuously and accepts only `gtc` / `ioc` — a
+# `day` order on a crypto pair is rejected by the venue. Every internal caller
+# submits with the TIF_DAY default, so without the boundary fix no crypto order
+# (long-term entry, protective exit, or emergency shutdown) could ever be
+# accepted.
+
+
+def test_alpaca_crypto_submit_upgrades_day_to_gtc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crypto pair submitted with the TIF_DAY default goes out as gtc."""
+    _with_creds(monkeypatch)
+    cap: list[dict[str, object]] = []
+    _patch_request(monkeypatch, _FakeResp(200, {
+        "id": "o1", "status": "accepted", "symbol": "BTC/USD", "filled_qty": "0",
+    }), capture=cap)
+
+    res = alpaca.AlpacaBroker().submit_order(
+        "BTC-USD", 0.05, broker.SIDE_BUY, limit_price=64_000.0,
+    )
+
+    assert res.ok is True
+    body = cap[0]["json"]
+    assert isinstance(body, dict)
+    assert body["time_in_force"] == "gtc"
+
+
+def test_alpaca_crypto_submit_honours_explicit_gtc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicitly requested gtc is passed through unchanged."""
+    _with_creds(monkeypatch)
+    cap: list[dict[str, object]] = []
+    _patch_request(monkeypatch, _FakeResp(200, {
+        "id": "o1", "status": "accepted", "symbol": "ETH/USD", "filled_qty": "0",
+    }), capture=cap)
+
+    alpaca.AlpacaBroker().submit_order(
+        "ETH-USD", 1.5, broker.SIDE_SELL, limit_price=3_400.0,
+        time_in_force=broker.TIF_GTC,
+    )
+
+    body = cap[0]["json"]
+    assert isinstance(body, dict)
+    assert body["time_in_force"] == "gtc"
+
+
+def test_alpaca_stock_submit_keeps_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Positive control: equities are unaffected and keep `day`."""
+    _with_creds(monkeypatch)
+    cap: list[dict[str, object]] = []
+    _patch_request(monkeypatch, _FakeResp(200, {
+        "id": "o1", "status": "accepted", "symbol": "AAPL", "filled_qty": "0",
+    }), capture=cap)
+
+    alpaca.AlpacaBroker().submit_order(
+        "AAPL", 10, broker.SIDE_BUY, limit_price=190.0,
+    )
+
+    body = cap[0]["json"]
+    assert isinstance(body, dict)
+    assert body["time_in_force"] == "day"
+
+
+def test_alpaca_option_submit_keeps_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Positive control: an OCC option symbol is not mistaken for a crypto pair."""
+    _with_creds(monkeypatch)
+    occ_symbol = "AAPL260116C00190000"
+    cap: list[dict[str, object]] = []
+    _patch_request(monkeypatch, _FakeResp(200, {
+        "id": "o1", "status": "accepted", "symbol": occ_symbol, "filled_qty": "0",
+    }), capture=cap)
+
+    alpaca.AlpacaBroker().submit_order(
+        occ_symbol, 1, broker.SIDE_BUY, limit_price=5.0,
+    )
+
+    body = cap[0]["json"]
+    assert isinstance(body, dict)
+    assert body["time_in_force"] == "day"
+
+
+def test_resolve_time_in_force_matches_symbol_translation_boundary() -> None:
+    """The TIF rule fires on exactly the symbols to_alpaca_symbol translates."""
+    for symbol in ("BTC-USD", "ETH-USD", "BNB-USD"):
+        assert alpaca.to_alpaca_symbol(symbol) != symbol
+        assert alpaca.resolve_time_in_force(symbol, broker.TIF_DAY) == broker.TIF_GTC
+    for symbol in ("AAPL", "BRK.B", "AAPL260116C00190000"):
+        assert alpaca.to_alpaca_symbol(symbol) == symbol
+        assert alpaca.resolve_time_in_force(symbol, broker.TIF_DAY) == broker.TIF_DAY
+
+
+def test_alpaca_crypto_submit_intent_log_shows_sent_tif(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The pre-send intent log records the tif actually sent, not the requested one."""
+    _with_creds(monkeypatch)
+    _patch_request(monkeypatch, _FakeResp(200, {
+        "id": "o1", "status": "accepted", "symbol": "BTC/USD", "filled_qty": "0",
+    }))
+
+    alpaca.AlpacaBroker().submit_order(
+        "BTC-USD", 0.05, broker.SIDE_BUY, limit_price=64_000.0,
+    )
+
+    err = capsys.readouterr().err
+    assert "submit intent" in err
+    assert "tif=gtc" in err
 
 
 def test_alpaca_get_positions_empty_is_ok(monkeypatch: pytest.MonkeyPatch) -> None:
