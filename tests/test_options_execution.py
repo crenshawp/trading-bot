@@ -399,6 +399,36 @@ def test_evaluate_exit_missing_price_holds() -> None:
     assert d.action == "hold"
 
 
+def test_evaluate_exit_missing_price_is_distinguishable_from_nothing_triggered() -> None:
+    """A skipped TP/SL check must NOT look like a completed one.
+
+    With no underlying quote the whole TP/SL block is skipped, and the reason
+    used to come back as plain "holding" -- byte-identical to "I checked the
+    price and nothing triggered". The stop loss was never evaluated.
+    """
+    missing = oe.evaluate_option_exit("call", None, 110.0, 95.0, _OPENED, None)
+    checked = oe.evaluate_option_exit("call", 100.0, 110.0, 95.0, _OPENED, None)
+
+    assert missing.action == "hold"
+    assert missing.reason == oe.EXIT_NO_PRICE_DATA
+    assert checked.reason == oe.EXIT_HOLDING
+    assert missing.reason != checked.reason
+
+
+def test_evaluate_exit_missing_price_still_honours_the_deadline() -> None:
+    """A run-out hold window closes even when the underlying cannot be quoted."""
+    d = oe.evaluate_option_exit("call", None, 110.0, 95.0, _LATE, _DEADLINE)
+    assert d.action == "close"
+    assert d.reason == oe.EXIT_HOLD_DEADLINE
+
+
+def test_evaluate_exit_without_levels_is_ordinary_holding() -> None:
+    """No TP/SL configured is not a price failure -- nothing was skipped."""
+    d = oe.evaluate_option_exit("call", None, None, None, _OPENED, None)
+    assert d.action == "hold"
+    assert d.reason == oe.EXIT_HOLDING
+
+
 # ───────────────────────── exit watcher (driver) ────────────────────────────
 
 
@@ -488,6 +518,41 @@ def test_watcher_holds_when_no_exit(tmp_db: Path) -> None:
     )
     assert actions[0].action == "hold"
     assert len(db.get_open_option_positions()) == 1   # still open, no order sent
+
+
+def test_watcher_says_so_when_the_underlying_cannot_be_quoted(
+    tmp_db: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An unevaluated stop is the one hold the operator has to be told about.
+
+    _build_latest_price_fetch returns prices.get, so a symbol absent from the
+    batch or with a 0 IEX bid/ask yields None. That silently skipped TP/SL and
+    the cycle still printed "N open position(s), 0 closed, 0 error(s)".
+    """
+    _open_position("AAPL260116C00150000", "AAPL")
+    actions = oe.watch_open_option_positions(
+        FakeBroker(), underlying_price_fetch=lambda _u: None,
+        option_price_fetch=lambda _s: 5.0, now=_OPENED,
+    )
+
+    assert actions[0].action == "hold"
+    assert actions[0].reason == oe.EXIT_NO_PRICE_DATA
+    assert len(db.get_open_option_positions()) == 1   # untouched, as before
+    err = capsys.readouterr().err
+    assert "no underlying quote for AAPL" in err
+    assert "TP/SL NOT evaluated" in err
+
+
+def test_watcher_is_quiet_on_an_ordinary_hold(
+    tmp_db: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The new warning must not fire on a hold that DID evaluate the levels."""
+    _open_position("AAPL260116C00150000", "AAPL")
+    oe.watch_open_option_positions(
+        FakeBroker(), underlying_price_fetch=lambda _u: 100.0,
+        option_price_fetch=lambda _s: 5.0, now=_OPENED,
+    )
+    assert "no underlying quote" not in capsys.readouterr().err
 
 
 def test_watcher_one_error_does_not_block_others(tmp_db: Path) -> None:

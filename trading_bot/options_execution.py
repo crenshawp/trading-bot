@@ -450,6 +450,9 @@ EXIT_TAKE_PROFIT = "take_profit"
 EXIT_STOP_LOSS = "stop_loss"
 EXIT_HOLD_DEADLINE = "hold_deadline"
 EXIT_HOLDING = "holding"
+# The underlying could not be quoted, so TP/SL were never evaluated. A HOLD,
+# because nothing was closed -- but never the same thing as "nothing triggered".
+EXIT_NO_PRICE_DATA = "no_price_data"
 
 
 @dataclass(frozen=True)
@@ -487,6 +490,8 @@ def evaluate_option_exit(
     hold-window deadline forces a close. Otherwise: hold. Never raises.
     """
     bullish = option_type == OPTION_TYPE_CALL
+    # Kept as an inline conjunction rather than a `has_levels` flag: mypy does
+    # not narrow tp/sl through a boolean variable, and the audit gate is strict.
     if underlying_price is not None and tp is not None and sl is not None:
         sl_hit = underlying_price <= sl if bullish else underlying_price >= sl
         tp_hit = underlying_price >= tp if bullish else underlying_price <= tp
@@ -494,8 +499,23 @@ def evaluate_option_exit(
             return ExitDecision("close", EXIT_STOP_LOSS)
         if tp_hit:
             return ExitDecision("close", EXIT_TAKE_PROFIT)
+    # The deadline is checked even with no price: a hold window that has run out
+    # forces a close regardless of whether the underlying could be quoted.
     if deadline is not None and now >= deadline:
         return ExitDecision("close", EXIT_HOLD_DEADLINE)
+    if underlying_price is None and tp is not None and sl is not None:
+        # DISTINCT from EXIT_HOLDING. A missing underlying quote skipped the
+        # whole TP/SL block above and then returned a plain "holding" -- byte
+        # identical to "I checked the price and nothing triggered". The stop
+        # loss was never evaluated, and nothing anywhere said so: the cycle
+        # printed "N open position(s), 0 closed, 0 error(s)".
+        #
+        # The fetcher (scanner._build_latest_price_fetch) returns prices.get,
+        # i.e. None for any symbol absent from the batch or whose IEX bid/ask
+        # came back 0 -- partial free-tier coverage makes that ordinary, not
+        # exceptional. long_term.watch_long_term_positions already distinguishes
+        # this case ("no price data"); the option watcher did not.
+        return ExitDecision("hold", EXIT_NO_PRICE_DATA)
     return ExitDecision("hold", EXIT_HOLDING)
 
 
@@ -619,6 +639,16 @@ def watch_open_option_positions(
                 pos.deadline,
             )
             if decision.action == "hold":
+                if decision.reason == EXIT_NO_PRICE_DATA:
+                    # Say it out loud. An unevaluated stop is the one "hold"
+                    # the operator needs to see, and the cycle summary counts
+                    # it among the quiet ones.
+                    print(
+                        f"  options watcher: no underlying quote for "
+                        f"{pos.underlying} ({pos.symbol}) - TP/SL NOT "
+                        f"evaluated this cycle",
+                        file=sys.stderr,
+                    )
                 actions.append(ExitAction(pos, "hold", decision.reason))
                 continue
 
