@@ -1670,6 +1670,37 @@ def test_latest_price_fetch_batches_stock_and_crypto_quotes(
     assert fetch("BTC-USD") == 60_050.0
 
 
+def test_latest_price_fetch_accepts_a_one_shot_iterator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_emergency_price_fetchers passes a generator; splitting it twice used to
+    leave `crypto` empty, so a Tier-2 shutdown could never price a crypto
+    position and therefore never closed one."""
+    from trading_bot import alpaca_market_data as amd
+
+    stock = amd.MarketQuote("META", datetime.now(UTC), 99.0, 1.0, 101.0, 1.0)
+    crypto_quote = amd.MarketQuote(
+        "BTC-USD", datetime.now(UTC), 60_000.0, 1.0, 60_100.0, 1.0,
+    )
+    asked: list[list[str]] = []
+
+    class QuoteClient:
+        def get_stock_latest_quotes(self, symbols: list[str]) -> amd.QuotesResult:
+            asked.append(symbols)
+            return amd.QuotesResult(ok=True, quotes={"META": stock})
+
+        def get_crypto_latest_quotes(self, symbols: list[str]) -> amd.QuotesResult:
+            asked.append(symbols)
+            return amd.QuotesResult(ok=True, quotes={"BTC-USD": crypto_quote})
+
+    monkeypatch.setattr(amd, "AlpacaMarketDataClient", QuoteClient)
+    fetch = scanner._build_latest_price_fetch(t for t in ("META", "BTC-USD"))
+
+    assert asked == [["META"], ["BTC-USD"]]  # the crypto leg IS requested
+    assert fetch("META") == 100.0
+    assert fetch("BTC-USD") == 60_050.0
+
+
 def test_exit_watcher_cycle_is_a_distinct_hook() -> None:
     """Additive — it does not replace the existing hourly cycles."""
     assert callable(scanner._run_exit_watcher_cycle)

@@ -1703,6 +1703,11 @@ def _build_latest_price_fetch(tickers):
 
     client = AlpacaMarketDataClient()
     prices: dict[str, float] = {}
+    # Materialise first: `tickers` is split into two comprehensions below, and
+    # _emergency_price_fetchers passes a GENERATOR. Consuming it for `stocks`
+    # left `crypto` permanently empty, so a Tier-2 shutdown never requested a
+    # crypto quote and could never flatten the crypto book.
+    tickers = list(tickers)
     stocks = sorted({ticker for ticker in tickers if not ticker.endswith("-USD")})
     crypto = sorted({ticker for ticker in tickers if ticker.endswith("-USD")})
     results = []
