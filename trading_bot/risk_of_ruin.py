@@ -58,6 +58,11 @@ _AUTH_REASON_SUFFIX = ".reason"
 _BROKER_ERROR_STREAK_KEY = "ror.broker_error_streak"
 _RECONCILE_STREAK_KEY = "ror.reconcile_divergence_streak"
 _LAST_EVENT_KEY = "ror.last_event"
+# The newest execution event the operator has ACKNOWLEDGED by re-authorizing,
+# stored as "<final_fill_at ISO>|<final_exit_pending_order_id>" — the first two
+# components of the ordering key in _ordered_broker_execution_outcomes, so the
+# comparison below matches that sort exactly. Advanced only by reauthorize().
+_TIER1_LOSS_ACK_KEY = "ror.tier1_loss_streak_ack"
 
 STATE_NORMAL = "normal"
 STATE_PAUSED = "paused"          # Tier 1 tripped — new entries revoked
@@ -312,20 +317,63 @@ def _ordered_broker_execution_outcomes() -> list[BrokerExecutionOutcome]:
     )
 
 
+def _tier1_loss_ack() -> tuple[datetime, int] | None:
+    """The newest execution event the operator acknowledged, or ``None``.
+
+    Unreadable / hand-mangled values are treated as no acknowledgement at all:
+    that direction keeps the breaker STRICTER (the whole streak still counts),
+    which is the only safe way to fail here.
+    """
+    raw = settings.get(_TIER1_LOSS_ACK_KEY)
+    if not raw or "|" not in raw:
+        return None
+    stamp, _, order_id = raw.rpartition("|")
+    try:
+        fill_at = datetime.fromisoformat(stamp)
+        return fill_at, int(order_id)
+    except ValueError:
+        print(
+            f"  risk: unreadable tier1 acknowledgement {raw!r} - ignoring it "
+            "(the full loss streak still counts)",
+            file=sys.stderr,
+        )
+        return None
+
+
 def consecutive_losses() -> int | None:
     """Return the provable leading real-execution loss run, or ``None``.
 
     A known threshold is monotonic: once the configured number of newer losses
     is reached, older unknown history cannot undo the Tier-1 trigger.  Before
     that point an unknown event makes the streak indeterminate.
+
+    Counting stops at the newest event the operator ACKNOWLEDGED via
+    ``reauthorize`` (``_TIER1_LOSS_ACK_KEY``).  Without that boundary the Tier-1
+    loss breaker was unrecoverable: the streak is derived from closed positions
+    and nothing ever marked one as seen, so the next hourly ``evaluate_tier1``
+    re-read the same losses and re-paused within the hour — and the only thing
+    that can break a streak is a WIN, which needs a new position, which the
+    pause revokes.  A fresh run of MAX_CONSECUTIVE_LOSSES real losses after the
+    acknowledgement trips it again exactly as before.
     """
     try:
         outcomes = _ordered_broker_execution_outcomes()
     except Exception as exc:  # noqa: BLE001 - safety truth must fail unknown
         print(f"  risk: broker execution outcomes unknown ({exc})", file=sys.stderr)
         return None
+    acknowledged = _tier1_loss_ack()
     streak = 0
     for event in outcomes:
+        fill_at = event.final_fill_at
+        order_id = event.final_exit_pending_order_id
+        if (
+            acknowledged is not None
+            and fill_at is not None
+            and order_id is not None
+            and (fill_at, order_id) <= acknowledged
+        ):
+            # This event and everything older were signed off by the operator.
+            return streak
         if event.outcome == "loss":
             streak += 1
             if streak >= config.MAX_CONSECUTIVE_LOSSES:
@@ -807,6 +855,44 @@ def _safe_send(send: Notifier, title: str, message: str) -> None:
 # ── operator controls: re-authorization + manual kill switch ─────────────────
 
 
+def _acknowledge_loss_streak() -> None:
+    """Mark the current newest execution event as seen by the operator.
+
+    The Tier-1 loss streak is DERIVED from closed positions, so unlike the two
+    Tier-2 detectors there is no counter to zero — without a watermark the same
+    losses were re-counted on the next hourly evaluate_tier1 and the pause came
+    straight back, permanently. This is the loss-streak equivalent of the
+    ``settings.set(..., "0")`` calls beside it.
+
+    FAIL-SOFT on purpose: if the outcome set cannot be read, nothing is written
+    and no acknowledgement is recorded — but that is exactly the case where
+    ``consecutive_losses`` already returns ``None`` (indeterminate) and cannot
+    trip, so re-authorization still holds. An empty book likewise leaves the
+    watermark alone: there is nothing to acknowledge.
+
+    NOT touched: the drawdown breaker. ``current_drawdown_pct`` measures against
+    the all-time equity peak and recovers on its own as equity does, so it is
+    not the unrecoverable one; re-baselining a peak is a separate judgement call
+    about what "recovered" means and is deliberately left to the operator.
+    """
+    try:
+        outcomes = _ordered_broker_execution_outcomes()
+    except Exception as exc:  # noqa: BLE001 - re-authorization must still restore state
+        print(
+            f"  risk: could not read execution outcomes to acknowledge the loss "
+            f"streak ({exc}); the streak is indeterminate and cannot trip",
+            file=sys.stderr,
+        )
+        return
+    for event in outcomes:  # newest first
+        if event.final_fill_at is not None and event.final_exit_pending_order_id is not None:
+            settings.set(
+                _TIER1_LOSS_ACK_KEY,
+                f"{event.final_fill_at.isoformat()}|{event.final_exit_pending_order_id}",
+            )
+            return
+
+
 def reauthorize(token: str) -> tuple[bool, str]:
     """Clear a Tier-1 pause OR a Tier-2 halt and restore capabilities.
 
@@ -825,6 +911,7 @@ def reauthorize(token: str) -> tuple[bool, str]:
     authorize(config.ENTRY_CAPABILITY)
     settings.set(_BROKER_ERROR_STREAK_KEY, "0")
     settings.set(_RECONCILE_STREAK_KEY, "0")
+    _acknowledge_loss_streak()
     _set_state(STATE_NORMAL)
     settings.set(_LAST_EVENT_KEY, f"operator re-authorization (was {previous})")
     print(f"  risk: operator re-authorization (was {previous})", file=sys.stderr)
