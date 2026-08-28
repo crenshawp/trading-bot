@@ -643,3 +643,103 @@ def test_cli_renders_unknown_loss_truth(
     monkeypatch.setattr(ror, "consecutive_losses", lambda: None)
     main.cmd_risk_ror_status()
     assert "Consecutive losses:    unknown / 7 limit" in capsys.readouterr().out
+
+
+# ───────── operator re-authorization must actually clear the Tier-1 pause ────
+
+
+def test_reauthorize_breaks_the_tier1_loss_deadlock(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pause must not come straight back on the next hourly cycle.
+
+    The loss streak is DERIVED from closed positions, so `reauthorize` — which
+    zeroes both Tier-2 counters — had nothing to zero here. `evaluate_tier1`
+    re-read the same seven losses, re-revoked entry and re-paused within the
+    hour. That is unrecoverable, not merely annoying: the only thing that
+    breaks a streak is a WIN, a win needs a new position, and new positions are
+    exactly what the pause revokes.
+    """
+    losses = [_event("loss", index) for index in range(7)]
+    monkeypatch.setattr(ror, "_ordered_broker_execution_outcomes", lambda: losses)
+
+    assert ror.consecutive_losses() == config.MAX_CONSECUTIVE_LOSSES
+    assert ror.evaluate_tier1(notifier=_Recorder()).tripped is True
+    assert ror.get_state() == ror.STATE_PAUSED
+
+    ok, _msg = ror.reauthorize(config.ROR_REAUTHORIZE_TOKEN)
+    assert ok is True
+
+    # The next hourly cycle, with the SAME closed book and nothing new traded.
+    assert ror.consecutive_losses() == 0
+    assert ror.evaluate_tier1(notifier=_Recorder()).tripped is False
+    assert ror.get_state() == ror.STATE_NORMAL
+    assert ror.is_entry_authorized() is True
+
+
+def test_a_fresh_loss_run_after_reauthorization_still_trips(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The breaker is acknowledged, not disabled: MAX_CONSECUTIVE_LOSSES NEW
+    real-execution losses trip it again exactly as before."""
+    book = [_event("loss", index) for index in range(7)]
+    monkeypatch.setattr(ror, "_ordered_broker_execution_outcomes", lambda: book)
+    ror.evaluate_tier1(notifier=_Recorder())
+    ror.reauthorize(config.ROR_REAUTHORIZE_TOKEN)
+    assert ror.consecutive_losses() == 0
+
+    # Seven newer losses arrive (offset -1.. -7 -> newer than the whole book).
+    fresh = [_event("loss", -(index + 1)) for index in range(7)]
+    book[:0] = fresh
+    assert ror.consecutive_losses() == config.MAX_CONSECUTIVE_LOSSES
+    assert ror.evaluate_tier1(notifier=_Recorder()).tripped is True
+    assert ror.get_state() == ror.STATE_PAUSED
+
+
+def test_acknowledgement_only_hides_events_at_or_older_than_the_watermark(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single newer loss is still counted; the acknowledged ones are not."""
+    book = [_event("loss", index) for index in range(7)]
+    monkeypatch.setattr(ror, "_ordered_broker_execution_outcomes", lambda: book)
+    ror.reauthorize(config.ROR_REAUTHORIZE_TOKEN)
+
+    book.insert(0, _event("loss", -1))
+    assert ror.consecutive_losses() == 1
+
+
+def test_unreadable_acknowledgement_falls_back_to_counting_everything(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Fail STRICTER: a mangled watermark must never silently mute the breaker."""
+    from trading_bot import settings
+
+    book = [_event("loss", index) for index in range(7)]
+    monkeypatch.setattr(ror, "_ordered_broker_execution_outcomes", lambda: book)
+    settings.set(ror._TIER1_LOSS_ACK_KEY, "not-a-timestamp|nope")
+
+    assert ror.consecutive_losses() == config.MAX_CONSECUTIVE_LOSSES
+    assert "unreadable tier1 acknowledgement" in capsys.readouterr().err
+
+
+def test_reauthorize_survives_an_unreadable_outcome_set(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """It must still restore state. The streak is indeterminate in this case,
+    so `consecutive_losses` returns None and cannot trip anyway."""
+    def boom() -> list[BrokerExecutionOutcome]:
+        raise sqlite3.OperationalError("db unavailable")
+
+    monkeypatch.setattr(ror, "_ordered_broker_execution_outcomes", boom)
+    ror._set_state(ror.STATE_PAUSED)
+    ror.revoke(config.ENTRY_CAPABILITY, "tier1: test")
+
+    ok, _msg = ror.reauthorize(config.ROR_REAUTHORIZE_TOKEN)
+
+    assert ok is True
+    assert ror.get_state() == ror.STATE_NORMAL
+    assert ror.is_entry_authorized() is True
+    assert "could not read execution outcomes" in capsys.readouterr().err
+    assert ror.consecutive_losses() is None
