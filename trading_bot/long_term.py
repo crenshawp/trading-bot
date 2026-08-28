@@ -673,6 +673,20 @@ def watch_long_term_positions(
         try:
             df = price_fetch(pos.ticker)
             if df is None:
+                # Say it out loud. This "hold" means "I could not look", never
+                # "I looked and nothing triggered": with no candles the trend
+                # breakdown and drawdown stop (or a swing_fallback row's own
+                # TP/SL) were never evaluated at all. The distinct reason was
+                # already recorded, but nothing printed it, so an unevaluated
+                # protective stop was indistinguishable from a quiet hold in
+                # the cycle summary. options_execution.watch_open_option_
+                # positions prints the same line for the same reason
+                # (EXIT_NO_PRICE_DATA); this watcher was the silent half.
+                print(
+                    f"  longterm watcher: no price data for {pos.ticker} - "
+                    f"protective exits NOT evaluated this cycle",
+                    file=sys.stderr,
+                )
                 actions.append(ExitAction(pos, "hold", "no price data"))
                 continue
             current_price = _val(df["Close"], -1)

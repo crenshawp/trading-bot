@@ -769,6 +769,50 @@ def test_mixed_book_neither_path_affects_the_other(tmp_db: Path) -> None:
     assert by_ticker["SWNG"] == ("hold", "holding")           # its own SL wins
 
 
+def test_watcher_announces_a_position_it_could_not_price(
+    tmp_db: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A missing candle frame skips the protective exits entirely, so it must
+    not look like an ordinary hold.
+
+    `price_fetch` is scanner.get_exit_price_history, which returns None on an
+    empty yfinance frame WITHOUT printing anything. The watcher then recorded
+    the distinct "no price data" reason but also stayed silent, so a position
+    whose drawdown stop was never evaluated was indistinguishable from one
+    that was evaluated and held — hour after hour. FAILS before the fix.
+    """
+    _seed_position("THIN", 100.0)
+
+    actions = long_term.watch_long_term_positions(
+        FakeBroker(auto_fill=True),
+        price_fetch=lambda _t: None,
+        now=datetime(2026, 1, 5, tzinfo=UTC),
+    )
+
+    assert [(a.action, a.reason) for a in actions] == [("hold", "no price data")]
+    err = capsys.readouterr().err
+    assert "THIN" in err
+    assert "no price data" in err
+    assert "NOT evaluated" in err
+
+
+def test_watcher_stays_quiet_for_an_ordinary_priced_hold(
+    tmp_db: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The new line is scoped to the unpriced case only — a genuine hold that
+    DID evaluate its stops must not start printing a warning every cycle."""
+    _seed_position("HOLD6", 100.0)
+
+    actions = long_term.watch_long_term_positions(
+        FakeBroker(auto_fill=True),
+        price_fetch=lambda _t: _flat_df(99.0),   # -1%: nothing triggers
+        now=datetime(2026, 1, 5, tzinfo=UTC),
+    )
+
+    assert actions[0].action == "hold"
+    assert "NOT evaluated" not in capsys.readouterr().err
+
+
 def test_cli_longterm_positions_shows_source(
     tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
