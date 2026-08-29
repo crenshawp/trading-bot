@@ -330,6 +330,33 @@ def _tier1_loss_ack() -> tuple[datetime, int] | None:
     stamp, _, order_id = raw.rpartition("|")
     try:
         fill_at = datetime.fromisoformat(stamp)
+    except ValueError:
+        print(
+            f"  risk: unreadable tier1 acknowledgement {raw!r} - ignoring it "
+            "(the full loss streak still counts)",
+            file=sys.stderr,
+        )
+        return None
+    if fill_at.tzinfo is None:
+        # A naive stamp PARSES fine, so it escaped the guard above and reached
+        # the `(fill_at, order_id) <= acknowledged` comparison in
+        # `consecutive_losses` — where every `final_fill_at` is guaranteed
+        # tz-aware (`_ordered_broker_execution_outcomes` raises on a naive one).
+        # Comparing the two raises TypeError, which is NOT caught there (the try
+        # wraps only the outcomes fetch), so it propagated through
+        # `evaluate_tier1` to `_run_risk_cycle` and aborted the entire hourly
+        # risk cycle at its first statement — no Tier-1 evaluation, no
+        # reconciliation, no catastrophic check, no STATE_HOLDING retry of
+        # pending emergency closes — every hour until the row was hand-repaired.
+        # This is what the docstring above already promises: unusable values are
+        # ignored, which keeps the breaker STRICTER.
+        print(
+            f"  risk: tier1 acknowledgement {raw!r} has no timezone - ignoring "
+            "it (the full loss streak still counts)",
+            file=sys.stderr,
+        )
+        return None
+    try:
         return fill_at, int(order_id)
     except ValueError:
         print(
