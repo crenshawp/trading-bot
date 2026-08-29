@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 from trading_bot import allocation, config
 from trading_bot.broker.base import AccountInfo, Position, PositionsResult
+from trading_bot.broker.options import parse_occ_symbol
 from trading_bot.models import LongTermPosition, OptionPosition, PendingOrder
 
 
@@ -132,9 +133,8 @@ def build_existing_exposure(
         ticker_values[ticker] = ticker_values.get(ticker, 0.0) + value
 
     for position in broker_positions.positions:
-        # Identify the holding BEFORE valuing it: only the internal books know
-        # whether a broker symbol is an option contract, and an option's
-        # entry-cost fallback needs the contract multiplier.
+        # Identify the holding BEFORE valuing it: an option's entry-cost
+        # fallback needs the contract multiplier.
         option = option_by_symbol.get(position.symbol)
         long_term = long_term_by_symbol.get(position.symbol)
         pending = pending_by_symbol.get(position.symbol)
@@ -142,10 +142,25 @@ def build_existing_exposure(
             is_option = True
         elif long_term is not None:
             is_option = False  # long-term holdings are shares or crypto
-        else:
+        elif pending is not None:
             # A partially filled option entry has a broker position before the
             # option_positions row exists; the working order names its kind.
-            is_option = pending is not None and pending.target_position_kind == "option"
+            is_option = pending.target_position_kind == "option"
+        else:
+            # Nothing internal claims this symbol — but the symbol ITSELF says
+            # whether it is a contract. Deciding option-ness only from the books
+            # valued an untracked OCC holding at 1/100th of its dollars (a $1,800
+            # position reported as $18), so the allocator saw essentially
+            # unlimited gross- and ticker-exposure room and approved entries it
+            # should have skipped. That fails OPEN, which this module's docstring
+            # promises it never does. Reachable whenever a broker-held contract
+            # has no option_positions row and no working entry order: an internal
+            # row closed while the broker still shows the contract, a
+            # materialisation failure after a terminal fill, or a residual
+            # contract in the same paper account.
+            # `risk_of_ruin._generic_close_limit_price` already identifies this
+            # exact case from the symbol alone; same tool, same job.
+            is_option = parse_occ_symbol(position.symbol) is not None
         multiplier = float(config.OPTION_MULTIPLIER) if is_option else 1.0
 
         value = _position_value(position, multiplier)

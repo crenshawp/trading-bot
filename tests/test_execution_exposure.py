@@ -238,3 +238,80 @@ def test_partially_filled_option_entry_uses_the_multiplier_before_its_book_row()
     # Filled contract: 5.00 x 100 x 1 = $500. Working remainder: 2 x 5.00 x 100
     # = $1,000 (the working-order branch already applied the multiplier).
     assert result.exposure.ticker_values == {"NVDA": 1_500.0}
+
+
+def test_untracked_option_contract_still_gets_the_multiplier() -> None:
+    """A broker-held OCC contract that no internal book claims must still be
+    valued in dollars.
+
+    Option-ness used to be decided ONLY from the internal books, so a contract
+    with no ``option_positions`` row and no working entry order fell through to
+    ``multiplier = 1.0`` and was valued at 1/100th of its dollars. The allocator
+    then saw essentially unlimited gross- and ticker-exposure room and approved
+    entries it should have skipped — failing OPEN, which this module's docstring
+    says it never does.
+
+    Reachable whenever the broker still shows a contract the books do not: an
+    internal row closed ahead of the broker, a materialisation failure after a
+    terminal fill, or a residual contract in the same paper account. The symbol
+    itself is sufficient to identify it, which is what
+    ``risk_of_ruin._generic_close_limit_price`` already does.
+    """
+    positions = PositionsResult(ok=True, positions=[
+        Position("AMZN260320C00250000", 3.0, avg_entry_price=6.00),
+    ])
+    result = execution_exposure.build_existing_exposure(
+        _account(), positions, [], [], [],
+    )
+
+    assert result.ok is True
+    assert result.exposure is not None
+    # 6.00 premium x 100 x 3 contracts = $1,800 (was $18 before the fix).
+    assert result.exposure.gross_value == 1_800.0
+
+
+def test_untracked_option_matches_the_same_position_when_tracked() -> None:
+    """The snapshot must not depend on whether the internal book happens to
+    carry the row: the dollars at risk are the same either way."""
+    positions = PositionsResult(ok=True, positions=[
+        Position("META260918C00500000", 2.0, avg_entry_price=20.0),
+    ])
+    untracked = execution_exposure.build_existing_exposure(
+        _account(), positions, [], [], [],
+    )
+    tracked = execution_exposure.build_existing_exposure(
+        _account(), positions, [_option()], [], [],
+    )
+
+    assert untracked.exposure is not None and tracked.exposure is not None
+    assert untracked.exposure.gross_value == tracked.exposure.gross_value == 4_000.0
+
+
+def test_untracked_equity_symbol_gets_no_multiplier() -> None:
+    """Control: an unclaimed PLAIN symbol must not be mistaken for a contract."""
+    positions = PositionsResult(ok=True, positions=[
+        Position("AAPL", 10.0, avg_entry_price=200.0),
+    ])
+    result = execution_exposure.build_existing_exposure(
+        _account(), positions, [], [], [],
+    )
+
+    assert result.ok is True
+    assert result.exposure is not None
+    assert result.exposure.gross_value == 2_000.0
+
+
+def test_a_market_value_is_never_multiplied_for_an_untracked_contract() -> None:
+    """Control: the broker reports an option's ``market_value`` with the
+    multiplier ALREADY applied, so the symbol-based fallback must not double it."""
+    positions = PositionsResult(ok=True, positions=[
+        Position("AMZN260320C00250000", 3.0, avg_entry_price=6.00,
+                 market_value=1_800.0),
+    ])
+    result = execution_exposure.build_existing_exposure(
+        _account(), positions, [], [], [],
+    )
+
+    assert result.ok is True
+    assert result.exposure is not None
+    assert result.exposure.gross_value == 1_800.0
