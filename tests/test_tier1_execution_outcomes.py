@@ -723,6 +723,55 @@ def test_unreadable_acknowledgement_falls_back_to_counting_everything(
     assert "unreadable tier1 acknowledgement" in capsys.readouterr().err
 
 
+def test_a_naive_acknowledgement_is_ignored_rather_than_crashing_the_cycle(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression: a timezone-less watermark PARSES, then poisons the compare.
+
+    `datetime.fromisoformat("2026-08-01T10:00:00")` raises no ValueError, so it
+    slipped past the unreadable-value guard and reached
+    `(fill_at, order_id) <= acknowledged` — where every `final_fill_at` is
+    guaranteed tz-aware. That raises TypeError, which is NOT caught in
+    `consecutive_losses` (its try wraps only the outcomes fetch), so it
+    propagated through `evaluate_tier1` and aborted the whole hourly risk cycle:
+    no Tier-1 evaluation, no reconciliation, no catastrophic check, and no
+    STATE_HOLDING retry of pending emergency closes — every hour, until the
+    settings row was repaired by hand.
+
+    Treated like any other unusable value: ignored, so the FULL streak counts
+    (stricter, never looser).
+    """
+    from trading_bot import settings
+
+    book = [_event("loss", index) for index in range(7)]
+    monkeypatch.setattr(ror, "_ordered_broker_execution_outcomes", lambda: book)
+    settings.set(ror._TIER1_LOSS_ACK_KEY, "2026-08-01T10:00:00|1000")
+
+    assert ror.consecutive_losses() == config.MAX_CONSECUTIVE_LOSSES
+    assert "has no timezone" in capsys.readouterr().err
+
+
+def test_a_tz_aware_acknowledgement_still_bounds_the_streak(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control: the normal write path stores a tz-aware stamp, which must keep
+    working exactly as before — the fix must not reject a valid watermark."""
+    from trading_bot import settings
+
+    book = [_event("loss", index) for index in range(7)]
+    ack = book[2]
+    assert ack.final_fill_at is not None
+    settings.set(
+        ror._TIER1_LOSS_ACK_KEY,
+        f"{ack.final_fill_at.isoformat()}|{ack.final_exit_pending_order_id}",
+    )
+    monkeypatch.setattr(ror, "_ordered_broker_execution_outcomes", lambda: book)
+
+    # Only the two events newer than the acknowledged one still count.
+    assert ror.consecutive_losses() == 2
+
+
 def test_reauthorize_survives_an_unreadable_outcome_set(
     tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
