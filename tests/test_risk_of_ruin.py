@@ -949,6 +949,70 @@ def test_generic_short_close_uses_positive_market_value_magnitude(
     assert order.requested_limit_price == 240.0
 
 
+def test_generic_option_close_divides_out_the_contract_multiplier(
+    tmp_db: Path,
+) -> None:
+    """An untyped OPTION position prices per SHARE, not per contract.
+
+    Pins the defect: the broker reports an option's market value with the 100x
+    multiplier already applied while qty stays in contracts, so the raw
+    market_value/qty quotient was a 100x limit price. A sell limit at $600
+    against a $6.00 market never fills, so the Tier-2 flatten could never
+    complete for that position.
+    """
+    broker = _ClosingFakeBroker(auto_fill=False)
+    broker._positions["META260918C00480000"] = Position(
+        symbol="META260918C00480000", qty=3.0, side="long", market_value=1800.0,
+    )
+
+    ror.emergency_shutdown(
+        broker, trigger="test", notifier=_Recorder(), now=_TS,
+    )
+
+    (order,) = db.get_generic_emergency_orders_for_symbol("META260918C00480000")
+    assert order.side == "sell"
+    assert order.requested_qty == 3.0
+    assert order.requested_limit_price == 6.0
+
+
+def test_generic_equity_close_price_is_unchanged_by_the_option_correction(
+    tmp_db: Path,
+) -> None:
+    """The multiplier must apply to OCC symbols only — equities are untouched."""
+    broker = _ClosingFakeBroker(auto_fill=False)
+    broker._positions["NVDA"] = Position(
+        symbol="NVDA", qty=4.0, side="long", market_value=800.0,
+    )
+
+    ror.emergency_shutdown(
+        broker, trigger="test", notifier=_Recorder(), now=_TS,
+    )
+
+    (order,) = db.get_generic_emergency_orders_for_symbol("NVDA")
+    assert order.requested_limit_price == 200.0
+
+
+def test_generic_option_close_entry_price_fallback_is_not_divided(
+    tmp_db: Path,
+) -> None:
+    """avg_entry_price is ALREADY a per-share premium; dividing would be wrong."""
+    broker = _ClosingFakeBroker(auto_fill=False)
+    broker._positions["META260918C00480000"] = Position(
+        symbol="META260918C00480000",
+        qty=2.0,
+        side="long",
+        market_value=None,
+        avg_entry_price=5.25,
+    )
+
+    ror.emergency_shutdown(
+        broker, trigger="test", notifier=_Recorder(), now=_TS,
+    )
+
+    (order,) = db.get_generic_emergency_orders_for_symbol("META260918C00480000")
+    assert order.requested_limit_price == 5.25
+
+
 def test_emergency_restart_does_not_duplicate_nonterminal_typed_exit(
     tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1176,6 +1240,42 @@ def test_cli_risk_killswitch(tmp_db: Path, monkeypatch, capsys) -> None:
     m.cmd_risk_killswitch(config.ROR_KILLSWITCH_TOKEN)
     out = capsys.readouterr().out
     assert "KILL SWITCH: halted" in out
+    assert ror.get_state() == ror.STATE_HALTED
+
+
+def test_cli_risk_killswitch_actually_closes_typed_positions(
+    tmp_db: Path, monkeypatch, capsys,
+) -> None:
+    """The operator kill switch must FLATTEN the book, not defer every position.
+
+    Regression: `cmd_risk_killswitch` called `kill_switch` without
+    `option_price_fetch` / `long_term_price_fetch`, so both typed closers hit
+    their deliberate "no current price is available" refusal and every holding
+    landed in `pending`. The existing CLI test ran against an EMPTY book, so it
+    halted trivially and never caught this. The three automatic call sites in
+    scanner.py already wired `_emergency_price_fetchers`; the CLI was missed.
+    """
+    from trading_bot import __main__ as m
+
+    _seed_open_option()
+    _seed_open_long_term()
+    b = _ClosingFakeBroker(auto_fill=True)
+    monkeypatch.setattr(m.broker, "AlpacaBroker", lambda: b)
+    monkeypatch.setattr(ror, "_pushover_notify", lambda _t, _m: True)
+    # Stand in for the live quote lookups the real helper performs.
+    monkeypatch.setattr(
+        "trading_bot.scanner._emergency_price_fetchers",
+        lambda: ((lambda _s: 6.0), (lambda _t: 470.0)),
+    )
+
+    m.cmd_risk_killswitch(config.ROR_KILLSWITCH_TOKEN)
+
+    out = capsys.readouterr().out
+    assert "KILL SWITCH: halted" in out
+    # The books are actually EMPTY — nothing was merely deferred to `pending`.
+    assert db.get_open_option_positions() == []
+    assert db.get_open_long_term_positions() == []
+    assert "pending:" not in out
     assert ror.get_state() == ror.STATE_HALTED
 
 

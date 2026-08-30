@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import time
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -698,11 +699,21 @@ def is_market_open():
     # would silently have been treated as a normal trading day, forever, with
     # no warning — scanning stale prior-session bars and firing signals dated
     # to a non-session, which the hourly execution cycle would then act on.
+    #
+    # The CLOSING bell comes from outcomes.stock_session_close, not a hardcoded
+    # 16:00. The NYSE shuts at 13:00 ET on three half-days a year (July 3, the
+    # Friday after Thanksgiving, Christmas Eve), and a session-only check said
+    # "open" for the three hours after that bell — during which the hourly
+    # execution cycle submits real opening orders and durably consumes the
+    # signals behind them.
     now = datetime.now(ZoneInfo("America/New_York"))
     if not outcomes.is_stock_session(now.date()):
         return False
+    close_time = outcomes.stock_session_close(now.date())
     market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
-    market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+    market_close = now.replace(
+        hour=close_time.hour, minute=close_time.minute, second=0, microsecond=0,
+    )
     return market_open <= now <= market_close
 
 
@@ -1604,7 +1615,25 @@ def _run_allocation_execution_cycle() -> None:
     """Hourly: build the live plan and execute it. Mirrors cmd_allocate_execute's
     --confirm path in __main__.py, minus the CLI printing. execute_plan already
     checks risk_of_ruin.is_entry_authorized() internally — do not duplicate that
-    check here."""
+    check here.
+
+    Runs ONLY while the equity market is open. `schedule.every(1).hours` fires
+    around the clock — nights, weekends, holidays — and this cycle is the one
+    scheduled job that SUBMITS OPENING ORDERS, so it needs the same trading-day
+    guard `scan_stocks` already applies. Two things go wrong without it:
+
+    1. Orders are submitted outside RTH. `execute_plan` checks the Phase 15
+       entry authorization and nothing else — no submission path anywhere
+       consults market hours.
+    2. Worse, `live_candidates(mark_considered=True)` CONSUMES every actionable
+       signal the moment it is pulled (the locked Phase 17 "considered exactly
+       once" design). An off-hours pass therefore burns signals that the next
+       in-hours pass would have acted on — which is why this guard has to come
+       before that call, not after the plan is built.
+    """
+    if not is_market_open():
+        return
+
     try:
         from trading_bot import (
             allocation,
@@ -1737,7 +1766,9 @@ def _build_latest_price_fetch(tickers):
     return prices.get
 
 
-def _emergency_price_fetchers():
+def _emergency_price_fetchers() -> tuple[
+    Callable[[str], float | None], Callable[[str], float | None]
+]:
     """``(option_price_fetch, long_term_price_fetch)`` for a Tier-2 shutdown.
 
     Every production call site previously omitted both, so ``price`` was None
@@ -1792,8 +1823,39 @@ def _run_exit_watcher_cycle() -> None:
                 f"options market closed - deferred {len(option_book)} option "
                 "position(s) until a fresh regular-session quote is available"
             )
+        # Same guard as the option branch above, and for the same reason its
+        # docstring gives: "a weekend/overnight watcher cannot queue a stale
+        # limit for the next session". This cycle runs hourly around the clock,
+        # and a share exit goes out as a TIF_DAY limit priced off `price_fetch`,
+        # which returns DAILY candles — so an out-of-hours trigger submits a
+        # limit at the LAST SESSION'S CLOSE, which Alpaca queues for the next
+        # open. Worse, `_submit_long_term_watcher_exit` then refuses any further
+        # attempt while that order is nonterminal, so on the Monday gap-down the
+        # protective stop is meant to escape, the resting limit sits above the
+        # market, does not fill, and nothing else can be submitted until it
+        # expires at Monday's close.
+        #
+        # Split by asset class rather than deferring the whole book: crypto
+        # trades 24/7 and must stay watched.
+        # The watcher is still called unconditionally — that it runs in
+        # production at all is a pinned regression — but it is handed the
+        # filtered book rather than left to read the whole one from the DB.
+        lt_book = db.get_open_long_term_positions()
+        if lt_book and not is_market_open():
+            tradeable = [p for p in lt_book if p.asset_class == "crypto"]
+            deferred = len(lt_book) - len(tradeable)
+            if deferred:
+                print(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] exit watchers: "
+                    f"equity market closed - deferred {deferred} share "
+                    "position(s) until a fresh regular-session quote is available"
+                )
+        else:
+            tradeable = lt_book
+
         lt_actions = long_term.watch_long_term_positions(
             broker, price_fetch=get_exit_price_history, now=now,
+            positions=tradeable,
         )
 
         actions = [*option_actions, *lt_actions]
@@ -1856,7 +1918,11 @@ def _run_optimization_cycle() -> None:
         payload = self_optimization.run_optimization()
         run_id = self_optimization.persist_run(payload)
         degradations = payload.get("degradations", [])
-        flags = sum(item.get("verdict") == "degrading" for item in degradations)
+        # self_optimization._degradation_finding emits "degraded" — never
+        # "degrading". Matching the wrong string made this counter permanently 0,
+        # so the operator's only visible signal that self-optimisation found a
+        # decaying edge always read "0 degradation flag(s)".
+        flags = sum(item.get("verdict") == "degraded" for item in degradations)
         print(
             f"[{datetime.now().strftime('%H:%M:%S')}] self-optimization: "
             f"persisted run {run_id}, {flags} degradation flag(s)"
