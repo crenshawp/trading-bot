@@ -11,6 +11,7 @@ boundary.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -41,12 +42,14 @@ def _seed_signal(
     news_risk: str | bool = "UNKNOWN",
     timestamp: datetime = _NOW,
     hold_days: int | None = None,
+    raw_indicators_json: str | None = None,
 ) -> int:
     return db.insert_signal(Signal(
         timestamp=timestamp, ticker=ticker, asset_class=asset_class,
         signal_type=signal_type, direction=direction, entry_price=entry,
         atr=atr, rsi=rsi, earnings_risk=earnings_risk, news_risk=news_risk,
         hold_estimate_days=hold_days,
+        raw_indicators_json=raw_indicators_json,
     ))
 
 
@@ -76,6 +79,36 @@ def test_fresh_signal_is_returned(tmp_db: Path) -> None:
     assert candidate.ticker == "META"
     assert candidate.signal_type == "ema21_pullback"
     assert candidate.signal_id == sid
+
+
+def test_multi_horizon_position_scale_reaches_candidate(tmp_db: Path) -> None:
+    sid = _seed_signal(
+        signal_type=config.MULTI_HORIZON_SIGNAL,
+        raw_indicators_json=json.dumps({"position_scale": 0.5}),
+        hold_days=config.MULTI_HORIZON_HOLD_DAYS,
+    )
+    _seed_trade(sid)
+
+    (candidate,) = _live()
+
+    assert candidate.position_scale == pytest.approx(0.5)
+    assert allocation.route_pool(candidate) == config.POOL_SWING
+
+
+def test_invalid_multi_horizon_position_scale_fails_closed(
+    tmp_db: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    sid = _seed_signal(
+        signal_type=config.MULTI_HORIZON_SIGNAL,
+        raw_indicators_json="{}",
+    )
+    _seed_trade(sid)
+
+    (candidate,) = _live()
+
+    assert candidate.position_scale == 0.0
+    assert allocation.filter_reason(candidate, 10_000.0) == "unsizeable"
+    assert "invalid multi-horizon position scale" in capsys.readouterr().err
 
 
 def test_stale_signal_outside_window_is_excluded(tmp_db: Path) -> None:

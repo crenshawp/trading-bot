@@ -88,7 +88,8 @@ from trading_bot.models import (
 # Version 2 (Phase 2.1) — adds trades.market_regime + regime_snapshots table.
 # Version 31 (cross-cutting audit): one nonterminal typed exit per position.
 # Version 32 (production hardening): backfill missing option hold deadlines.
-SCHEMA_VERSION = 32
+# Version 33 (multi-horizon momentum): weekly evaluation audit ledger.
+SCHEMA_VERSION = 33
 
 
 class PendingExitAlreadyExistsError(RuntimeError):
@@ -318,6 +319,32 @@ CREATE TABLE IF NOT EXISTS signal_pair_transitions (
 
 CREATE INDEX IF NOT EXISTS idx_signal_pair_transitions_pair
     ON signal_pair_transitions (ticker, signal_type);
+
+-- TradingLab multi-horizon momentum: one successful evaluation per ticker per
+-- strategy week. Zero/flat scores are retained too, preventing daily retries
+-- from turning a weekly rule into a daily one while still leaving failed data
+-- fetches absent and therefore retryable on the next market day.
+CREATE TABLE IF NOT EXISTS multi_horizon_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_week TEXT NOT NULL,
+    evaluated_at TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    score INTEGER NOT NULL CHECK (score BETWEEN -4 AND 4),
+    direction TEXT CHECK (direction IN ('long','short')),
+    position_scale REAL NOT NULL CHECK (
+        position_scale >= 0.0 AND position_scale <= 1.0
+    ),
+    price REAL NOT NULL CHECK (price > 0.0),
+    annualized_average_move_pct REAL NOT NULL CHECK (
+        annualized_average_move_pct >= 0.0
+    ),
+    horizon_returns_json TEXT NOT NULL,
+    signal_id INTEGER REFERENCES signals(id) ON DELETE SET NULL,
+    UNIQUE (strategy_week, ticker)
+);
+
+CREATE INDEX IF NOT EXISTS idx_multi_horizon_evaluations_ticker
+    ON multi_horizon_evaluations (ticker, strategy_week);
 
 -- Phase 9: history of self-optimization runs. Each row is one operator-triggered
 -- run; findings_json holds the full degradation + feature-evaluation payload so
@@ -636,6 +663,7 @@ _TABLE_NAMES: tuple[str, ...] = (
     "predictions", "settings", "active_watchlist", "discovery_results",
     "shadow_evaluations", "watchlist_transitions",
     "signal_pair_status", "signal_pair_transitions", "optimization_runs",
+    "multi_horizon_evaluations",
     "readiness_state", "option_positions", "long_term_positions",
     "equity_snapshots", "plan_executions", "pending_orders",
 )
@@ -1914,6 +1942,16 @@ def _migrate_to_v32(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_to_v33(_conn: sqlite3.Connection) -> None:
+    """Add the weekly multi-horizon evaluation ledger.
+
+    Nothing to ALTER: the idempotent base schema creates the table and index
+    before migration hooks run. Existing trading and order-lifecycle rows are
+    untouched.
+    """
+    return None
+
+
 _PENDING_ORDER_STAGING_TABLES: tuple[str, ...] = (
     "pending_orders_v25",
     "pending_orders_v29",
@@ -2015,6 +2053,7 @@ def init_db() -> None:
             _migrate_to_v30(conn)
             _migrate_to_v31(conn)
             _migrate_to_v32(conn)
+            _migrate_to_v33(conn)
             cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
             row = cur.fetchone()
             if row is None:
@@ -2158,6 +2197,116 @@ def get_signal_by_id(signal_id: int) -> Signal | None:
     finally:
         conn.close()
     return _row_to_signal(row) if row is not None else None
+
+
+# ---- multi-horizon momentum evaluations ----
+
+
+def has_multi_horizon_evaluation(ticker: str, strategy_week: date) -> bool:
+    """Whether ``ticker`` already completed this strategy week's evaluation."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM multi_horizon_evaluations "
+            "WHERE ticker = ? AND strategy_week = ? LIMIT 1",
+            (ticker, strategy_week.isoformat()),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row is not None
+
+
+def insert_multi_horizon_evaluation(
+    *,
+    ticker: str,
+    strategy_week: date,
+    evaluated_at: datetime,
+    score: int,
+    direction: str | None,
+    position_scale: float,
+    price: float,
+    annualized_average_move_pct: float,
+    horizon_returns_pct: Sequence[float],
+    signal_id: int | None,
+) -> int:
+    """Persist one successful weekly evaluation, returning its stable id.
+
+    The unique ``(strategy_week, ticker)`` key makes restarts and the daily
+    retry schedule idempotent. Flat scores are stored with ``direction=NULL``;
+    failed market-data evaluations never call this function and remain
+    retryable on the next stock session.
+    """
+    horizon_count = len(config.MULTI_HORIZON_LOOKBACKS)
+    if not -horizon_count <= score <= horizon_count:
+        raise ValueError("multi-horizon score outside configured range")
+    expected_direction = "long" if score > 0 else "short" if score < 0 else None
+    if direction != expected_direction:
+        raise ValueError("multi-horizon direction does not match score")
+    expected_scale = abs(score) / horizon_count
+    if abs(position_scale - expected_scale) > 1e-9:
+        raise ValueError("multi-horizon position scale does not match score")
+    returns = [float(value) for value in horizon_returns_pct]
+    if len(returns) != horizon_count:
+        raise ValueError("multi-horizon return count does not match lookbacks")
+
+    params = (
+        strategy_week.isoformat(),
+        evaluated_at.isoformat(),
+        ticker,
+        score,
+        direction,
+        position_scale,
+        price,
+        annualized_average_move_pct,
+        json.dumps(returns, separators=(",", ":")),
+        signal_id,
+    )
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO multi_horizon_evaluations (
+                strategy_week, evaluated_at, ticker, score, direction,
+                position_scale, price, annualized_average_move_pct,
+                horizon_returns_json, signal_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(strategy_week, ticker) DO NOTHING
+            """,
+            params,
+        )
+        if cur.lastrowid:
+            evaluation_id = int(cur.lastrowid)
+        else:
+            row = conn.execute(
+                "SELECT id FROM multi_horizon_evaluations "
+                "WHERE strategy_week = ? AND ticker = ?",
+                (strategy_week.isoformat(), ticker),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("multi-horizon evaluation insert returned no row")
+            evaluation_id = int(row["id"])
+        conn.commit()
+        return evaluation_id
+    finally:
+        conn.close()
+
+
+def get_multi_horizon_evaluations(
+    strategy_week: date | None = None,
+) -> list[dict[str, Any]]:
+    """Return weekly momentum evaluations, newest first, for diagnostics."""
+    sql = "SELECT * FROM multi_horizon_evaluations"
+    params: tuple[str, ...] = ()
+    if strategy_week is not None:
+        sql += " WHERE strategy_week = ?"
+        params = (strategy_week.isoformat(),)
+    sql += " ORDER BY strategy_week DESC, ticker ASC"
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
 
 
 def get_signals_without_trades() -> list[Signal]:

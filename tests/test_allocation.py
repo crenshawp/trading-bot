@@ -33,6 +33,9 @@ def _candidate(**kw: object) -> Candidate:
 def test_route_pool_by_signal_type() -> None:
     assert allocation.route_pool(_candidate(signal_type="ema21_pullback")) == config.POOL_SWING
     assert allocation.route_pool(
+        _candidate(signal_type=config.MULTI_HORIZON_SIGNAL)
+    ) == config.POOL_SWING
+    assert allocation.route_pool(
         _candidate(signal_type="oversold_reversal", asset_class="crypto")
     ) == config.POOL_CRYPTO
     assert allocation.route_pool(
@@ -118,12 +121,32 @@ def test_signal_id_survives_ranking_and_planning() -> None:
 def test_manual_candidate_signal_id_defaults_to_none() -> None:
     candidate = _candidate()
     assert candidate.signal_id is None
-
     ranked = allocation.rank_candidates([(candidate, config.POOL_SWING)])
     orders, _skipped, _pools = allocation.allocate(
         ranked, {config.POOL_SWING: (10_000.0, 10_000.0)},
     )
     assert orders[0].signal_id is None
+
+
+def test_position_scale_reduces_size_risk_and_cost_proportionally() -> None:
+    full = _candidate(position_scale=1.0)
+    half = _candidate(position_scale=0.5)
+
+    full_size = allocation._size_candidate(full, config.POOL_SWING, 10_000.0)
+    half_size = allocation._size_candidate(half, config.POOL_SWING, 10_000.0)
+
+    assert full_size[0] is True and half_size[0] is True
+    for full_value, half_value in zip(full_size[1:], half_size[1:], strict=True):
+        assert full_value is not None and half_value is not None
+        assert half_value == pytest.approx(full_value * 0.5)
+
+
+@pytest.mark.parametrize("scale", [0.0, -0.5, 1.01])
+def test_invalid_position_scale_is_unsizeable(scale: float) -> None:
+    candidate = _candidate(position_scale=scale)
+    assert allocation.filter_reason(
+        candidate, 10_000.0, pool=config.POOL_SWING,
+    ) == "unsizeable"
 
 
 # ───────────────────────── indicator agreement ──────────────────────────────

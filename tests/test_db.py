@@ -229,11 +229,73 @@ def test_get_table_counts_zero_on_fresh_db(tmp_db: Path) -> None:
         "discovery_results": 0, "shadow_evaluations": 0,
         "watchlist_transitions": 0,
         "signal_pair_status": 0, "signal_pair_transitions": 0,
+        "multi_horizon_evaluations": 0,
         "optimization_runs": 0, "readiness_state": 0,
         "option_positions": 0, "long_term_positions": 0,
         "equity_snapshots": 0, "plan_executions": 0,
         "pending_orders": 0,
     }
+
+
+def test_multi_horizon_evaluation_round_trip_and_weekly_dedupe(
+    tmp_db: Path,
+) -> None:
+    week = date(2026, 8, 24)
+    evaluated_at = datetime(2026, 8, 24, 13, 32)
+    sid = db.insert_signal(_make_signal(
+        timestamp=evaluated_at,
+        signal_type="multi_horizon_momentum",
+    ))
+
+    evaluation_id = db.insert_multi_horizon_evaluation(
+        ticker="GOOGL",
+        strategy_week=week,
+        evaluated_at=evaluated_at,
+        score=2,
+        direction="long",
+        position_scale=0.5,
+        price=180.0,
+        annualized_average_move_pct=24.5,
+        horizon_returns_pct=(1.0, 2.0, 3.0, -1.0),
+        signal_id=sid,
+    )
+    duplicate_id = db.insert_multi_horizon_evaluation(
+        ticker="GOOGL",
+        strategy_week=week,
+        evaluated_at=evaluated_at,
+        score=2,
+        direction="long",
+        position_scale=0.5,
+        price=180.0,
+        annualized_average_move_pct=24.5,
+        horizon_returns_pct=(1.0, 2.0, 3.0, -1.0),
+        signal_id=sid,
+    )
+
+    assert duplicate_id == evaluation_id
+    assert db.has_multi_horizon_evaluation("GOOGL", week) is True
+    assert db.has_multi_horizon_evaluation("META", week) is False
+    (row,) = db.get_multi_horizon_evaluations(week)
+    assert row["score"] == 2
+    assert row["direction"] == "long"
+    assert row["position_scale"] == pytest.approx(0.5)
+    assert row["signal_id"] == sid
+
+
+def test_multi_horizon_evaluation_validates_score_mapping(tmp_db: Path) -> None:
+    with pytest.raises(ValueError, match="direction"):
+        db.insert_multi_horizon_evaluation(
+            ticker="META",
+            strategy_week=date(2026, 8, 24),
+            evaluated_at=datetime(2026, 8, 24, 13, 32),
+            score=-2,
+            direction="long",
+            position_scale=0.5,
+            price=100.0,
+            annualized_average_move_pct=20.0,
+            horizon_returns_pct=(-1.0, -2.0, -3.0, 1.0),
+            signal_id=None,
+        )
 
 
 # ---- sentiment provenance (cross-cutting audit) ----

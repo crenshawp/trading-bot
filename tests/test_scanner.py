@@ -8,6 +8,7 @@ forward testing — testing it now would be brittle and out of scope
 (spec §6: "Do not test the signal detection logic itself in this phase").
 """
 
+import json
 import sqlite3
 import sys
 from datetime import UTC, datetime
@@ -142,6 +143,84 @@ def test_scan_crypto_production_path_excludes_forming_bar(
     scanner.scan_crypto(now=datetime(2026, 7, 21, 12, 30, tzinfo=UTC))
 
     assert sent == []
+
+
+def _multi_horizon_detector_frame() -> pd.DataFrame:
+    closes = [100.0 + index for index in range(60)]
+    closes[-1] = 1.0  # forming candle: deliberately opposite and ignored
+    return pd.DataFrame({
+        "Close": closes,
+        "ATR": [2.0] * 60,
+        "RSI": [55.0] * 60,
+        "EMA21": [140.0] * 60,
+    })
+
+
+def test_multi_horizon_detector_uses_last_closed_daily_candle() -> None:
+    signal, reading = scanner.detect_multi_horizon_momentum_signal(
+        "META", _multi_horizon_detector_frame(),
+    )
+
+    assert signal is not None
+    assert reading.score == 4
+    assert signal["direction"].startswith("CALL")
+    assert signal["price"] == pytest.approx(158.0)
+    assert signal["position_scale"] == 1.0
+    assert signal["hold_days"] == f"{scanner.config.MULTI_HORIZON_HOLD_DAYS} days"
+    assert signal["take_profit"] == pytest.approx(162.0)
+    assert signal["stop_loss"] == pytest.approx(155.0)
+
+
+def test_weekly_momentum_scan_is_idempotent_and_respects_active_gates(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trading_bot.multi_horizon_momentum import MomentumReading
+
+    monkeypatch.setattr(scanner, "is_market_open", lambda: True)
+    monkeypatch.setattr(
+        scanner,
+        "_active_stock_watchlist_entries",
+        lambda: [("ACT", "active"), ("BEN", "benched")],
+    )
+    monkeypatch.setattr(scanner, "get_stock_data", lambda ticker: {"ticker": ticker})
+    monkeypatch.setattr(scanner, "add_stock_indicators", lambda frame: frame)
+    reading = MomentumReading(
+        score=2,
+        direction="long",
+        position_scale=0.5,
+        current_price=100.0,
+        horizon_returns_pct=(1.0, 2.0, 3.0, -1.0),
+        annualized_average_move_pct=20.0,
+    )
+
+    def detect(ticker: str, _frame: object) -> tuple[dict[str, Any], MomentumReading]:
+        signal = _stock_signal(ticker, "Multi Horizon Momentum")
+        signal["position_scale"] = 0.5
+        return signal, reading
+
+    monkeypatch.setattr(scanner, "detect_multi_horizon_momentum_signal", detect)
+    active: list[str] = []
+    shadow: list[str] = []
+    monkeypatch.setattr(
+        scanner,
+        "_emit_active_signal",
+        lambda signal, _df: active.append(signal["ticker"]),
+    )
+    monkeypatch.setattr(
+        scanner,
+        "send_notification",
+        lambda signal, **_kwargs: shadow.append(signal["ticker"]),
+    )
+    now = datetime(2026, 8, 25, 14, 0, tzinfo=UTC)
+
+    scanner.scan_multi_horizon_momentum(now=now)
+    scanner.scan_multi_horizon_momentum(now=now)
+
+    assert active == ["ACT"]
+    assert shadow == ["BEN"]
+    rows = db.get_multi_horizon_evaluations(datetime(2026, 8, 24).date())
+    assert len(rows) == 2
+    assert {row["ticker"] for row in rows} == {"ACT", "BEN"}
 
 
 # ───────────────────────── log_signal ─────────────────────────
@@ -1857,3 +1936,26 @@ def test_is_market_open_respects_a_derived_holiday(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(scanner, "datetime", _FrozenOrdinary)
     assert scanner.is_market_open() is True
+
+
+def test_log_signal_persists_multi_horizon_sizing_metadata(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _offline_context(monkeypatch)
+    signal = _stock_signal("META", "Multi Horizon Momentum")
+    signal.update({
+        "momentum_score": 2,
+        "position_scale": 0.5,
+        "horizon_returns_pct": [1.0, 2.0, 3.0, -1.0],
+        "annualized_average_move_pct": 20.0,
+        "momentum_lookbacks": [5, 10, 21, 42],
+    })
+
+    signal_id = scanner.log_signal(signal)
+
+    assert signal_id is not None
+    persisted = db.get_signal_by_id(signal_id)
+    assert persisted is not None and persisted.raw_indicators_json is not None
+    payload = json.loads(persisted.raw_indicators_json)
+    assert payload["momentum_score"] == 2
+    assert payload["position_scale"] == pytest.approx(0.5)

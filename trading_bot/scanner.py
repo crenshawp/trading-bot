@@ -14,11 +14,12 @@ is annotated regardless.
 """
 
 import argparse
+import json
 import os
 import re
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -34,6 +35,7 @@ from trading_bot import (
     earnings,
     evaluator_scheduling,
     indicators,
+    multi_horizon_momentum,
     news_client,
     order_lifecycle,
     outcomes,
@@ -210,6 +212,33 @@ def _hold_estimate_from(signal: dict) -> int | None:
     return max(int(n) for n in nums)
 
 
+def _signal_metadata_json(signal: dict) -> str | None:
+    """Serialize strategy-specific metadata without widening the signal table.
+
+    Multi-horizon score and sizing data must survive the scanner-to-allocator
+    boundary. Existing signal types keep the historical ``NULL`` default.
+    """
+    keys = (
+        "momentum_score",
+        "position_scale",
+        "horizon_returns_pct",
+        "annualized_average_move_pct",
+        "momentum_lookbacks",
+    )
+    payload = {key: signal[key] for key in keys if key in signal}
+    if not payload:
+        return None
+    try:
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        print(
+            f"  signal metadata serialization failed for "
+            f"{signal.get('ticker', '?')}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
 def _should_check_earnings(signal: dict) -> bool:
     """Earnings blackout applies only to stock TRADE signals (call/put).
     Crypto has no earnings; warning entries aren't trades."""
@@ -310,7 +339,18 @@ def _compute_signal_risk(signal: dict, indicator_ctx: object) -> object:
             for t in db.get_open_trades()
             if t.track_mode == "active"
         ]
-        return risk.assess(entry, atr, concentration, open_positions)
+        raw_scale = signal.get("position_scale", 1.0)
+        scale = float(raw_scale)
+        if not 0.0 < scale <= 1.0:
+            raise ValueError(f"invalid position scale {raw_scale!r}")
+        return risk.assess(
+            entry,
+            atr,
+            concentration,
+            open_positions,
+            risk_per_trade_pct=config.RISK_PER_TRADE_PCT * scale,
+            max_position_pct=config.MAX_POSITION_PCT * scale,
+        )
     except Exception as exc:  # noqa: BLE001 - advisory risk must never block an alert
         print(
             f"  risk pipeline error for {ticker}, alerting without it: {exc}",
@@ -319,7 +359,7 @@ def _compute_signal_risk(signal: dict, indicator_ctx: object) -> object:
         return None
 
 
-def _emit_active_signal(signal: dict, df: object = None) -> None:
+def _emit_active_signal(signal: dict, df: object = None) -> int | None:
     """Handle a signal that passed ticker-active AND pair-enabled.
 
     The ONE hard gate runs first: if a known earnings report falls inside the
@@ -347,14 +387,14 @@ def _emit_active_signal(signal: dict, df: object = None) -> None:
                 f"opened ({reason})",
                 file=sys.stderr,
             )
-            return
+            return None
 
     sentiment_result = _score_signal_sentiment(signal)
     indicator_ctx = (
         _compute_signal_indicators(signal, df) if df is not None else None
     )
     risk_assessment = _compute_signal_risk(signal, indicator_ctx)
-    send_notification(
+    return send_notification(
         signal, sentiment=sentiment_result, indicators=indicator_ctx,
         risk=risk_assessment,
     )
@@ -902,6 +942,7 @@ def log_signal(
         bb_lower=_opt_float(signal, "bb_lower"),
         earnings_risk=str(signal.get("earnings_risk", "UNKNOWN")),
         news_risk=str(signal.get("news_risk", "UNKNOWN")),
+        raw_indicators_json=_signal_metadata_json(signal),
     )
     signal_id = db.insert_signal(rec)
 
@@ -2046,6 +2087,64 @@ def detect_stock_signals(ticker, df):
     return signals
 
 
+def detect_multi_horizon_momentum_signal(ticker, df):
+    """Build the weekly TradingLab-style stock signal from closed daily bars.
+
+    ``df.iloc[-1]`` is the still-forming daily candle, matching the scanner's
+    established invariant. The pure evaluator therefore receives every close
+    through ``iloc[-2]`` and never reasons on partial OHLC data.
+    """
+    closed_prices = [float(value) for value in df["Close"].iloc[:-1].tolist()]
+    reading = multi_horizon_momentum.evaluate(closed_prices)
+    if reading.direction is None:
+        return None, reading
+
+    latest = df.iloc[-2]
+    price = reading.current_price
+    atr = float(latest["ATR"])
+    rsi = float(latest["RSI"])
+    ema21 = float(latest["EMA21"])
+    is_long = reading.direction == "long"
+    direction = "CALL 📈" if is_long else "PUT 📉"
+    take_profit = round(price + atr * 2.0, 2) if is_long else round(price - atr * 2.0, 2)
+    stop_loss = round(price - atr * 1.5, 2) if is_long else round(price + atr * 1.5, 2)
+    votes = ", ".join(
+        f"{lookback}d={value:+.2f}%"
+        for lookback, value in zip(
+            config.MULTI_HORIZON_LOOKBACKS,
+            reading.horizon_returns_pct,
+            strict=True,
+        )
+    )
+    return {
+        "ticker": ticker,
+        "asset_type": "stock",
+        "trade_type": "📆 WEEKLY SWING TRADE",
+        "direction": direction,
+        "setup": "Multi Horizon Momentum",
+        "detail": (
+            f"Trend score {reading.score:+d}/4 ({votes}); "
+            f"{reading.position_scale:.0%} normal size; annualized average "
+            f"move {reading.annualized_average_move_pct:.1f}%."
+        ),
+        "price": price,
+        "confidence": "High" if reading.position_scale == 1.0 else "Medium",
+        "take_profit": take_profit,
+        "stop_loss": stop_loss,
+        "hold_days": f"{config.MULTI_HORIZON_HOLD_DAYS} days",
+        "atr": atr,
+        "rsi": rsi,
+        "ema21": ema21,
+        "earnings_risk": "UNKNOWN",
+        "news_risk": "UNKNOWN",
+        "momentum_score": reading.score,
+        "position_scale": reading.position_scale,
+        "horizon_returns_pct": list(reading.horizon_returns_pct),
+        "annualized_average_move_pct": reading.annualized_average_move_pct,
+        "momentum_lookbacks": list(config.MULTI_HORIZON_LOOKBACKS),
+    }, reading
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CRYPTO SIGNALS — Oversold Reversal + Momentum Breakout + Overbought Reversal
 # Proven 56-61% win rate on BTC, BNB, ETH on hourly candles
@@ -2245,7 +2344,7 @@ def _sentiment_alert_lines(sentiment: object) -> str:
 def send_notification(
     signal, *, track_mode="active", alert=True, sentiment=None, indicators=None,
     risk=None,
-):
+) -> int | None:
     """Persist the signal/trade and (unless suppressed) fire the alert.
 
     Phase 3.1-LIVE: ``track_mode`` tags the opened trade ('active' or
@@ -2266,8 +2365,9 @@ def send_notification(
     recommended size + portfolio verdicts, persisted on the trade row and shown
     in the alert. Advisory/notional only; it NEVER suppresses anything.
     """
+    signal_id: int | None = None
     try:
-        log_signal(
+        signal_id = log_signal(
             signal, track_mode=track_mode, sentiment=sentiment,
             indicators=indicators, risk=risk,
         )
@@ -2283,7 +2383,7 @@ def send_notification(
             f"({signal['setup']} {signal['direction']}) — trade opened "
             f"track_mode={track_mode}"
         )
-        return
+        return signal_id
 
     msg = (
         f"🚨 TRADE ALERT — {signal['ticker']}\n"
@@ -2305,7 +2405,7 @@ def send_notification(
     if DRY_RUN:
         print("\n--- DRY-RUN signal (no Discord/Pushover) ---")
         print(msg)
-        return
+        return signal_id
 
     embed_fields = [
         {"name": "Asset",       "value": signal['asset_type'].upper(), "inline": True},
@@ -2379,6 +2479,7 @@ def send_notification(
         print("  Pushover notification sent")
     except Exception as e:
         print(f"  Pushover error: {e}", file=sys.stderr)
+    return signal_id
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2436,6 +2537,101 @@ def scan_stocks():
                 print(f"  {ticker}: No signals")
         except Exception as e:
             print(f"  {ticker}: Error — {e}")
+
+
+def _multi_horizon_week_start(moment: datetime) -> date:
+    """Monday date for the strategy week containing ``moment`` in New York."""
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        local = moment.replace(tzinfo=ZoneInfo("America/New_York"))
+    else:
+        local = moment.astimezone(ZoneInfo("America/New_York"))
+    return local.date() - timedelta(days=local.weekday())
+
+
+def scan_multi_horizon_momentum(*, now: datetime | None = None) -> None:
+    """Run each stock's first successful multi-horizon evaluation of the week.
+
+    Scheduled daily so an NYSE holiday or one ticker's transient data failure
+    retries on the next session. The evaluation ledger makes successful rows
+    idempotent for the rest of the week, including flat scores that emit no
+    signal. Directional rows enter the ordinary active/shadow gating pipeline;
+    active/default-enabled signals alert and become executable paper candidates.
+    """
+    if not is_market_open():
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] Market closed — skipping "
+            "multi-horizon momentum scan"
+        )
+        return
+
+    moment = now if now is not None else datetime.now(UTC)
+    strategy_week = _multi_horizon_week_start(moment)
+    news_client.clear_cache()
+    indicators.clear_correlation_cache()
+    print(
+        f"\n[{datetime.now().strftime('%H:%M:%S')}] Scanning weekly "
+        f"multi-horizon momentum ({strategy_week})..."
+    )
+
+    evaluated = 0
+    signals_found = 0
+    already_done = 0
+    failed = 0
+    for ticker, status in _active_stock_watchlist_entries():
+        try:
+            if db.has_multi_horizon_evaluation(ticker, strategy_week):
+                already_done += 1
+                continue
+            df = get_stock_data(ticker)
+            if df is None:
+                print(f"  momentum {ticker}: no data — retry next session", file=sys.stderr)
+                failed += 1
+                continue
+            enriched = add_stock_indicators(df)
+            signal, reading = detect_multi_horizon_momentum_signal(ticker, enriched)
+            signal_id: int | None = None
+            if signal is not None:
+                signals_found += 1
+                is_active = status == "active"
+                if is_active and _pair_is_enabled(ticker, signal["setup"]):
+                    signal_id = _emit_active_signal(signal, enriched)
+                else:
+                    if is_active:
+                        print(
+                            f"  [muted pair] {ticker}/{signal['setup']} — "
+                            "alert gated, opening as shadow"
+                        )
+                    signal_id = send_notification(
+                        signal, track_mode="shadow", alert=False,
+                    )
+
+            db.insert_multi_horizon_evaluation(
+                ticker=ticker,
+                strategy_week=strategy_week,
+                evaluated_at=moment,
+                score=reading.score,
+                direction=reading.direction,
+                position_scale=reading.position_scale,
+                price=reading.current_price,
+                annualized_average_move_pct=reading.annualized_average_move_pct,
+                horizon_returns_pct=reading.horizon_returns_pct,
+                signal_id=signal_id,
+            )
+            evaluated += 1
+            if signal is None:
+                print(f"  momentum {ticker}: flat score 0 — no signal")
+        except Exception as exc:  # noqa: BLE001 - one ticker must never sink the sweep
+            failed += 1
+            print(
+                f"  momentum {ticker}: error — {exc}; retry next session",
+                file=sys.stderr,
+            )
+
+    print(
+        "  momentum scan summary: "
+        f"evaluated={evaluated} signals={signals_found} "
+        f"already_done={already_done} failed={failed}"
+    )
 
 
 def scan_shadow():
@@ -2599,6 +2795,7 @@ def main() -> None:
         print("=== DRY RUN — one scan cycle, no notifications, DB writes only ===")
         if is_market_open():
             scan_stocks()
+            scan_multi_horizon_momentum()
         else:
             scan_crypto()
         return
@@ -2607,6 +2804,7 @@ def main() -> None:
     print(f"Stocks:  {_active_stock_watchlist()}")
     print(f"Crypto:  {CRYPTO_WATCHLIST}")
     print("Stock scan: once daily at market open")
+    print("Multi-horizon momentum: first successful stock session each week")
     print("Crypto scan: every hour 24/7")
 
     # Run both immediately on start. Guarded: a transient failure during the
@@ -2614,6 +2812,7 @@ def main() -> None:
     # process before the schedules are even registered — that would put
     # Railway into a restart loop instead of simply catching the next tick.
     _never_raise(scan_stocks)()
+    _never_raise(scan_multi_horizon_momentum)()
     # Shadow scan AFTER the active scan so active alerting/logging is never
     # delayed or blocked by the 100-name shadow load. Wrapped so it can never
     # take down the active pipeline.
@@ -2635,6 +2834,14 @@ def main() -> None:
 
     # Stock scan — once per day at 9:31am EST
     schedule.every().day.at("09:31").do(_never_raise(scan_stocks))
+
+    # Weekly multi-horizon strategy — checked daily at 09:32 so a holiday or
+    # transient per-ticker data failure retries on the next market session.
+    # The DB evaluation ledger guarantees at most one successful evaluation per
+    # ticker/week, including score-zero evaluations that emit no trade.
+    schedule.every().day.at("09:32").do(
+        _never_raise(scan_multi_horizon_momentum)
+    )
 
     # Shadow scan at 09:33 EST — two minutes after the active stock scan so
     # active trades/alerts land first. Phase 3.1-LIVE.

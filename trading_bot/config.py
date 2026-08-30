@@ -181,6 +181,7 @@ POOL_CAPITAL_SPLIT: dict[str, float] = {
 # Phase 14 long-term signals route into the LONG_TERM / CRYPTO execution pools.
 SIGNAL_TYPE_TO_POOL: dict[str, str] = {
     "ema21_pullback": POOL_SWING,
+    "multi_horizon_momentum": POOL_SWING,
     "long_term_stock": POOL_LONG_TERM,
     "long_term_crypto": POOL_CRYPTO,
 }
@@ -243,6 +244,16 @@ LONGTERM_CRYPTO_SIGNAL = "long_term_crypto"
 DATA_ONLY_SIGNAL_TYPES: frozenset[str] = frozenset(
     {"oversold_reversal", "momentum_breakout", "overbought_reversal"}
 )
+
+# TradingLab multi-horizon momentum — weekly, STOCK SWING, PAPER. The four
+# horizons are trading sessions approximating one week, two weeks, one month,
+# and two months. Its score controls direction and a 0.5/1.0 size multiplier;
+# the existing ATR-normalized SWING sizing/exit path remains the risk authority.
+MULTI_HORIZON_SIGNAL = "multi_horizon_momentum"
+MULTI_HORIZON_LOOKBACKS: tuple[int, ...] = (5, 10, 21, 42)
+MULTI_HORIZON_VOLATILITY_WINDOW: int = 30
+STOCK_ANNUALIZATION_PERIODS: int = 252
+MULTI_HORIZON_HOLD_DAYS: int = 7
 LONGTERM_STOCK_UNIVERSE: tuple[str, ...] = (
     "BLK", "GOOGL", "META", "GS", "NOW", "AMZN", "LLY", "TSLA",
 )

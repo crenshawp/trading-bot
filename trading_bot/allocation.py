@@ -68,6 +68,10 @@ class Candidate:
     vol_regime: str = "unknown"        # low | normal | high | unknown
     sentiment_score: float | None = None   # -1..+1 (advisory)
     concentration: str = "unknown"     # Phase 6 label, carried for completeness
+    # Strategy-requested fraction of the normal risk-normalized size. The
+    # multi-horizon momentum score uses 1.0 for +/-4 and 0.5 for +/-2. Other
+    # strategies retain the compatibility default of 1.0.
+    position_scale: float = 1.0
     # Phase 20: the ORIGINAL swing signal's resolver settlement deadline
     # (signal timestamp + the Phase 1 hold window) — the same moment the paper
     # trade on this signal expires. Populated by the live candidate source for
@@ -398,13 +402,34 @@ def _size_candidate(
     the position value and the amount at risk). Keeping the two sizing methods
     behind one dispatcher is what lets the pools coexist in one allocator.
     """
+    scale = candidate.position_scale
+    if not 0.0 < scale <= 1.0:
+        return False, None, None, None
+
     if pool in (config.POOL_LONG_TERM, config.POOL_CRYPTO):
         lt = risk.position_size_long_term(pool_capital, candidate.entry)
         if not lt.ok or lt.dollars is None or lt.qty is None:
             return False, None, None, None
-        return True, lt.dollars, lt.dollars, lt.qty
+        return (
+            True,
+            lt.dollars * scale,
+            lt.dollars * scale,
+            lt.qty * scale,
+        )
     size = risk.position_size(candidate.entry, candidate.atr, account=pool_capital)
-    return size.ok, size.position_value, size.dollar_risk, size.recommended_size
+    if (
+        not size.ok
+        or size.position_value is None
+        or size.dollar_risk is None
+        or size.recommended_size is None
+    ):
+        return False, None, None, None
+    return (
+        True,
+        size.position_value * scale,
+        size.dollar_risk * scale,
+        size.recommended_size * scale,
+    )
 
 
 # ── Stage 2/3: rank, then allocate top-down within each pool ─────────────────

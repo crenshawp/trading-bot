@@ -28,12 +28,40 @@ build_plan / allocate / execute need no changes downstream of sourcing.
 from __future__ import annotations
 
 import dataclasses
+import json
+import sys
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from trading_bot import config, db, outcomes, signal_pairs
 from trading_bot.allocation import AllocationResult, Candidate, route_pool
 from trading_bot.models import is_hard_risk
+
+
+def _position_scale(row: dict[str, Any]) -> float:
+    """Read a strategy-requested sizing fraction from persisted metadata.
+
+    Only multi-horizon momentum requires this field. Missing/malformed metadata
+    on that strategy returns zero, making allocation fail closed as unsizeable
+    instead of accidentally converting a half-size signal into a full-size
+    order. Every other strategy keeps the historical 1.0 default.
+    """
+    if str(row.get("signal_type", "")) != config.MULTI_HORIZON_SIGNAL:
+        return 1.0
+    raw = row.get("raw_indicators_json")
+    try:
+        payload = json.loads(str(raw))
+        scale = float(payload["position_scale"])
+        if not 0.0 < scale <= 1.0:
+            raise ValueError("position_scale must be in (0, 1]")
+        return scale
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(
+            f"  candidate source: invalid multi-horizon position scale for "
+            f"{row.get('ticker', '?')}: {exc}",
+            file=sys.stderr,
+        )
+        return 0.0
 
 
 def _watchlist_status_map() -> dict[str, str]:
@@ -91,6 +119,7 @@ def _to_candidate(
         vol_regime=row["trade_ind_vol_regime"] or "unknown",
         sentiment_score=row["trade_sentiment_score"],
         concentration=row["trade_ind_concentration"] or "unknown",
+        position_scale=_position_scale(row),
         signal_id=int(row["id"]),
     )
     # Phase 20: SWING-pool candidates carry the signal's EXISTING resolver
