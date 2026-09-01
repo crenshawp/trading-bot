@@ -2,13 +2,14 @@
 
 Consumes a Phase 12 allocated SWING candidate (side + allocated capital +
 underlying) and turns it into an actual single-leg option order (buy call / buy
-put), with a fractional-share fallback. Still PAPER ONLY.
+put), with a share fallback. Still PAPER ONLY.
 
 Execution hierarchy per allocated swing signal (Section 4):
   1. a FULL-sized option at target delta (0.65-0.75), or
   2. an UNDERSIZED option (delta band widened down to 0.50, still liquidity-
      gated, still a WHOLE contract) that fits the allocated capital, or
-  3. fall back to FRACTIONAL SHARES via the existing Phase 11 equity order path.
+  3. fall back to SHARES via the existing Phase 11 equity order path. Long
+     fallbacks may be fractional; Alpaca short fallbacks must be whole shares.
 
 Greeks (theta/vega/gamma) are stored for audit but are NOT hard gates this phase.
 No spreads / multi-leg. No naive market orders (LIMIT default). Alpaca has no
@@ -225,7 +226,14 @@ def _shares_decision(
     direction: str, underlying: str, underlying_price: float | None,
     allocated_capital: float,
 ) -> ExecutionDecision:
-    """Fractional-share fallback via the existing Phase 11 equity order path."""
+    """Share fallback via the existing Phase 11 equity order path.
+
+    Alpaca accepts fractional-share BUY orders but rejects fractional short
+    sales. Bearish fallbacks therefore floor to a whole-share quantity while
+    bullish fallbacks retain the allocator's exact fractional sizing. Refuse a
+    short fallback when its capital cannot cover one share instead of sending a
+    broker request that is guaranteed to fail.
+    """
     side = "buy" if _bullish(direction) else "sell"
     if underlying_price is None or underlying_price <= 0.0:
         return ExecutionDecision(
@@ -233,7 +241,14 @@ def _shares_decision(
             est_cost=0.0, dollar_risk=0.0, contract=None,
             reason="shares fallback unsizeable: no underlying price",
         )
-    qty = allocated_capital / underlying_price      # fractional shares are fine
+    raw_qty = allocated_capital / underlying_price
+    qty = raw_qty if side == "buy" else float(int(raw_qty))
+    if qty <= 0.0:
+        return ExecutionDecision(
+            vehicle=VEHICLE_NONE, side=side, symbol=underlying, qty=0.0,
+            est_cost=0.0, dollar_risk=0.0, contract=None,
+            reason="shares fallback unsizeable: short requires one whole share",
+        )
     est_cost = qty * underlying_price
     return ExecutionDecision(
         vehicle=VEHICLE_SHARES, side=side, symbol=underlying, qty=qty,

@@ -162,14 +162,14 @@ def test_choose_execution_undersized_when_no_full_fit() -> None:
 
 
 def test_choose_execution_falls_back_to_shares_when_no_contract_fits() -> None:
-    # A full-band contract exists but costs $500/contract; only $300 allocated ->
+    # A full-band contract exists but costs $500/contract; only $350 allocated ->
     # no whole contract fits (never undersized to a fraction) -> shares.
     contracts = [_contract(0.70)]
     dec = oe.choose_execution(
-        "call", 300.0, "AAPL", 100.0, contracts, ref_date=_REF,
+        "call", 350.0, "AAPL", 100.0, contracts, ref_date=_REF,
     )
     assert dec.vehicle == oe.VEHICLE_SHARES
-    assert dec.qty == 3.0            # $300 / $100 underlying = 3 fractional shares
+    assert dec.qty == 3.5            # bullish fallbacks retain fractional sizing
     assert dec.symbol == "AAPL"
 
 
@@ -208,9 +208,18 @@ def test_choose_execution_empty_chain_routes_to_shares() -> None:
     assert dec.vehicle == oe.VEHICLE_SHARES
 
 
-def test_choose_execution_short_shares_fallback_sells() -> None:
-    dec = oe.choose_execution("short", 600.0, "AAPL", 100.0, [], ref_date=_REF)
+def test_choose_execution_short_shares_fallback_sells_whole_shares() -> None:
+    dec = oe.choose_execution("short", 650.0, "AAPL", 100.0, [], ref_date=_REF)
     assert dec.vehicle == oe.VEHICLE_SHARES and dec.side == "sell"
+    assert dec.qty == 6.0
+    assert dec.est_cost == 600.0
+
+
+def test_choose_execution_short_shares_refuses_when_one_share_will_not_fit() -> None:
+    dec = oe.choose_execution("short", 99.0, "AAPL", 100.0, [], ref_date=_REF)
+    assert dec.vehicle == oe.VEHICLE_NONE
+    assert dec.qty == 0.0
+    assert dec.reason == "shares fallback unsizeable: short requires one whole share"
 
 
 def test_choose_execution_shares_unsizeable_without_price() -> None:
