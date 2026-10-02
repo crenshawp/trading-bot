@@ -1744,8 +1744,13 @@ def _build_latest_price_fetch(tickers):
 
     client = AlpacaMarketDataClient()
     prices: dict[str, float] = {}
-    stocks = sorted({ticker for ticker in tickers if not ticker.endswith("-USD")})
-    crypto = sorted({ticker for ticker in tickers if ticker.endswith("-USD")})
+    # Materialise first: callers pass generator expressions (e.g.
+    # `p.ticker for p in long_term_book`), and the two comprehensions below
+    # iterate `tickers` twice. Consuming a generator in the first one left
+    # `crypto` permanently empty, so no crypto quote was ever requested.
+    symbols = tuple(tickers)
+    stocks = sorted({ticker for ticker in symbols if not ticker.endswith("-USD")})
+    crypto = sorted({ticker for ticker in symbols if ticker.endswith("-USD")})
     results = []
     if stocks:
         results.append(client.get_stock_latest_quotes(stocks))

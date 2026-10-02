@@ -1749,6 +1749,43 @@ def test_latest_price_fetch_batches_stock_and_crypto_quotes(
     assert fetch("BTC-USD") == 60_050.0
 
 
+def test_latest_price_fetch_accepts_a_generator_of_tickers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the crypto book must still be priced when the caller passes
+    a generator.
+
+    `_emergency_price_fetchers` calls this with `p.ticker for p in
+    long_term_book`. The function iterates `tickers` twice, so a generator was
+    exhausted by the stock comprehension and the crypto one saw nothing —
+    `get_crypto_latest_quotes` was never called, `fetch("BTC-USD")` returned
+    None, and `emergency_shutdown` could never flatten a crypto position.
+    """
+    from trading_bot import alpaca_market_data as amd
+
+    stock = amd.MarketQuote("META", datetime.now(UTC), 99.0, 1.0, 101.0, 1.0)
+    crypto = amd.MarketQuote(
+        "BTC-USD", datetime.now(UTC), 60_000.0, 1.0, 60_100.0, 1.0,
+    )
+    crypto_calls: list[list[str]] = []
+
+    class QuoteClient:
+        def get_stock_latest_quotes(self, _symbols: list[str]) -> amd.QuotesResult:
+            return amd.QuotesResult(ok=True, quotes={"META": stock})
+
+        def get_crypto_latest_quotes(self, symbols: list[str]) -> amd.QuotesResult:
+            crypto_calls.append(symbols)
+            return amd.QuotesResult(ok=True, quotes={"BTC-USD": crypto})
+
+    monkeypatch.setattr(amd, "AlpacaMarketDataClient", QuoteClient)
+    fetch = scanner._build_latest_price_fetch(
+        ticker for ticker in ["META", "BTC-USD"]
+    )
+    assert crypto_calls == [["BTC-USD"]]
+    assert fetch("META") == 100.0
+    assert fetch("BTC-USD") == 60_050.0
+
+
 def test_exit_watcher_cycle_is_a_distinct_hook() -> None:
     """Additive — it does not replace the existing hourly cycles."""
     assert callable(scanner._run_exit_watcher_cycle)
